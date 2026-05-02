@@ -6,8 +6,17 @@
 use super::{SnapshotMap, SnapshotNode};
 use std::collections::HashMap;
 
+/// Viewport-relative bounds for a DOM candidate.
+#[derive(Debug, Clone, Default, serde::Deserialize, serde::Serialize)]
+pub struct DomRect {
+    pub x: f64,
+    pub y: f64,
+    pub width: f64,
+    pub height: f64,
+}
+
 /// A candidate element extracted from the live DOM.
-#[derive(Debug, Clone, serde::Deserialize)]
+#[derive(Debug, Clone, Default, serde::Deserialize, serde::Serialize)]
 pub struct DomCandidate {
     #[serde(rename = "backendNodeId")]
     pub backend_node_id: i64,
@@ -19,6 +28,28 @@ pub struct DomCandidate {
     pub parent_role: String,
     #[serde(rename = "parentName")]
     pub parent_name: String,
+    #[serde(rename = "accessibleName", default)]
+    pub accessible_name: String,
+    #[serde(rename = "visibleText", default)]
+    pub visible_text: String,
+    #[serde(default)]
+    pub value: String,
+    #[serde(default)]
+    pub placeholder: String,
+    #[serde(default)]
+    pub title: String,
+    #[serde(rename = "altText", default)]
+    pub alt_text: String,
+    #[serde(rename = "testId", default)]
+    pub test_id: String,
+    #[serde(rename = "matchedOn", default)]
+    pub matched_on: Vec<String>,
+    #[serde(default)]
+    pub warnings: Vec<String>,
+    #[serde(rename = "viewportRect", default)]
+    pub viewport_rect: Option<DomRect>,
+    #[serde(rename = "inViewport", default)]
+    pub in_viewport: bool,
 }
 
 /// Build a SnapshotMap from DOM candidates, assigning d<N> prefixed UIDs.
@@ -31,19 +62,23 @@ pub fn build_dom_snapshot(
     generation: u64,
 ) -> SnapshotMap {
     let mut uid_to_node = HashMap::new();
+    let mut uid_to_candidate = HashMap::new();
     let mut backend_to_uids: HashMap<i64, Vec<String>> = HashMap::new();
+    let mut ordered_uids = Vec::with_capacity(candidates.len());
 
     for (i, candidate) in candidates.iter().enumerate() {
         let uid_key = format!("d{}", i + 1);
+        ordered_uids.push(uid_key.clone());
 
         uid_to_node.insert(
             uid_key.clone(),
             SnapshotNode {
                 backend_node_id: candidate.backend_node_id,
                 role: candidate.role.clone(),
-                name: candidate.label.clone(),
+                name: snapshot_display_name(candidate),
             },
         );
+        uid_to_candidate.insert(uid_key.clone(), candidate.clone());
 
         if candidate.backend_node_id != 0 {
             backend_to_uids
@@ -55,10 +90,44 @@ pub fn build_dom_snapshot(
 
     SnapshotMap {
         uid_to_node,
+        uid_to_candidate,
         backend_to_uids,
+        ordered_uids,
         page_url,
         generation,
     }
+}
+
+fn snapshot_display_name(candidate: &DomCandidate) -> String {
+    let matched_visible_text = candidate
+        .matched_on
+        .iter()
+        .any(|field| field == "visible_text");
+    let stale_accessible_name = candidate
+        .warnings
+        .iter()
+        .any(|warning| warning == "accessible_name_visible_text_mismatch");
+
+    if !candidate.visible_text.is_empty()
+        && (matched_visible_text || stale_accessible_name || candidate.label.is_empty())
+    {
+        return candidate.visible_text.clone();
+    }
+
+    [
+        &candidate.label,
+        &candidate.accessible_name,
+        &candidate.value,
+        &candidate.placeholder,
+        &candidate.title,
+        &candidate.alt_text,
+        &candidate.test_id,
+        &candidate.visible_text,
+    ]
+    .into_iter()
+    .find(|value| !value.is_empty())
+    .cloned()
+    .unwrap_or_default()
 }
 
 /// Build the JavaScript expression that walks the DOM and returns interactive candidates.
@@ -103,23 +172,73 @@ function isVisible(el) {{
     return true;
 }}
 
+function normalizeText(value) {{
+    return (value || "").replace(/\s+/g, " ").trim();
+}}
+
+function truncate(value, max) {{
+    const text = normalizeText(value);
+    return text.length > max ? text.substring(0, max) : text;
+}}
+
+function labelledByText(el) {{
+    const labelledBy = el.getAttribute("aria-labelledby");
+    if (!labelledBy) return "";
+    return labelledBy.split(/\s+/).map(id => {{
+        const root = el.getRootNode();
+        const ref_ = root && root.getElementById ? root.getElementById(id) : null;
+        return ref_ ? ref_.textContent : "";
+    }}).filter(Boolean).join(" ");
+}}
+
+function labelElementText(el) {{
+    if (!el.labels || !el.labels.length) return "";
+    return Array.from(el.labels).map(l => l.textContent).join(" ");
+}}
+
+function formValue(el) {{
+    if (el.tagName === "INPUT" || el.tagName === "TEXTAREA" || el.tagName === "SELECT") {{
+        return el.value || "";
+    }}
+    return "";
+}}
+
+function explicitAccessibleName(el) {{
+    const ariaLabel = el.getAttribute("aria-label");
+    if (ariaLabel) return ariaLabel;
+
+    const labelledBy = labelledByText(el);
+    if (labelledBy) return labelledBy;
+
+    const labelText = labelElementText(el);
+    if (labelText) return labelText;
+
+    const ph = el.getAttribute("placeholder") || el.getAttribute("data-placeholder");
+    if (ph) return ph;
+
+    if (el.tagName === "INPUT" && ["submit", "button", "reset"].includes(el.type)) {{
+        const value = formValue(el);
+        if (value) return value;
+    }}
+
+    const title = el.getAttribute("title");
+    if (title) return title;
+
+    const alt = el.getAttribute("alt");
+    if (alt) return alt;
+
+    return "";
+}}
+
 function getLabel(el) {{
     const ariaLabel = el.getAttribute("aria-label");
     if (ariaLabel) return ariaLabel.trim();
 
-    const labelledBy = el.getAttribute("aria-labelledby");
-    if (labelledBy) {{
-        const parts = labelledBy.split(/\s+/).map(id => {{
-            const ref_ = el.getRootNode().getElementById(id);
-            return ref_ ? ref_.textContent.trim() : "";
-        }}).filter(Boolean);
-        if (parts.length) return parts.join(" ");
-    }}
+    const labelledBy = labelledByText(el);
+    if (labelledBy) return normalizeText(labelledBy);
 
-    if (el.labels && el.labels.length) {{
-        const txt = Array.from(el.labels).map(l => l.textContent.trim()).join(" ");
-        if (txt) return txt;
-    }}
+    const labelText = labelElementText(el);
+    if (labelText) return normalizeText(labelText);
 
     const ph = el.getAttribute("placeholder") || el.getAttribute("data-placeholder");
     if (ph) return ph.trim();
@@ -148,6 +267,17 @@ function getLabel(el) {{
 
     // Last resort: tag name, so we never concatenate descendant text.
     return el.tagName.toLowerCase();
+}}
+
+function getVisibleText(el) {{
+    // innerText follows rendered text more closely than textContent. Fall
+    // back to the old pruned text helpers for elements/browsers that do not
+    // expose useful innerText.
+    const inner = truncate(el.innerText || "", 300);
+    if (inner) return inner;
+    const own = ownTextNodes(el);
+    if (own) return truncate(own, 300);
+    return truncate(directOwnText(el), 300);
 }}
 
 function hasOwnLabel(el) {{
@@ -231,6 +361,43 @@ function getParentContext(el) {{
     return {{ role: "", name: "" }};
 }}
 
+function viewportRect(el) {{
+    const rect = el.getBoundingClientRect();
+    return {{
+        x: Math.round(rect.x * 10) / 10,
+        y: Math.round(rect.y * 10) / 10,
+        width: Math.round(rect.width * 10) / 10,
+        height: Math.round(rect.height * 10) / 10,
+    }};
+}}
+
+function intersectsViewport(rect) {{
+    return rect.width > 0
+        && rect.height > 0
+        && rect.x < window.innerWidth
+        && rect.y < window.innerHeight
+        && rect.x + rect.width > 0
+        && rect.y + rect.height > 0;
+}}
+
+function matchFields(fields) {{
+    if (!queryLower) return [];
+    const matched = [];
+    for (const [name, value] of Object.entries(fields)) {{
+        if (value && value.toLowerCase().includes(queryLower)) {{
+            matched.push(name);
+        }}
+    }}
+    return matched;
+}}
+
+function meaningfullyDifferent(a, b) {{
+    const left = normalizeText(a).toLowerCase();
+    const right = normalizeText(b).toLowerCase();
+    if (!left || !right || left === right) return false;
+    return !left.includes(right) && !right.includes(left);
+}}
+
 function isInteractive(el) {{
     if (INTERACTIVE_TAGS.has(el.tagName)) return true;
     if (el.isContentEditable && (!el.parentElement || !el.parentElement.isContentEditable)) return true;
@@ -265,43 +432,96 @@ const allElements = [];
 walk(document, allElements);
 
 const queryLower = QUERY.toLowerCase();
-const matchedElements = [];
-const metadataArray = [];
+const matched = [];
 const roleCounts = {{}};
 
 for (const el of allElements) {{
     const label = getLabel(el);
     const role = getRole(el);
+    const accessibleName = truncate(explicitAccessibleName(el), 200);
+    const visibleText = getVisibleText(el);
+    const value = truncate(formValue(el), 200);
+    const placeholder = truncate(el.getAttribute("placeholder") || el.getAttribute("data-placeholder") || "", 200);
+    const title = truncate(el.getAttribute("title") || "", 200);
+    const altText = truncate(el.getAttribute("alt") || "", 200);
+    const testId = truncate(el.getAttribute("data-testid") || el.getAttribute("data-test") || el.getAttribute("data-cy") || "", 200);
 
     // Inventory counts all interactive elements regardless of visibility or text match
     if (!roleCounts[role]) roleCounts[role] = {{ count: 0, labels: [] }};
     roleCounts[role].count++;
-    if (roleCounts[role].labels.length < 3 && label) {{
-        roleCounts[role].labels.push(label.substring(0, 80));
+    const inventoryLabel = label || visibleText;
+    if (roleCounts[role].labels.length < 3 && inventoryLabel) {{
+        roleCounts[role].labels.push(inventoryLabel.substring(0, 80));
     }}
 
-    // Match filter: cheap checks first, expensive isVisible last
+    // Match filter: cheap checks first, expensive isVisible last.
     if (ROLE_FILTER && role !== ROLE_FILTER) continue;
-    if (!label.toLowerCase().includes(queryLower)) continue;
-    if (matchedElements.length >= MAX) continue;
+
+    const parent = getParentContext(el);
+    const matchedOn = matchFields({{
+        label,
+        accessible_name: accessibleName,
+        visible_text: visibleText,
+        value,
+        placeholder,
+        title,
+        alt_text: altText,
+        test_id: testId,
+    }});
+    if (queryLower && matchedOn.length === 0) continue;
     if (!isVisible(el)) continue;
 
     const tag = el.tagName.toLowerCase();
     const disabled = el.disabled === true || el.getAttribute("aria-disabled") === "true";
-    const parent = getParentContext(el);
+    const rect = viewportRect(el);
+    const inViewport = intersectsViewport(rect);
+    const warnings = [];
+    if (meaningfullyDifferent(accessibleName, visibleText)) {{
+        warnings.push("accessible_name_visible_text_mismatch");
+    }}
+    if (!inViewport) {{
+        warnings.push("outside_viewport");
+    }}
 
     // Store metadata in a parallel array (avoids mutating live DOM elements)
-    metadataArray.push({{
-        backendNodeId: 0,
-        role,
-        label: label.substring(0, 200),
-        tag,
-        disabled,
-        parentRole: parent.role,
-        parentName: parent.name.substring(0, 100),
+    matched.push({{
+        el,
+        metadata: {{
+            backendNodeId: 0,
+            role,
+            label: label.substring(0, 200),
+            tag,
+            disabled,
+            parentRole: parent.role,
+            parentName: truncate(parent.name, 100),
+            accessibleName,
+            visibleText,
+            value,
+            placeholder,
+            title,
+            altText,
+            testId,
+            matchedOn,
+            warnings,
+            viewportRect: rect,
+            inViewport,
+        }},
     }});
-    matchedElements.push(el);
 }}
+
+matched.sort((a, b) => {{
+    if (a.metadata.inViewport !== b.metadata.inViewport) {{
+        return a.metadata.inViewport ? -1 : 1;
+    }}
+    if (a.metadata.viewportRect.y !== b.metadata.viewportRect.y) {{
+        return a.metadata.viewportRect.y - b.metadata.viewportRect.y;
+    }}
+    return a.metadata.viewportRect.x - b.metadata.viewportRect.x;
+}});
+
+const selected = matched.slice(0, MAX);
+const matchedElements = selected.map(item => item.el);
+const metadataArray = selected.map(item => item.metadata);
 
 const inventory = Object.entries(roleCounts).map(([role, data]) => ({{
     role,
@@ -326,9 +546,45 @@ pub fn format_dom_snapshot(candidates: &[DomCandidate]) -> String {
         if !node.label.is_empty() {
             parts.push(format!("\"{}\"", node.label));
         }
+        if !node.accessible_name.is_empty() && node.accessible_name != node.label {
+            parts.push(format!("accessible_name=\"{}\"", node.accessible_name));
+        }
+        if !node.visible_text.is_empty() && node.visible_text != node.label {
+            parts.push(format!("visible_text=\"{}\"", node.visible_text));
+        }
+        if !node.value.is_empty() && node.value != node.label {
+            parts.push(format!("value=\"{}\"", node.value));
+        }
+        if !node.placeholder.is_empty() && node.placeholder != node.label {
+            parts.push(format!("placeholder=\"{}\"", node.placeholder));
+        }
+        if !node.title.is_empty() && node.title != node.label {
+            parts.push(format!("title=\"{}\"", node.title));
+        }
+        if !node.alt_text.is_empty() && node.alt_text != node.label {
+            parts.push(format!("alt=\"{}\"", node.alt_text));
+        }
+        if !node.test_id.is_empty() {
+            parts.push(format!("test_id=\"{}\"", node.test_id));
+        }
         parts.push(format!("tag={}", node.tag));
         if node.disabled {
             parts.push("disabled".to_string());
+        }
+        if let Some(rect) = &node.viewport_rect {
+            parts.push(format!(
+                "rect=({:.0},{:.0} {:.0}x{:.0})",
+                rect.x, rect.y, rect.width, rect.height
+            ));
+            if !node.in_viewport {
+                parts.push("offscreen".to_string());
+            }
+        }
+        if !node.matched_on.is_empty() {
+            parts.push(format!("matched_on={}", node.matched_on.join(",")));
+        }
+        if !node.warnings.is_empty() {
+            parts.push(format!("warnings={}", node.warnings.join(",")));
         }
         if !node.parent_role.is_empty() {
             if node.parent_name.is_empty() {
@@ -360,6 +616,7 @@ mod tests {
                 disabled: false,
                 parent_role: "form".to_string(),
                 parent_name: "Login".to_string(),
+                ..Default::default()
             },
             DomCandidate {
                 backend_node_id: 20,
@@ -369,6 +626,7 @@ mod tests {
                 disabled: false,
                 parent_role: "form".to_string(),
                 parent_name: "Login".to_string(),
+                ..Default::default()
             },
         ];
 
@@ -391,10 +649,32 @@ mod tests {
             disabled: false,
             parent_role: "dialog".to_string(),
             parent_name: "Confirm".to_string(),
+            ..Default::default()
         }];
 
         let map = build_dom_snapshot(&candidates, "about:blank".to_string(), 0);
         assert_eq!(map.backend_to_uids[&42], vec!["d1"]);
+    }
+
+    #[test]
+    fn build_dom_snapshot_uses_visible_display_name_for_stale_accessibility_label() {
+        let candidates = vec![DomCandidate {
+            backend_node_id: 42,
+            role: "button".to_string(),
+            label: "Chat with Ljuba Isakovic, 0 new messages".to_string(),
+            tag: "button".to_string(),
+            disabled: false,
+            parent_role: "list".to_string(),
+            parent_name: "Chats".to_string(),
+            visible_text: "Note to Self Tue Photo".to_string(),
+            matched_on: vec!["visible_text".to_string()],
+            warnings: vec!["accessible_name_visible_text_mismatch".to_string()],
+            ..Default::default()
+        }];
+
+        let map = build_dom_snapshot(&candidates, "about:blank".to_string(), 0);
+
+        assert_eq!(map.uid_to_node["d1"].name, "Note to Self Tue Photo");
     }
 
     #[test]
@@ -415,6 +695,19 @@ mod tests {
     }
 
     #[test]
+    fn dom_walker_js_keeps_parent_name_out_of_match_fields() {
+        let js = dom_walker_js("Note to Self", None, 10);
+        assert!(
+            !js.contains("parent_name: parent.name"),
+            "parent context should be rendered as metadata, not treated as a primary query hit"
+        );
+        assert!(
+            js.contains("parentName: truncate(parent.name, 100)"),
+            "parent context should still be returned for disambiguation"
+        );
+    }
+
+    #[test]
     fn format_dom_snapshot_basic() {
         let candidates = vec![
             DomCandidate {
@@ -425,6 +718,7 @@ mod tests {
                 disabled: false,
                 parent_role: "form".to_string(),
                 parent_name: "Login".to_string(),
+                ..Default::default()
             },
             DomCandidate {
                 backend_node_id: 20,
@@ -434,6 +728,7 @@ mod tests {
                 disabled: true,
                 parent_role: "".to_string(),
                 parent_name: "".to_string(),
+                ..Default::default()
             },
         ];
 
@@ -455,6 +750,7 @@ mod tests {
             disabled: false,
             parent_role: "nav".to_string(),
             parent_name: "".to_string(),
+            ..Default::default()
         }];
 
         let result = format_dom_snapshot(&candidates);
@@ -476,6 +772,7 @@ mod tests {
                 disabled: false,
                 parent_role: "list".to_string(),
                 parent_name: "Chats".to_string(),
+                ..Default::default()
             },
             DomCandidate {
                 backend_node_id: 200,
@@ -485,6 +782,7 @@ mod tests {
                 disabled: false,
                 parent_role: "header".to_string(),
                 parent_name: "".to_string(),
+                ..Default::default()
             },
         ];
 
@@ -610,6 +908,7 @@ mod tests {
             disabled: false,
             parent_role: "header".to_string(),
             parent_name: "".to_string(),
+            ..Default::default()
         }];
 
         let result = format_dom_snapshot(&candidates);

@@ -327,10 +327,13 @@ impl MacOSDevToolsServer {
                 tools,
                 &[
                     "cdp_take_dom_snapshot",
+                    "cdp_summarize_page",
                     "cdp_find_elements",
+                    "cdp_get_element_context",
                     "cdp_list_pages",
                     "cdp_element_at_point",
                     "cdp_wait_for",
+                    "cdp_wait_for_page_change",
                 ],
                 annotate_read_only(),
             );
@@ -1485,7 +1488,7 @@ impl MacOSDevToolsServer {
     fn get_cdp_connect_tool() -> Tool {
         Tool::new(
             "cdp_connect",
-            "Connect to a Chrome or Electron app via its remote debugging port. The app must be launched with --remote-debugging-port=PORT and --user-data-dir=PATH (Chrome 136+ requires a non-default profile for the debug port to open). After connecting, use cdp_find_elements to discover page elements (preferred), or cdp_take_dom_snapshot for a full page overview.",
+            "Connect to a Chrome or Electron app via its remote debugging port. The app must be launched with --remote-debugging-port=PORT and --user-data-dir=PATH (Chrome 136+ requires a non-default profile for the debug port to open). After connecting, use cdp_summarize_page for page inventory, cdp_find_elements for targeted discovery, and cdp_get_element_context to expand an ambiguous match.",
             Arc::new(json_to_object(serde_json::json!({
                 "type": "object",
                 "required": ["port"],
@@ -1527,15 +1530,23 @@ impl MacOSDevToolsServer {
                 }))),
             ),
             Tool::new(
+                "cdp_summarize_page",
+                "Return a compact page summary: URL, title, current page generation, and an inventory of interactive elements grouped by role with a few sample labels. Does not return element UIDs and does not overwrite the current DOM UID snapshot. Use this for orientation before issuing targeted cdp_find_elements queries.",
+                Arc::new(json_to_object(serde_json::json!({
+                    "type": "object",
+                    "properties": {}
+                }))),
+            ),
+            Tool::new(
                 "cdp_find_elements",
-                "PREFERRED discovery tool. Search the live DOM for interactive elements matching a text query. Returns a compact result set with UIDs prefixed 'd' (e.g., d1, d2), plus a page-level inventory of all interactive elements grouped by role. Always try this first — it gives focused results without flooding context. Use cdp_take_dom_snapshot only if you need the full page structure. UIDs are valid for cdp_click, cdp_fill, and other action tools.",
+                "PREFERRED discovery tool. Search the live DOM for interactive elements matching a text query across labels, visible text, values, placeholders, titles, alt text, and test ids. Returns UIDs prefixed 'd' (e.g., d1, d2), match provenance, visible/accessibility text evidence, parent context for disambiguation, viewport geometry, warnings, and a page-level inventory grouped by role. Always try this first — it gives focused results without flooding context. Use cdp_take_dom_snapshot only if you need the full page structure. UIDs are valid for cdp_click, cdp_fill, and other action tools.",
                 Arc::new(json_to_object(serde_json::json!({
                     "type": "object",
                     "required": ["query"],
                     "properties": {
                         "query": {
                             "type": "string",
-                            "description": "Text to search for in element labels"
+                            "description": "Text to search for across element labels, visible text, values, placeholders, titles, alt text, and test ids"
                         },
                         "role": {
                             "type": "string",
@@ -1549,8 +1560,38 @@ impl MacOSDevToolsServer {
                 }))),
             ),
             Tool::new(
+                "cdp_get_element_context",
+                "Expand a UID returned by the most recent cdp_find_elements or cdp_take_dom_snapshot call. Returns the stored match evidence, nearby snapshot matches, and bounded live DOM context around the element (ancestors, siblings, and children). Use this when targeted search returns multiple plausible matches or the match needs local context before acting.",
+                Arc::new(json_to_object(serde_json::json!({
+                    "type": "object",
+                    "required": ["uid"],
+                    "properties": {
+                        "uid": {
+                            "type": "string",
+                            "description": (Self::UID_DESC)
+                        },
+                        "ancestor_depth": {
+                            "type": "integer",
+                            "description": "Maximum ancestor levels to include (default: 3, max: 8)"
+                        },
+                        "sibling_limit": {
+                            "type": "integer",
+                            "description": "Number of preceding/following siblings to include around the element (default: 2, max: 10)"
+                        },
+                        "child_limit": {
+                            "type": "integer",
+                            "description": "Maximum direct children to summarize (default: 8, max: 50)"
+                        },
+                        "max_chars": {
+                            "type": "integer",
+                            "description": "Maximum text characters per summarized node (default: 240, range: 40-1000)"
+                        }
+                    }
+                }))),
+            ),
+            Tool::new(
                 "cdp_evaluate_script",
-                "Evaluate a JavaScript function in the selected browser page. Returns the response as JSON. Example without arguments: '() => document.title' or 'async () => fetch(url)'. Example with element arguments: pass UIDs from cdp_take_dom_snapshot or cdp_find_elements via args to reference DOM elements, e.g., '(el) => el.innerText' with args=[{uid: 'd5'}].",
+                "Evaluate a JavaScript function in the selected browser page. Arbitrary script execution may mutate page or external state and is approval-gated by clients; prefer cdp_find_elements/cdp_take_dom_snapshot for discovery and typed cdp_* action tools for UI changes. Returns the response as JSON. Example without arguments: '() => document.title'. Example with element arguments: pass UIDs from cdp_take_dom_snapshot or cdp_find_elements via args to reference DOM elements, e.g., '(el) => el.innerText' with args=[{uid: 'd5'}].",
                 Arc::new(json_to_object(serde_json::json!({
                     "type": "object",
                     "required": ["function"],
@@ -1763,6 +1804,43 @@ impl MacOSDevToolsServer {
                         "include_snapshot": {
                             "type": "boolean",
                             "description": "Appends a DOM snapshot (d-prefixed UIDs) to the response after the text appears (default: false). When false, only a short 'text appeared after Xms' line is returned."
+                        }
+                    }
+                }))),
+            ),
+            Tool::new(
+                "cdp_wait_for_page_change",
+                "Wait until the selected page or a scoped DOM element has a semantic visible-text/editor-value change. Use this for unknown incoming messages, replies, notifications, or page updates after you have chosen the best scope_uid with cdp_find_elements/cdp_get_element_context. This blocks inside one tool call and returns compact before/after deltas.",
+                Arc::new(json_to_object(serde_json::json!({
+                    "type": "object",
+                    "properties": {
+                        "scope_uid": {
+                            "type": "string",
+                            "description": "Optional d-prefixed uid to watch. Prefer a stable container such as a message list, inbox list, thread, panel, or editor. Omit only when a page-level wait is intentional."
+                        },
+                        "condition": {
+                            "type": "string",
+                            "description": "Coarse condition label for the wait, e.g. semantic_delta, new_visible_text, item_count_changed. Currently evaluated as semantic_delta and echoed in the result."
+                        },
+                        "goal": {
+                            "type": "string",
+                            "description": "Short natural-language goal to echo in the result so the next model turn can judge relevance, e.g. new incoming message in Note to Self."
+                        },
+                        "timeout": {
+                            "type": "integer",
+                            "description": "Maximum wait time in milliseconds (default: 55000, capped at 55000 to stay within the Clickweave MCP client timeout)"
+                        },
+                        "poll_interval_ms": {
+                            "type": "integer",
+                            "description": "Backup polling interval in milliseconds for changes MutationObserver cannot see (default: 500, clamped to 100-5000)"
+                        },
+                        "stable_ms": {
+                            "type": "integer",
+                            "description": "Debounce/stability window after a wake-up before comparing semantic text (default: 500, clamped to 100-2000)"
+                        },
+                        "include_snapshot": {
+                            "type": "boolean",
+                            "description": "Appends a compact DOM snapshot after the wait returns (default: false). The normal response already includes before/after text tails and deltas."
                         }
                     }
                 }))),
@@ -2614,6 +2692,10 @@ impl ServerHandler for MacOSDevToolsServer {
                 )
             }
             #[cfg(feature = "cdp")]
+            "cdp_summarize_page" => {
+                Ok(crate::cdp::tools::cdp_summarize_page(self.cdp_client.clone()).await)
+            }
+            #[cfg(feature = "cdp")]
             "cdp_find_elements" => {
                 let query = parse_string_field(&args, "query")?;
                 let role = args.get("role").and_then(|v| v.as_str()).map(String::from);
@@ -2625,6 +2707,35 @@ impl ServerHandler for MacOSDevToolsServer {
                     query,
                     role,
                     max_results,
+                    self.cdp_client.clone(),
+                )
+                .await)
+            }
+            #[cfg(feature = "cdp")]
+            "cdp_get_element_context" => {
+                let uid = parse_string_field(&args, "uid")?;
+                let ancestor_depth = args
+                    .get("ancestor_depth")
+                    .and_then(|v| v.as_u64())
+                    .map(|n| n as u32);
+                let sibling_limit = args
+                    .get("sibling_limit")
+                    .and_then(|v| v.as_u64())
+                    .map(|n| n as u32);
+                let child_limit = args
+                    .get("child_limit")
+                    .and_then(|v| v.as_u64())
+                    .map(|n| n as u32);
+                let max_chars = args
+                    .get("max_chars")
+                    .and_then(|v| v.as_u64())
+                    .map(|n| n as u32);
+                Ok(crate::cdp::tools::cdp_get_element_context(
+                    uid,
+                    ancestor_depth,
+                    sibling_limit,
+                    child_limit,
+                    max_chars,
                     self.cdp_client.clone(),
                 )
                 .await)
@@ -2788,6 +2899,36 @@ impl ServerHandler for MacOSDevToolsServer {
                 Ok(crate::cdp::tools::cdp_wait_for(
                     texts,
                     timeout,
+                    include_snapshot,
+                    self.cdp_client.clone(),
+                )
+                .await)
+            }
+            #[cfg(feature = "cdp")]
+            "cdp_wait_for_page_change" => {
+                let scope_uid = args
+                    .get("scope_uid")
+                    .and_then(|v| v.as_str())
+                    .map(String::from);
+                let condition = args
+                    .get("condition")
+                    .and_then(|v| v.as_str())
+                    .map(String::from);
+                let goal = args.get("goal").and_then(|v| v.as_str()).map(String::from);
+                let timeout = args.get("timeout").and_then(|v| v.as_u64());
+                let poll_interval_ms = args.get("poll_interval_ms").and_then(|v| v.as_u64());
+                let stable_ms = args.get("stable_ms").and_then(|v| v.as_u64());
+                let include_snapshot = args
+                    .get("include_snapshot")
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(false);
+                Ok(crate::cdp::tools::cdp_wait_for_page_change(
+                    scope_uid,
+                    condition,
+                    goal,
+                    timeout,
+                    poll_interval_ms,
+                    stable_ms,
                     include_snapshot,
                     self.cdp_client.clone(),
                 )

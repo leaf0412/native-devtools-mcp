@@ -157,9 +157,14 @@ pub fn cdp_error(msg: impl Into<String>) -> CallToolResult {
 /// Either signal mismatching is enough to reject the snapshot as stale.
 pub struct SnapshotMap {
     pub uid_to_node: HashMap<String, SnapshotNode>,
+    /// Rich candidate metadata keyed by d-prefixed UID. This is used by
+    /// bounded expansion tools without requiring a fresh page-wide dump.
+    pub uid_to_candidate: HashMap<String, dom_discovery::DomCandidate>,
     /// Reverse map: backendNodeId → list of snapshot UIDs.
     /// Skips entries where backendNodeId is 0 (no DOM backing).
     pub backend_to_uids: HashMap<i64, Vec<String>>,
+    /// Snapshot order, matching the order UIDs were assigned in the response.
+    pub ordered_uids: Vec<String>,
     /// URL of the page at the moment this snapshot was taken.
     pub page_url: String,
     /// Value of [`CdpClient::generation`] at the moment this snapshot was taken.
@@ -219,7 +224,9 @@ mod tests {
     fn make_dom_map(generation: u64, uid: &str, backend_node_id: i64) -> SnapshotMap {
         let mut map = SnapshotMap {
             uid_to_node: HashMap::new(),
+            uid_to_candidate: HashMap::new(),
             backend_to_uids: HashMap::new(),
+            ordered_uids: vec![uid.to_string()],
             page_url: URL.to_string(),
             generation,
         };
