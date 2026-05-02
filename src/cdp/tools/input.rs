@@ -4,10 +4,11 @@ use super::{resolve_element_center, resolve_node, resolve_to_object_id};
 use crate::cdp::{cdp_error, CdpClient};
 use chromiumoxide::cdp::browser_protocol::input::{
     DispatchKeyEventParams, DispatchKeyEventType, DispatchMouseEventParams, DispatchMouseEventType,
-    MouseButton,
+    InsertTextParams, MouseButton,
 };
 use chromiumoxide::cdp::js_protocol::runtime::{CallArgument, CallFunctionOnParams};
 use rmcp::model::{CallToolResult, Content};
+use serde_json::Value;
 use std::sync::Arc;
 use tokio::sync::RwLock;
 
@@ -30,6 +31,36 @@ async fn maybe_append_snapshot(
         super::script::cdp_take_dom_snapshot(Some(AUTO_SNAPSHOT_MAX_NODES), cdp_client).await;
     result.content.extend(snapshot.content);
     result
+}
+
+async fn invalidate_snapshot_cache(cdp_client: Arc<RwLock<Option<CdpClient>>>) {
+    if let Some(client) = cdp_client.write().await.as_mut() {
+        client.invalidate_snapshots();
+    }
+}
+
+async fn finish_after_action(
+    result: CallToolResult,
+    include_snapshot: bool,
+    cdp_client: Arc<RwLock<Option<CdpClient>>>,
+) -> CallToolResult {
+    invalidate_snapshot_cache(cdp_client.clone()).await;
+    maybe_append_snapshot(result, include_snapshot, cdp_client).await
+}
+
+fn observed_fill_status(strategy: &str, observed_text: &str, value: &str) -> &'static str {
+    let matched = if strategy == "select_value" {
+        observed_text
+            .lines()
+            .any(|part| part.trim() == value || part.contains(value))
+    } else {
+        observed_text.contains(value)
+    };
+    if matched {
+        "observed_text=true"
+    } else {
+        "observed_text=false"
+    }
 }
 
 pub async fn cdp_click(
@@ -82,7 +113,7 @@ pub async fn cdp_click(
         "Clicked uid={} '{}' ({}) at ({:.1}, {:.1}){}",
         uid, node_name, node_role, cx, cy, dbl_note
     ))]);
-    maybe_append_snapshot(result, include_snapshot, cdp_client).await
+    finish_after_action(result, include_snapshot, cdp_client).await
 }
 
 pub async fn cdp_hover(
@@ -117,7 +148,7 @@ pub async fn cdp_hover(
         "Hovered uid={} '{}' ({}) at ({:.1}, {:.1})",
         uid, node_name, node_role, cx, cy
     ))]);
-    maybe_append_snapshot(result, include_snapshot, cdp_client).await
+    finish_after_action(result, include_snapshot, cdp_client).await
 }
 
 pub async fn cdp_fill(
@@ -151,46 +182,196 @@ pub async fn cdp_fill(
     };
 
     let fill_fn = r#"function(value) {
+        function textOf(el) {
+            if (!el) return "";
+            if (el.tagName === "SELECT") {
+                const selected = el.options && el.selectedIndex >= 0 ? el.options[el.selectedIndex] : null;
+                const selectedValue = selected ? selected.value : (el.value || "");
+                const selectedText = selected ? (selected.textContent || "").replace(/\s+/g, " ").trim() : "";
+                return [selectedValue, selectedText].filter(Boolean).join("\n");
+            }
+            if ("value" in el) return el.value || "";
+            return (el.innerText || el.textContent || "").replace(/\s+/g, " ").trim();
+        }
+
+        function findRichEditor(el) {
+            if (el && el.isContentEditable) return el;
+            if (!el || !el.querySelector) return null;
+            return el.querySelector([
+                "[contenteditable='true']",
+                "[contenteditable='plaintext-only']",
+                ".ql-editor",
+                ".ProseMirror",
+                "[data-lexical-editor='true']",
+                "[role='textbox'][contenteditable]"
+            ].join(","));
+        }
+
+        function selectEditableContents(el) {
+            el.focus({ preventScroll: true });
+            const doc = el.ownerDocument || document;
+            const selection = doc.getSelection && doc.getSelection();
+            if (!selection) return;
+            const range = doc.createRange();
+            range.selectNodeContents(el);
+            selection.removeAllRanges();
+            selection.addRange(range);
+        }
+
+        function setNativeValue(el, nextValue) {
+            const proto = el.tagName === "TEXTAREA"
+                ? HTMLTextAreaElement.prototype
+                : HTMLInputElement.prototype;
+            const setter = Object.getOwnPropertyDescriptor(proto, "value")?.set;
+            if (setter) setter.call(el, nextValue);
+            else el.value = nextValue;
+            el.dispatchEvent(new InputEvent("input", {
+                bubbles: true,
+                composed: true,
+                inputType: "insertText",
+                data: nextValue
+            }));
+            el.dispatchEvent(new Event("change", { bubbles: true }));
+        }
+
         if (this.tagName === 'SELECT') {
             const option = Array.from(this.options).find(o => o.value === value || o.textContent.trim() === value);
             if (!option) throw new Error('Option not found: ' + value);
             this.value = option.value;
             this.dispatchEvent(new Event('input', { bubbles: true }));
             this.dispatchEvent(new Event('change', { bubbles: true }));
-            return;
+            return { strategy: "select_value", observedText: textOf(this) };
         }
+
+        if (this.tagName === "INPUT" || this.tagName === "TEXTAREA") {
+            this.focus({ preventScroll: true });
+            if (this.select) this.select();
+            setNativeValue(this, value);
+            return { strategy: "native_value_setter", observedText: textOf(this) };
+        }
+
+        const richEditor = findRichEditor(this);
+        if (richEditor) {
+            selectEditableContents(richEditor);
+            return {
+                strategy: "rich_editor_keyboard",
+                observedText: textOf(richEditor),
+                targetTag: richEditor.tagName.toLowerCase(),
+                targetClass: String(richEditor.className || "")
+            };
+        }
+
         this.focus();
         if (this.select) this.select();
         else document.execCommand('selectAll', false, null);
         document.execCommand('insertText', false, value);
+        return { strategy: "exec_command", observedText: textOf(this) };
     }"#;
 
     let call_params = match CallFunctionOnParams::builder()
         .function_declaration(fill_fn)
-        .object_id(object_id)
+        .object_id(object_id.clone())
         .arguments(vec![CallArgument::builder()
             .value(serde_json::Value::String(value.clone()))
             .build()])
         .await_promise(true)
+        .return_by_value(true)
         .build()
     {
         Ok(p) => p,
         Err(e) => return cdp_error(format!("Failed to build call params: {}", e)),
     };
 
-    let result = match page.execute(call_params).await {
+    let prep = match page.execute(call_params).await {
         Ok(resp) => {
             if let Some(exc) = &resp.result.exception_details {
                 return cdp_error(format!("Fill failed: {}", exc.text));
             }
-            CallToolResult::success(vec![Content::text(format!(
-                "Filled uid={} '{}' ({}) with '{}'",
-                uid, node_name, node_role, value
-            ))])
+            resp.result.result.value.unwrap_or(Value::Null)
         }
         Err(e) => return cdp_error(format!("Fill failed on uid={}: {}", uid, e)),
     };
-    maybe_append_snapshot(result, include_snapshot, cdp_client).await
+
+    let strategy = prep
+        .get("strategy")
+        .and_then(Value::as_str)
+        .unwrap_or("unknown");
+    if strategy == "rich_editor_keyboard" {
+        if let Err(e) = page.execute(InsertTextParams::new(value.clone())).await {
+            return cdp_error(format!(
+                "Fill failed on uid={} with CDP text insertion: {}",
+                uid, e
+            ));
+        }
+    }
+
+    let verify_fn = r#"function() {
+        function textOf(el) {
+            if (!el) return "";
+            if (el.tagName === "SELECT") {
+                const selected = el.options && el.selectedIndex >= 0 ? el.options[el.selectedIndex] : null;
+                const selectedValue = selected ? selected.value : (el.value || "");
+                const selectedText = selected ? (selected.textContent || "").replace(/\s+/g, " ").trim() : "";
+                return [selectedValue, selectedText].filter(Boolean).join("\n");
+            }
+            if ("value" in el) return el.value || "";
+            return (el.innerText || el.textContent || "").replace(/\s+/g, " ").trim();
+        }
+        function findRichEditor(el) {
+            if (el && el.isContentEditable) return el;
+            if (!el || !el.querySelector) return null;
+            return el.querySelector([
+                "[contenteditable='true']",
+                "[contenteditable='plaintext-only']",
+                ".ql-editor",
+                ".ProseMirror",
+                "[data-lexical-editor='true']",
+                "[role='textbox'][contenteditable]"
+            ].join(","));
+        }
+        const target = findRichEditor(this) || this;
+        return { observedText: textOf(target), active: document.activeElement === target };
+    }"#;
+    let verify_params = match CallFunctionOnParams::builder()
+        .function_declaration(verify_fn)
+        .object_id(object_id)
+        .return_by_value(true)
+        .await_promise(true)
+        .build()
+    {
+        Ok(p) => p,
+        Err(e) => return cdp_error(format!("Failed to build verification params: {}", e)),
+    };
+    let observed_text = match page.execute(verify_params).await {
+        Ok(resp) => {
+            if let Some(exc) = &resp.result.exception_details {
+                return cdp_error(format!("Fill verification failed: {}", exc.text));
+            }
+            resp.result
+                .result
+                .value
+                .and_then(|v| {
+                    v.get("observedText")
+                        .and_then(Value::as_str)
+                        .map(str::to_string)
+                })
+                .unwrap_or_default()
+        }
+        Err(e) => return cdp_error(format!("Fill verification failed on uid={}: {}", uid, e)),
+    };
+
+    let observed = observed_fill_status(strategy, &observed_text, &value);
+    let rich_hint = if strategy == "rich_editor_keyboard" {
+        "; rich editor used CDP keyboard insertion. If this is a chat composer and the message is ready, use cdp_press_key({\"key\":\"Enter\"}) or find/click an enabled Send control to submit."
+    } else {
+        ""
+    };
+
+    let result = CallToolResult::success(vec![Content::text(format!(
+        "Filled uid={} '{}' ({}) with '{}' (strategy={}, {}{})",
+        uid, node_name, node_role, value, strategy, observed, rich_hint
+    ))]);
+    finish_after_action(result, include_snapshot, cdp_client).await
 }
 
 /// Map a key name to its CDP key identifier, code, and Windows virtual key code.
@@ -475,7 +656,7 @@ pub async fn cdp_press_key(
     }
 
     let result = CallToolResult::success(vec![Content::text(format!("Pressed key: {}", key))]);
-    maybe_append_snapshot(result, include_snapshot, cdp_client).await
+    finish_after_action(result, include_snapshot, cdp_client).await
 }
 
 pub async fn cdp_type_text(
@@ -527,6 +708,7 @@ pub async fn cdp_type_text(
         .as_ref()
         .map(|k| format!(" + {}", k))
         .unwrap_or_default();
+    invalidate_snapshot_cache(cdp_client).await;
     CallToolResult::success(vec![Content::text(format!(
         "Typed text \"{}{}\"",
         text, suffix
@@ -538,6 +720,19 @@ mod tests {
     use super::*;
 
     // MARK: - key_definition tests
+
+    #[test]
+    fn observed_fill_status_accepts_select_value_or_visible_text() {
+        let observed = "us\nUnited States";
+        assert_eq!(
+            observed_fill_status("select_value", observed, "us"),
+            "observed_text=true"
+        );
+        assert_eq!(
+            observed_fill_status("select_value", observed, "United States"),
+            "observed_text=true"
+        );
+    }
 
     #[test]
     fn key_definition_returns_enter() {
