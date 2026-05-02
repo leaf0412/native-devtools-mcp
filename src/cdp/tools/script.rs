@@ -487,12 +487,16 @@ fn string_argument(value: impl Into<Value>) -> CallArgument {
     CallArgument::builder().value(value.into()).build()
 }
 
-async fn resolve_scope_object_id(
+async fn resolve_scope_backend_node_id(
     scope_uid: &str,
-    client: &CdpClient,
     page: &Page,
-) -> Result<chromiumoxide::cdp::js_protocol::runtime::RemoteObjectId, CallToolResult> {
+    cdp_client: Arc<RwLock<Option<CdpClient>>>,
+) -> Result<i64, CallToolResult> {
     let current_url = page_url(page).await;
+    let guard = cdp_client.read().await;
+    let client = guard
+        .as_ref()
+        .ok_or_else(|| cdp_error("No CDP connection. Use cdp_connect first."))?;
     let node = crate::cdp::resolve_uid_from_maps(
         scope_uid,
         client.last_dom_snapshot.as_ref(),
@@ -500,8 +504,17 @@ async fn resolve_scope_object_id(
         &current_url,
     )
     .map_err(cdp_error)?;
+
+    Ok(node.backend_node_id)
+}
+
+async fn resolve_scope_object_id(
+    scope_uid: &str,
+    backend_node_id: i64,
+    page: &Page,
+) -> Result<chromiumoxide::cdp::js_protocol::runtime::RemoteObjectId, CallToolResult> {
     let resolve_params = ResolveNodeParams::builder()
-        .backend_node_id(BackendNodeId::new(node.backend_node_id))
+        .backend_node_id(BackendNodeId::new(backend_node_id))
         .build();
     let remote_object = page.execute(resolve_params).await.map_err(|e| {
         cdp_error(format!(
@@ -641,41 +654,46 @@ pub async fn cdp_wait_for_page_change(
     let condition = condition.unwrap_or_else(|| "semantic_delta".to_string());
     let scope_uid = scope_uid.filter(|uid| !uid.trim().is_empty());
 
-    let value = {
+    let page = {
         let guard = cdp_client.read().await;
         let client = match guard.as_ref() {
             Some(c) => c,
             None => return cdp_error("No CDP connection. Use cdp_connect first."),
         };
-        let page = match client.require_page() {
-            Ok(p) => p,
+        match client.require_page() {
+            Ok(page) => page,
             Err(e) => return e,
-        };
-        match scope_uid.as_deref() {
-            Some(uid) => {
-                let object_id = match resolve_scope_object_id(uid, client, &page).await {
-                    Ok(object_id) => object_id,
+        }
+    };
+
+    let value = match scope_uid.as_deref() {
+        Some(uid) => {
+            let backend_node_id =
+                match resolve_scope_backend_node_id(uid, &page, cdp_client.clone()).await {
+                    Ok(backend_node_id) => backend_node_id,
                     Err(e) => return e,
                 };
-                match wait_for_scoped_semantic_change(
-                    &page,
-                    object_id,
-                    raw_timeout,
-                    stable,
-                    poll_interval,
-                )
-                .await
-                {
-                    Ok(value) => value,
-                    Err(e) => return e,
-                }
+            let object_id = match resolve_scope_object_id(uid, backend_node_id, &page).await {
+                Ok(object_id) => object_id,
+                Err(e) => return e,
+            };
+            match wait_for_scoped_semantic_change(
+                &page,
+                object_id,
+                raw_timeout,
+                stable,
+                poll_interval,
+            )
+            .await
+            {
+                Ok(value) => value,
+                Err(e) => return e,
             }
-            None => {
-                match wait_for_page_semantic_change(&page, raw_timeout, stable, poll_interval).await
-                {
-                    Ok(value) => value,
-                    Err(e) => return e,
-                }
+        }
+        None => {
+            match wait_for_page_semantic_change(&page, raw_timeout, stable, poll_interval).await {
+                Ok(value) => value,
+                Err(e) => return e,
             }
         }
     };
@@ -1111,7 +1129,7 @@ pub async fn cdp_get_element_context(
         match client.last_dom_snapshot.as_ref() {
             Some(snapshot) => snapshot,
             None => return cdp_error(
-                "No DOM snapshot available. Call cdp_find_elements before cdp_get_element_context.",
+                "No DOM snapshot available. Call cdp_find_elements or cdp_take_dom_snapshot before cdp_get_element_context.",
             ),
         };
     let node = match crate::cdp::resolve_uid_from_maps(
@@ -1130,7 +1148,8 @@ pub async fn cdp_get_element_context(
         .get(&uid)
         .map(|candidate| dom_candidate_json(&uid, candidate))
         .unwrap_or_else(|| snapshot_node_json(&uid, node));
-    let nearby = nearby_snapshot_candidates(snapshot, &uid, sibling_limit.unwrap_or(2) as usize);
+    let nearby =
+        nearby_snapshot_candidates(snapshot, &uid, sibling_limit.unwrap_or(2).min(10) as usize);
     let backend_node_id = node.backend_node_id;
 
     let live_context = match live_element_context(

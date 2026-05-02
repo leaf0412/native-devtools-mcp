@@ -48,6 +48,21 @@ async fn finish_after_action(
     maybe_append_snapshot(result, include_snapshot, cdp_client).await
 }
 
+fn observed_fill_status(strategy: &str, observed_text: &str, value: &str) -> &'static str {
+    let matched = if strategy == "select_value" {
+        observed_text
+            .lines()
+            .any(|part| part.trim() == value || part.contains(value))
+    } else {
+        observed_text.contains(value)
+    };
+    if matched {
+        "observed_text=true"
+    } else {
+        "observed_text=false"
+    }
+}
+
 pub async fn cdp_click(
     uid: String,
     dbl_click: bool,
@@ -169,6 +184,12 @@ pub async fn cdp_fill(
     let fill_fn = r#"function(value) {
         function textOf(el) {
             if (!el) return "";
+            if (el.tagName === "SELECT") {
+                const selected = el.options && el.selectedIndex >= 0 ? el.options[el.selectedIndex] : null;
+                const selectedValue = selected ? selected.value : (el.value || "");
+                const selectedText = selected ? (selected.textContent || "").replace(/\s+/g, " ").trim() : "";
+                return [selectedValue, selectedText].filter(Boolean).join("\n");
+            }
             if ("value" in el) return el.value || "";
             return (el.innerText || el.textContent || "").replace(/\s+/g, " ").trim();
         }
@@ -287,6 +308,12 @@ pub async fn cdp_fill(
     let verify_fn = r#"function() {
         function textOf(el) {
             if (!el) return "";
+            if (el.tagName === "SELECT") {
+                const selected = el.options && el.selectedIndex >= 0 ? el.options[el.selectedIndex] : null;
+                const selectedValue = selected ? selected.value : (el.value || "");
+                const selectedText = selected ? (selected.textContent || "").replace(/\s+/g, " ").trim() : "";
+                return [selectedValue, selectedText].filter(Boolean).join("\n");
+            }
             if ("value" in el) return el.value || "";
             return (el.innerText || el.textContent || "").replace(/\s+/g, " ").trim();
         }
@@ -333,11 +360,7 @@ pub async fn cdp_fill(
         Err(e) => return cdp_error(format!("Fill verification failed on uid={}: {}", uid, e)),
     };
 
-    let observed = if observed_text.contains(&value) {
-        "observed_text=true"
-    } else {
-        "observed_text=false"
-    };
+    let observed = observed_fill_status(strategy, &observed_text, &value);
     let rich_hint = if strategy == "rich_editor_keyboard" {
         "; rich editor used CDP keyboard insertion. If this is a chat composer and the message is ready, use cdp_press_key({\"key\":\"Enter\"}) or find/click an enabled Send control to submit."
     } else {
@@ -697,6 +720,19 @@ mod tests {
     use super::*;
 
     // MARK: - key_definition tests
+
+    #[test]
+    fn observed_fill_status_accepts_select_value_or_visible_text() {
+        let observed = "us\nUnited States";
+        assert_eq!(
+            observed_fill_status("select_value", observed, "us"),
+            "observed_text=true"
+        );
+        assert_eq!(
+            observed_fill_status("select_value", observed, "United States"),
+            "observed_text=true"
+        );
+    }
 
     #[test]
     fn key_definition_returns_enter() {

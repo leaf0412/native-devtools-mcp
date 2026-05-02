@@ -438,6 +438,19 @@ const roleCounts = {{}};
 for (const el of allElements) {{
     const label = getLabel(el);
     const role = getRole(el);
+
+    // Inventory counts all interactive elements regardless of visibility or text match
+    if (!roleCounts[role]) roleCounts[role] = {{ count: 0, labels: [] }};
+    roleCounts[role].count++;
+    const inventoryLabel = label || (roleCounts[role].labels.length < 3 ? getVisibleText(el) : "");
+    if (roleCounts[role].labels.length < 3 && inventoryLabel) {{
+        roleCounts[role].labels.push(inventoryLabel.substring(0, 80));
+    }}
+
+    // Summary-only calls ask for MAX=0 and only consume inventory. Avoid
+    // computing expensive per-candidate metadata that would be discarded.
+    if (MAX === 0) continue;
+
     const accessibleName = truncate(explicitAccessibleName(el), 200);
     const visibleText = getVisibleText(el);
     const value = truncate(formValue(el), 200);
@@ -445,14 +458,6 @@ for (const el of allElements) {{
     const title = truncate(el.getAttribute("title") || "", 200);
     const altText = truncate(el.getAttribute("alt") || "", 200);
     const testId = truncate(el.getAttribute("data-testid") || el.getAttribute("data-test") || el.getAttribute("data-cy") || "", 200);
-
-    // Inventory counts all interactive elements regardless of visibility or text match
-    if (!roleCounts[role]) roleCounts[role] = {{ count: 0, labels: [] }};
-    roleCounts[role].count++;
-    const inventoryLabel = label || visibleText;
-    if (roleCounts[role].labels.length < 3 && inventoryLabel) {{
-        roleCounts[role].labels.push(inventoryLabel.substring(0, 80));
-    }}
 
     // Match filter: cheap checks first, expensive isVisible last.
     if (ROLE_FILTER && role !== ROLE_FILTER) continue;
@@ -704,6 +709,15 @@ mod tests {
         assert!(
             js.contains("parentName: truncate(parent.name, 100)"),
             "parent context should still be returned for disambiguation"
+        );
+    }
+
+    #[test]
+    fn dom_walker_js_short_circuits_candidate_metadata_when_max_zero() {
+        let js = dom_walker_js("", None, 0);
+        assert!(
+            js.contains("if (MAX === 0) continue;"),
+            "summary-only calls should skip per-candidate metadata work"
         );
     }
 
