@@ -1677,7 +1677,7 @@ impl MacOSDevToolsServer {
             ),
             Tool::new(
                 "cdp_fill",
-                "Type text into an input, text area, or select an option from a <select> element.",
+                "Type text into an input, text area, rich contenteditable editor, or select an option from a <select> element. Rich editors are focused inside the page and receive CDP keyboard insertion so framework state updates.",
                 Arc::new(json_to_object(serde_json::json!({
                     "type": "object",
                     "required": ["uid", "value"],

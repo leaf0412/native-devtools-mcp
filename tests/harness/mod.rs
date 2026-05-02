@@ -336,3 +336,29 @@ pub const HTML_SHADOW_AND_IFRAME: &str = r#"
   </script>
 </body></html>
 "#;
+
+/// Scenario 5: an Electron-style list row whose clickable container has an
+/// accessibility name that disagrees with its rendered descendant text.
+pub const HTML_ARIA_VISIBLE_TEXT_MISMATCH: &str = r#"
+<!doctype html>
+<html><body>
+  <button aria-label="Chat with Ljuba Isakovic, 0 new messages"
+          data-testid="conversation-row"
+          style="width:320px;height:72px;text-align:left">
+    <span>Note to Self</span>
+    <span>Tue</span>
+    <span>Photo</span>
+  </button>
+</body></html>
+"#;
+
+/// Scenario 6: text belongs to the row, not to every control nested inside it.
+pub const HTML_PARENT_TEXT_SHOULD_NOT_MATCH_CHILD: &str = r#"
+<!doctype html>
+<html><body>
+  <div role="listitem">
+    <span>Note to Self</span>
+    <button aria-label="More actions" style="width:32px;height:32px">...</button>
+  </div>
+</body></html>
+"#;
