@@ -1,6 +1,6 @@
 {
   "name": "native-devtools-mcp",
-  "version": "0.9.3",
+  "version": "0.10.0",
   "mcpName": "io.github.sh3ll3x3c/native-devtools",
   "description": "MCP server for native app testing — screenshot, OCR, click, type, find_text, template matching. macOS, Windows & Android.",
   "license": "MIT",
@@ -53,8 +53,8 @@
     "bin"
   ],
   "optionalDependencies": {
-    "@sh3ll3x3c/native-devtools-mcp-darwin-arm64": "0.9.3",
-    "@sh3ll3x3c/native-devtools-mcp-win32-x64": "0.9.3"
+    "@sh3ll3x3c/native-devtools-mcp-darwin-arm64": "0.10.0",
+    "@sh3ll3x3c/native-devtools-mcp-win32-x64": "0.10.0"
   },
   "engines": {
     "node": ">=18"
