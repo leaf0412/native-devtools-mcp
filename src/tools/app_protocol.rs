@@ -428,3 +428,295 @@ pub async fn app_focus_window(
         Err(e) => CallToolResult::error(vec![Content::text(format!("Failed: {}", e))]),
     }
 }
+
+// ============================================================================
+// MCP tool handlers. Each wraps the free function above with its name, schema,
+// and availability. `app_connect` is always visible (so the user can connect);
+// the others are gated `WhenAppConnected`, mirroring `get_app_connect_tool` /
+// `get_app_tools` + the connection gate in `get_tools`. Schema JSON moved
+// verbatim from the deleted getters; call bodies copied verbatim from the
+// deleted `call_tool` arms, with `ctx.app_client` / `ctx.peer` replacing
+// `self.app_client` / `context.peer`.
+// ============================================================================
+
+use crate::tools::registry::{
+    json_to_object, Availability, ToolContext, ToolHandler,
+};
+use rmcp::{model::Tool, Error as McpError};
+
+/// `app_connect` — always visible so a disconnected client can initiate a
+/// connection. Fires `notify_tool_list_changed` (inside the free function) so
+/// the now-connected app's tools become visible.
+pub struct AppConnect;
+
+#[async_trait::async_trait]
+impl ToolHandler for AppConnect {
+    fn name(&self) -> &'static str {
+        "app_connect"
+    }
+
+    fn schema(&self) -> Tool {
+        Tool::new(
+            "app_connect",
+            "Connect to an app's debug server via WebSocket. The app must have AppDebugKit embedded.",
+            Arc::new(json_to_object(serde_json::json!({
+                "type": "object",
+                "required": ["url"],
+                "properties": {
+                    "url": {
+                        "type": "string",
+                        "description": "WebSocket URL (e.g., ws://127.0.0.1:9222)"
+                    },
+                    "expected_bundle_id": {
+                        "type": "string",
+                        "description": "Expected bundle ID (e.g., com.example.MyApp). Connection fails if mismatch."
+                    },
+                    "expected_app_name": {
+                        "type": "string",
+                        "description": "Expected app name (case-insensitive). Connection fails if mismatch."
+                    }
+                }
+            }))),
+        )
+    }
+
+    async fn call(
+        &self,
+        args: serde_json::Value,
+        ctx: &ToolContext,
+    ) -> Result<CallToolResult, McpError> {
+        let params: AppConnectParams = serde_json::from_value(args)
+            .map_err(|e| McpError::invalid_params(e.to_string(), None))?;
+        let result = app_connect(params, ctx.app_client.clone(), ctx.peer.clone()).await;
+        Ok(result)
+    }
+}
+
+/// `app_disconnect` — visible only while connected. Fires
+/// `notify_tool_list_changed` (inside the free function) so the app tools
+/// disappear once the connection closes.
+pub struct AppDisconnect;
+
+#[async_trait::async_trait]
+impl ToolHandler for AppDisconnect {
+    fn name(&self) -> &'static str {
+        "app_disconnect"
+    }
+
+    fn availability(&self) -> Availability {
+        Availability::WhenAppConnected
+    }
+
+    fn schema(&self) -> Tool {
+        Tool::new(
+            "app_disconnect",
+            "Disconnect from the app's debug server.",
+            Arc::new(json_to_object(serde_json::json!({
+                "type": "object",
+                "properties": {}
+            }))),
+        )
+    }
+
+    async fn call(
+        &self,
+        _args: serde_json::Value,
+        ctx: &ToolContext,
+    ) -> Result<CallToolResult, McpError> {
+        let result = app_disconnect(ctx.app_client.clone(), ctx.peer.clone()).await;
+        Ok(result)
+    }
+}
+
+/// `app_get_info` — visible only while connected.
+pub struct AppGetInfo;
+
+#[async_trait::async_trait]
+impl ToolHandler for AppGetInfo {
+    fn name(&self) -> &'static str {
+        "app_get_info"
+    }
+
+    fn availability(&self) -> Availability {
+        Availability::WhenAppConnected
+    }
+
+    fn schema(&self) -> Tool {
+        Tool::new(
+            "app_get_info",
+            "Get runtime info from the connected app (name, bundle ID, version, etc.).",
+            Arc::new(json_to_object(serde_json::json!({
+                "type": "object",
+                "properties": {}
+            }))),
+        )
+    }
+
+    async fn call(
+        &self,
+        _args: serde_json::Value,
+        ctx: &ToolContext,
+    ) -> Result<CallToolResult, McpError> {
+        Ok(app_get_info(ctx.app_client.clone()).await)
+    }
+}
+
+/// `app_get_tree` — visible only while connected.
+pub struct AppGetTree;
+
+#[async_trait::async_trait]
+impl ToolHandler for AppGetTree {
+    fn name(&self) -> &'static str {
+        "app_get_tree"
+    }
+
+    fn availability(&self) -> Availability {
+        Availability::WhenAppConnected
+    }
+
+    fn schema(&self) -> Tool {
+        Tool::new(
+            "app_get_tree",
+            "Get the view hierarchy from the connected app.",
+            Arc::new(json_to_object(serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "depth": {
+                        "type": "integer",
+                        "description": "Max depth to traverse (-1 for unlimited)",
+                        "default": 5
+                    },
+                    "root_id": {
+                        "type": "string",
+                        "description": "Element ID to start from (optional, defaults to key window)"
+                    }
+                }
+            }))),
+        )
+    }
+
+    async fn call(
+        &self,
+        args: serde_json::Value,
+        ctx: &ToolContext,
+    ) -> Result<CallToolResult, McpError> {
+        let params: AppGetTreeParams = serde_json::from_value(args)
+            .map_err(|e| McpError::invalid_params(e.to_string(), None))?;
+        Ok(app_get_tree(params, ctx.app_client.clone()).await)
+    }
+}
+
+/// `app_get_element` — visible only while connected.
+pub struct AppGetElement;
+
+#[async_trait::async_trait]
+impl ToolHandler for AppGetElement {
+    fn name(&self) -> &'static str {
+        "app_get_element"
+    }
+
+    fn availability(&self) -> Availability {
+        Availability::WhenAppConnected
+    }
+
+    fn schema(&self) -> Tool {
+        Tool::new(
+            "app_get_element",
+            "Get detailed information about an element by ID.",
+            Arc::new(json_to_object(serde_json::json!({
+                "type": "object",
+                "required": ["element_id"],
+                "properties": {
+                    "element_id": {
+                        "type": "string",
+                        "description": "Element ID to get details for"
+                    }
+                }
+            }))),
+        )
+    }
+
+    async fn call(
+        &self,
+        args: serde_json::Value,
+        ctx: &ToolContext,
+    ) -> Result<CallToolResult, McpError> {
+        let params: AppGetElementParams = serde_json::from_value(args)
+            .map_err(|e| McpError::invalid_params(e.to_string(), None))?;
+        Ok(app_get_element(params, ctx.app_client.clone()).await)
+    }
+}
+
+/// `app_list_windows` — visible only while connected.
+pub struct AppListWindows;
+
+#[async_trait::async_trait]
+impl ToolHandler for AppListWindows {
+    fn name(&self) -> &'static str {
+        "app_list_windows"
+    }
+
+    fn availability(&self) -> Availability {
+        Availability::WhenAppConnected
+    }
+
+    fn schema(&self) -> Tool {
+        Tool::new(
+            "app_list_windows",
+            "List all windows in the connected app.",
+            Arc::new(json_to_object(serde_json::json!({
+                "type": "object",
+                "properties": {}
+            }))),
+        )
+    }
+
+    async fn call(
+        &self,
+        _args: serde_json::Value,
+        ctx: &ToolContext,
+    ) -> Result<CallToolResult, McpError> {
+        Ok(app_list_windows(ctx.app_client.clone()).await)
+    }
+}
+
+/// `app_focus_window` — visible only while connected.
+pub struct AppFocusWindow;
+
+#[async_trait::async_trait]
+impl ToolHandler for AppFocusWindow {
+    fn name(&self) -> &'static str {
+        "app_focus_window"
+    }
+
+    fn availability(&self) -> Availability {
+        Availability::WhenAppConnected
+    }
+
+    fn schema(&self) -> Tool {
+        Tool::new(
+            "app_focus_window",
+            "Focus a window in the connected app (make it key and main window).",
+            Arc::new(json_to_object(serde_json::json!({
+                "type": "object",
+                "required": ["window_id"],
+                "properties": {
+                    "window_id": {
+                        "type": "string",
+                        "description": "Window ID to focus (e.g., 'window-1')"
+                    }
+                }
+            }))),
+        )
+    }
+
+    async fn call(
+        &self,
+        args: serde_json::Value,
+        ctx: &ToolContext,
+    ) -> Result<CallToolResult, McpError> {
+        let params: AppFocusWindowParams = serde_json::from_value(args)
+            .map_err(|e| McpError::invalid_params(e.to_string(), None))?;
+        Ok(app_focus_window(params, ctx.app_client.clone()).await)
+    }
+}

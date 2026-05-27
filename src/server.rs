@@ -154,6 +154,13 @@ const MIGRATED: &[&str] = &[
     "ax_set_value",
     #[cfg(target_os = "macos")]
     "ax_select",
+    "app_connect",
+    "app_disconnect",
+    "app_get_info",
+    "app_get_tree",
+    "app_get_element",
+    "app_list_windows",
+    "app_focus_window",
 ];
 
 #[derive(Clone)]
@@ -295,7 +302,6 @@ impl MacOSDevToolsServer {
         recording: bool,
     ) -> Vec<Tool> {
         let mut tools = Self::get_base_tools();
-        tools.push(Self::get_app_connect_tool());
         if app_connected {
             tools.extend(Self::get_app_tools());
         }
@@ -456,69 +462,9 @@ impl MacOSDevToolsServer {
         Vec::new()
     }
 
-    /// The app_connect tool - always available to initiate connections
-    fn get_app_connect_tool() -> Tool {
-        Tool::new(
-            "app_connect",
-            "Connect to an app's debug server via WebSocket. The app must have AppDebugKit embedded.",
-            Arc::new(json_to_object(serde_json::json!({
-                "type": "object",
-                "required": ["url"],
-                "properties": {
-                    "url": {
-                        "type": "string",
-                        "description": "WebSocket URL (e.g., ws://127.0.0.1:9222)"
-                    },
-                    "expected_bundle_id": {
-                        "type": "string",
-                        "description": "Expected bundle ID (e.g., com.example.MyApp). Connection fails if mismatch."
-                    },
-                    "expected_app_name": {
-                        "type": "string",
-                        "description": "Expected app name (case-insensitive). Connection fails if mismatch."
-                    }
-                }
-            }))),
-        )
-    }
-
     /// App debug tools - only available when connected to an app
     fn get_app_tools() -> Vec<Tool> {
         vec![
-            Tool::new(
-                "app_disconnect",
-                "Disconnect from the app's debug server.",
-                Arc::new(json_to_object(serde_json::json!({
-                    "type": "object",
-                    "properties": {}
-                }))),
-            ),
-            Tool::new(
-                "app_get_info",
-                "Get runtime info from the connected app (name, bundle ID, version, etc.).",
-                Arc::new(json_to_object(serde_json::json!({
-                    "type": "object",
-                    "properties": {}
-                }))),
-            ),
-            Tool::new(
-                "app_get_tree",
-                "Get the view hierarchy from the connected app.",
-                Arc::new(json_to_object(serde_json::json!({
-                    "type": "object",
-                    "properties": {
-                        "depth": {
-                            "type": "integer",
-                            "description": "Max depth to traverse (-1 for unlimited)",
-                            "default": 5
-                        },
-                        "root_id": {
-                            "type": "string",
-                            "description": "Element ID to start from (optional, defaults to key window)"
-                        }
-                    }
-                }))),
-            ),
             Tool::new(
                 "app_query",
                 "Find elements matching a CSS-like selector in the connected app.",
@@ -534,20 +480,6 @@ impl MacOSDevToolsServer {
                             "type": "boolean",
                             "description": "Return all matches (default: first only)",
                             "default": false
-                        }
-                    }
-                }))),
-            ),
-            Tool::new(
-                "app_get_element",
-                "Get detailed information about an element by ID.",
-                Arc::new(json_to_object(serde_json::json!({
-                    "type": "object",
-                    "required": ["element_id"],
-                    "properties": {
-                        "element_id": {
-                            "type": "string",
-                            "description": "Element ID to get details for"
                         }
                     }
                 }))),
@@ -637,28 +569,6 @@ impl MacOSDevToolsServer {
                         "element_id": {
                             "type": "string",
                             "description": "Element ID to capture (whole window if omitted)"
-                        }
-                    }
-                }))),
-            ),
-            Tool::new(
-                "app_list_windows",
-                "List all windows in the connected app.",
-                Arc::new(json_to_object(serde_json::json!({
-                    "type": "object",
-                    "properties": {}
-                }))),
-            ),
-            Tool::new(
-                "app_focus_window",
-                "Focus a window in the connected app (make it key and main window).",
-                Arc::new(json_to_object(serde_json::json!({
-                    "type": "object",
-                    "required": ["window_id"],
-                    "properties": {
-                        "window_id": {
-                            "type": "string",
-                            "description": "Window ID to focus (e.g., 'window-1')"
                         }
                     }
                 }))),
@@ -1478,32 +1388,10 @@ impl ServerHandler for MacOSDevToolsServer {
 
         match request.name.as_ref() {
             // App Debug Protocol tools
-            "app_connect" => {
-                let params: app_tools::AppConnectParams = serde_json::from_value(args)
-                    .map_err(|e| McpError::invalid_params(e.to_string(), None))?;
-                let result =
-                    app_tools::app_connect(params, self.app_client.clone(), context.peer).await;
-                Ok(result)
-            }
-            "app_disconnect" => {
-                let result = app_tools::app_disconnect(self.app_client.clone(), context.peer).await;
-                Ok(result)
-            }
-            "app_get_info" => Ok(app_tools::app_get_info(self.app_client.clone()).await),
-            "app_get_tree" => {
-                let params: app_tools::AppGetTreeParams = serde_json::from_value(args)
-                    .map_err(|e| McpError::invalid_params(e.to_string(), None))?;
-                Ok(app_tools::app_get_tree(params, self.app_client.clone()).await)
-            }
             "app_query" => {
                 let params: app_tools::AppQueryParams = serde_json::from_value(args)
                     .map_err(|e| McpError::invalid_params(e.to_string(), None))?;
                 Ok(app_tools::app_query(params, self.app_client.clone()).await)
-            }
-            "app_get_element" => {
-                let params: app_tools::AppGetElementParams = serde_json::from_value(args)
-                    .map_err(|e| McpError::invalid_params(e.to_string(), None))?;
-                Ok(app_tools::app_get_element(params, self.app_client.clone()).await)
             }
             "app_click" => {
                 let params: app_tools::AppClickParams = serde_json::from_value(args)
@@ -1529,12 +1417,6 @@ impl ServerHandler for MacOSDevToolsServer {
                 let params: app_tools::AppScreenshotParams = serde_json::from_value(args)
                     .map_err(|e| McpError::invalid_params(e.to_string(), None))?;
                 Ok(app_tools::app_screenshot(params, self.app_client.clone()).await)
-            }
-            "app_list_windows" => Ok(app_tools::app_list_windows(self.app_client.clone()).await),
-            "app_focus_window" => {
-                let params: app_tools::AppFocusWindowParams = serde_json::from_value(args)
-                    .map_err(|e| McpError::invalid_params(e.to_string(), None))?;
-                Ok(app_tools::app_focus_window(params, self.app_client.clone()).await)
             }
             // Android tools
             "android_list_devices" => match crate::android::device::list_devices() {

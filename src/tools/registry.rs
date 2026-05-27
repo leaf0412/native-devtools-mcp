@@ -122,6 +122,13 @@ impl ToolRegistry {
             tools.push(Box::new(crate::tools::ax_set_value::AxSetValue));
             tools.push(Box::new(crate::tools::ax_select::AxSelect));
         }
+        tools.push(Box::new(crate::tools::app_protocol::AppConnect));
+        tools.push(Box::new(crate::tools::app_protocol::AppDisconnect));
+        tools.push(Box::new(crate::tools::app_protocol::AppGetInfo));
+        tools.push(Box::new(crate::tools::app_protocol::AppGetTree));
+        tools.push(Box::new(crate::tools::app_protocol::AppGetElement));
+        tools.push(Box::new(crate::tools::app_protocol::AppListWindows));
+        tools.push(Box::new(crate::tools::app_protocol::AppFocusWindow));
         Self { tools }
     }
 
