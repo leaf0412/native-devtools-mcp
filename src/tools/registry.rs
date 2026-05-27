@@ -129,6 +129,12 @@ impl ToolRegistry {
         tools.push(Box::new(crate::tools::app_protocol::AppGetElement));
         tools.push(Box::new(crate::tools::app_protocol::AppListWindows));
         tools.push(Box::new(crate::tools::app_protocol::AppFocusWindow));
+        tools.push(Box::new(crate::tools::app_protocol::AppQuery));
+        tools.push(Box::new(crate::tools::app_protocol::AppClick));
+        tools.push(Box::new(crate::tools::app_protocol::AppType));
+        tools.push(Box::new(crate::tools::app_protocol::AppPressKey));
+        tools.push(Box::new(crate::tools::app_protocol::AppFocus));
+        tools.push(Box::new(crate::tools::app_protocol::AppScreenshot));
         Self { tools }
     }
 
