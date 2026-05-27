@@ -287,6 +287,68 @@ fn apply_max_dimensions(
     img.resize(new_w, new_h, image::imageops::FilterType::Triangle)
 }
 
+use crate::tools::registry::{json_to_object, ToolContext, ToolHandler};
+use rmcp::{model::Tool, Error as McpError};
+
+/// `load_image` MCP tool handler.
+pub struct LoadImage;
+
+#[async_trait::async_trait]
+impl ToolHandler for LoadImage {
+    fn name(&self) -> &'static str {
+        "load_image"
+    }
+
+    fn schema(&self) -> Tool {
+        Tool::new(
+            "load_image",
+            "Load an image from a local file path and cache it for use with find_image. Returns an image_id that can be passed to find_image as template_id or mask_id. This avoids manually base64-encoding images.",
+            Arc::new(json_to_object(serde_json::json!({
+                "type": "object",
+                "required": ["path"],
+                "properties": {
+                    "path": {
+                        "type": "string",
+                        "description": "Local filesystem path to the image file"
+                    },
+                    "id_prefix": {
+                        "type": "string",
+                        "description": "Optional prefix for the generated ID (e.g., 'template', 'mask')"
+                    },
+                    "max_width": {
+                        "type": "integer",
+                        "description": "Maximum width to downscale to (maintains aspect ratio)"
+                    },
+                    "max_height": {
+                        "type": "integer",
+                        "description": "Maximum height to downscale to (maintains aspect ratio)"
+                    },
+                    "as_mask": {
+                        "type": "boolean",
+                        "description": "If true, convert to single-channel grayscale mask",
+                        "default": false
+                    },
+                    "return_base64": {
+                        "type": "boolean",
+                        "description": "If true, include base64-encoded image data in response",
+                        "default": false
+                    }
+                }
+            }))),
+        )
+    }
+
+    async fn call(
+        &self,
+        args: serde_json::Value,
+        ctx: &ToolContext,
+    ) -> Result<CallToolResult, McpError> {
+        let params: LoadImageParams = serde_json::from_value(args)
+            .map_err(|e| McpError::invalid_params(e.to_string(), None))?;
+        Ok(load_image(params, ctx.image_cache.clone()).await)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

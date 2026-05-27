@@ -113,6 +113,8 @@ impl ToolRegistry {
         tools.push(Box::new(crate::tools::input::GetDisplays));
         tools.push(Box::new(crate::tools::input::FindText));
         tools.push(Box::new(crate::tools::input::ElementAtPoint));
+        tools.push(Box::new(crate::tools::find_image::FindImage));
+        tools.push(Box::new(crate::tools::load_image::LoadImage));
         Self { tools }
     }
 

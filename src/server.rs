@@ -1,8 +1,8 @@
 use crate::app_protocol::AppProtocolClient;
 use crate::tools::registry::{ConnectionState, ToolContext, ToolRegistry};
 use crate::tools::{
-    app_protocol as app_tools, find_image, image_cache::ImageCache, input as input_tools,
-    load_image, screenshot, screenshot_cache::ScreenshotCache,
+    app_protocol as app_tools, image_cache::ImageCache, input as input_tools, screenshot,
+    screenshot_cache::ScreenshotCache,
 };
 use base64::Engine;
 use rmcp::model::Content;
@@ -145,6 +145,8 @@ const MIGRATED: &[&str] = &[
     "get_displays",
     "find_text",
     "element_at_point",
+    "find_image",
+    "load_image",
 ];
 
 #[derive(Clone)]
@@ -442,122 +444,6 @@ impl MacOSDevToolsServer {
     fn get_base_tools() -> Vec<Tool> {
         #[allow(unused_mut)]
         let mut tools = vec![
-            Tool::new(
-                "find_image",
-                "Find a template image within a screenshot using template matching. Returns precise click coordinates for non-text UI elements like icons and shapes. Use screenshot_id from take_screenshot or provide screenshot_image_base64. Use template_id from load_image or provide template_image_base64.",
-                Arc::new(json_to_object(serde_json::json!({
-                    "type": "object",
-                    "properties": {
-                        "screenshot_id": {
-                            "type": "string",
-                            "description": "Screenshot ID from a previous take_screenshot call (preferred)"
-                        },
-                        "screenshot_image_base64": {
-                            "type": "string",
-                            "description": "Base64-encoded screenshot image (used if no screenshot_id)"
-                        },
-                        "template_id": {
-                            "type": "string",
-                            "description": "Image ID from a previous load_image call (preferred over template_image_base64)"
-                        },
-                        "template_image_base64": {
-                            "type": "string",
-                            "description": "Base64-encoded template image to find (used if no template_id)"
-                        },
-                        "mask_id": {
-                            "type": "string",
-                            "description": "Image ID from a previous load_image call for the mask"
-                        },
-                        "mask_image_base64": {
-                            "type": "string",
-                            "description": "Base64-encoded mask image (optional; white=match, black=ignore)"
-                        },
-                        "mode": {
-                            "type": "string",
-                            "enum": ["fast", "accurate"],
-                            "description": "Matching mode: 'fast' (default) for quick searches, 'accurate' for thorough matching",
-                            "default": "fast"
-                        },
-                        "threshold": {
-                            "type": "number",
-                            "description": "Minimum match score 0.0-1.0 (default: 0.75)"
-                        },
-                        "max_results": {
-                            "type": "integer",
-                            "description": "Maximum matches to return (default: 3 fast, 5 accurate)"
-                        },
-                        "scales": {
-                            "type": "object",
-                            "description": "Scale search range {min, max, step}",
-                            "properties": {
-                                "min": { "type": "number", "default": 0.8 },
-                                "max": { "type": "number", "default": 1.2 },
-                                "step": { "type": "number", "default": 0.1 }
-                            }
-                        },
-                        "search_region": {
-                            "type": "object",
-                            "description": "Limit search to region {x, y, w, h} in screenshot pixels",
-                            "properties": {
-                                "x": { "type": "integer" },
-                                "y": { "type": "integer" },
-                                "w": { "type": "integer" },
-                                "h": { "type": "integer" }
-                            }
-                        },
-                        "stride": {
-                            "type": "integer",
-                            "description": "Search step size (default: 2 fast, 1 accurate)"
-                        },
-                        "rotations": {
-                            "type": "array",
-                            "items": { "type": "number" },
-                            "description": "Rotations to try in degrees (only 0, 90, 180, 270 supported)"
-                        },
-                        "return_screen_coords": {
-                            "type": "boolean",
-                            "description": "Include screen coordinates for clicking (default: true)",
-                            "default": true
-                        }
-                    }
-                }))),
-            ),
-            Tool::new(
-                "load_image",
-                "Load an image from a local file path and cache it for use with find_image. Returns an image_id that can be passed to find_image as template_id or mask_id. This avoids manually base64-encoding images.",
-                Arc::new(json_to_object(serde_json::json!({
-                    "type": "object",
-                    "required": ["path"],
-                    "properties": {
-                        "path": {
-                            "type": "string",
-                            "description": "Local filesystem path to the image file"
-                        },
-                        "id_prefix": {
-                            "type": "string",
-                            "description": "Optional prefix for the generated ID (e.g., 'template', 'mask')"
-                        },
-                        "max_width": {
-                            "type": "integer",
-                            "description": "Maximum width to downscale to (maintains aspect ratio)"
-                        },
-                        "max_height": {
-                            "type": "integer",
-                            "description": "Maximum height to downscale to (maintains aspect ratio)"
-                        },
-                        "as_mask": {
-                            "type": "boolean",
-                            "description": "If true, convert to single-channel grayscale mask",
-                            "default": false
-                        },
-                        "return_base64": {
-                            "type": "boolean",
-                            "description": "If true, include base64-encoded image data in response",
-                            "default": false
-                        }
-                    }
-                }))),
-            ),
             Tool::new(
                 "take_ax_snapshot",
                 "Take an accessibility tree snapshot of an application. Returns a \
@@ -1752,21 +1638,6 @@ impl ServerHandler for MacOSDevToolsServer {
                 let params: app_tools::AppFocusWindowParams = serde_json::from_value(args)
                     .map_err(|e| McpError::invalid_params(e.to_string(), None))?;
                 Ok(app_tools::app_focus_window(params, self.app_client.clone()).await)
-            }
-            "find_image" => {
-                let params: find_image::FindImageParams = serde_json::from_value(args)
-                    .map_err(|e| McpError::invalid_params(e.to_string(), None))?;
-                Ok(find_image::find_image(
-                    params,
-                    self.screenshot_cache.clone(),
-                    self.image_cache.clone(),
-                )
-                .await)
-            }
-            "load_image" => {
-                let params: load_image::LoadImageParams = serde_json::from_value(args)
-                    .map_err(|e| McpError::invalid_params(e.to_string(), None))?;
-                Ok(load_image::load_image(params, self.image_cache.clone()).await)
             }
             "take_ax_snapshot" => {
                 let params: crate::tools::ax_snapshot::TakeAxSnapshotParams =
