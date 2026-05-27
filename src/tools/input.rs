@@ -1017,6 +1017,459 @@ fn find_text_in_window(
     Ok(matches)
 }
 
+use crate::tools::registry::{json_to_object, ToolContext, ToolHandler};
+use rmcp::{model::Tool, Error as McpError};
+use std::sync::Arc;
+
+/// `click` MCP tool handler.
+pub struct Click;
+
+#[async_trait::async_trait]
+impl ToolHandler for Click {
+    fn name(&self) -> &'static str {
+        "click"
+    }
+
+    fn schema(&self) -> Tool {
+        Tool::new(
+            "click",
+            "Click at screen coordinates. Pass exactly one coordinate variant — the runtime \
+             rejects mixes. Variants: \
+             (1) 'screenshot-pixels' (PREFERRED after take_screenshot) — screenshot_x, \
+             screenshot_y, screenshot_origin_x, screenshot_origin_y, screenshot_scale from \
+             take_screenshot metadata; \
+             (2) 'screen' — absolute screen x, y (use with find_text results); \
+             (3) 'window-relative' — window_x, window_y, window_id from list_windows; \
+             (4) 'screenshot-pixels-legacy' (DEPRECATED) — screenshot_x, screenshot_y, \
+             screenshot_window_id. \
+             Works with any app (egui, Electron, etc.). Requires Accessibility permission on macOS.",
+            Arc::new(json_to_object(serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "x": {
+                        "type": "number",
+                        "description": "[screen variant] Absolute screen X coordinate. Use with find_text results."
+                    },
+                    "y": {
+                        "type": "number",
+                        "description": "[screen variant] Absolute screen Y coordinate. Use with find_text results."
+                    },
+                    "window_x": {
+                        "type": "number",
+                        "description": "[window-relative variant] X relative to window top-left. Pair with window_y and window_id."
+                    },
+                    "window_y": {
+                        "type": "number",
+                        "description": "[window-relative variant] Y relative to window top-left. Pair with window_x and window_id."
+                    },
+                    "window_id": {
+                        "type": "integer",
+                        "description": "[window-relative variant] Target window ID (from list_windows)."
+                    },
+                    "screenshot_x": {
+                        "type": "number",
+                        "description": "[screenshot-pixels / screenshot-pixels-legacy] X pixel inside the screenshot image."
+                    },
+                    "screenshot_y": {
+                        "type": "number",
+                        "description": "[screenshot-pixels / screenshot-pixels-legacy] Y pixel inside the screenshot image."
+                    },
+                    "screenshot_origin_x": {
+                        "type": "number",
+                        "description": "[screenshot-pixels, PREFERRED] screenshot_origin_x from take_screenshot metadata."
+                    },
+                    "screenshot_origin_y": {
+                        "type": "number",
+                        "description": "[screenshot-pixels, PREFERRED] screenshot_origin_y from take_screenshot metadata."
+                    },
+                    "screenshot_scale": {
+                        "type": "number",
+                        "description": "[screenshot-pixels, PREFERRED] screenshot_scale from take_screenshot metadata."
+                    },
+                    "screenshot_window_id": {
+                        "type": "integer",
+                        "description": "[screenshot-pixels-legacy, DEPRECATED] Window ID the screenshot was taken from. Prefer screenshot_origin_x/y + screenshot_scale."
+                    },
+                    "button": {
+                        "type": "string",
+                        "enum": ["left", "right", "center"],
+                        "description": "Mouse button (default: left)"
+                    },
+                    "click_count": {
+                        "type": "integer",
+                        "description": "Number of clicks (1=single, 2=double)",
+                        "default": 1
+                    }
+                }
+            }))),
+        )
+    }
+
+    async fn call(
+        &self,
+        args: serde_json::Value,
+        _ctx: &ToolContext,
+    ) -> Result<CallToolResult, McpError> {
+        let params: ClickParams = serde_json::from_value(args)
+            .map_err(|e| McpError::invalid_params(e.to_string(), None))?;
+        Ok(click(params).await)
+    }
+}
+
+/// `move_mouse` MCP tool handler.
+pub struct MoveMouse;
+
+#[async_trait::async_trait]
+impl ToolHandler for MoveMouse {
+    fn name(&self) -> &'static str {
+        "move_mouse"
+    }
+
+    fn schema(&self) -> Tool {
+        Tool::new(
+            "move_mouse",
+            "Move mouse cursor to screen coordinates. Requires Accessibility permission on macOS.",
+            Arc::new(json_to_object(serde_json::json!({
+                "type": "object",
+                "required": ["x", "y"],
+                "properties": {
+                    "x": {
+                        "type": "number",
+                        "description": "Screen X coordinate"
+                    },
+                    "y": {
+                        "type": "number",
+                        "description": "Screen Y coordinate"
+                    }
+                }
+            }))),
+        )
+    }
+
+    async fn call(
+        &self,
+        args: serde_json::Value,
+        _ctx: &ToolContext,
+    ) -> Result<CallToolResult, McpError> {
+        let params: MoveMouseParams = serde_json::from_value(args)
+            .map_err(|e| McpError::invalid_params(e.to_string(), None))?;
+        Ok(move_mouse(params).await)
+    }
+}
+
+/// `drag` MCP tool handler.
+pub struct Drag;
+
+#[async_trait::async_trait]
+impl ToolHandler for Drag {
+    fn name(&self) -> &'static str {
+        "drag"
+    }
+
+    fn schema(&self) -> Tool {
+        Tool::new(
+            "drag",
+            "Drag from one point to another. Requires Accessibility permission on macOS.",
+            Arc::new(json_to_object(serde_json::json!({
+                "type": "object",
+                "required": ["start_x", "start_y", "end_x", "end_y"],
+                "properties": {
+                    "start_x": {
+                        "type": "number",
+                        "description": "Start X coordinate"
+                    },
+                    "start_y": {
+                        "type": "number",
+                        "description": "Start Y coordinate"
+                    },
+                    "end_x": {
+                        "type": "number",
+                        "description": "End X coordinate"
+                    },
+                    "end_y": {
+                        "type": "number",
+                        "description": "End Y coordinate"
+                    },
+                    "button": {
+                        "type": "string",
+                        "enum": ["left", "right", "center"],
+                        "description": "Mouse button (default: left)"
+                    }
+                }
+            }))),
+        )
+    }
+
+    async fn call(
+        &self,
+        args: serde_json::Value,
+        _ctx: &ToolContext,
+    ) -> Result<CallToolResult, McpError> {
+        let params: DragParams = serde_json::from_value(args)
+            .map_err(|e| McpError::invalid_params(e.to_string(), None))?;
+        Ok(drag(params).await)
+    }
+}
+
+/// `scroll` MCP tool handler.
+pub struct Scroll;
+
+#[async_trait::async_trait]
+impl ToolHandler for Scroll {
+    fn name(&self) -> &'static str {
+        "scroll"
+    }
+
+    fn schema(&self) -> Tool {
+        Tool::new(
+            "scroll",
+            "Scroll at a position. Requires Accessibility permission on macOS.",
+            Arc::new(json_to_object(serde_json::json!({
+                "type": "object",
+                "required": ["x", "y", "delta_y"],
+                "properties": {
+                    "x": {
+                        "type": "number",
+                        "description": "Screen X coordinate to scroll at"
+                    },
+                    "y": {
+                        "type": "number",
+                        "description": "Screen Y coordinate to scroll at"
+                    },
+                    "delta_x": {
+                        "type": "integer",
+                        "description": "Horizontal scroll amount (positive=right)",
+                        "default": 0
+                    },
+                    "delta_y": {
+                        "type": "integer",
+                        "description": "Vertical scroll amount (negative=up, positive=down)"
+                    }
+                }
+            }))),
+        )
+    }
+
+    async fn call(
+        &self,
+        args: serde_json::Value,
+        _ctx: &ToolContext,
+    ) -> Result<CallToolResult, McpError> {
+        let params: ScrollParams = serde_json::from_value(args)
+            .map_err(|e| McpError::invalid_params(e.to_string(), None))?;
+        Ok(scroll(params).await)
+    }
+}
+
+/// `type_text` MCP tool handler.
+pub struct TypeText;
+
+#[async_trait::async_trait]
+impl ToolHandler for TypeText {
+    fn name(&self) -> &'static str {
+        "type_text"
+    }
+
+    fn schema(&self) -> Tool {
+        Tool::new(
+            "type_text",
+            "Type text at the current cursor position. Works with any app. Requires Accessibility permission on macOS.",
+            Arc::new(json_to_object(serde_json::json!({
+                "type": "object",
+                "required": ["text"],
+                "properties": {
+                    "text": {
+                        "type": "string",
+                        "description": "Text to type"
+                    }
+                }
+            }))),
+        )
+    }
+
+    async fn call(
+        &self,
+        args: serde_json::Value,
+        _ctx: &ToolContext,
+    ) -> Result<CallToolResult, McpError> {
+        let params: TypeTextParams = serde_json::from_value(args)
+            .map_err(|e| McpError::invalid_params(e.to_string(), None))?;
+        Ok(type_text(params).await)
+    }
+}
+
+/// `press_key` MCP tool handler.
+pub struct PressKey;
+
+#[async_trait::async_trait]
+impl ToolHandler for PressKey {
+    fn name(&self) -> &'static str {
+        "press_key"
+    }
+
+    fn schema(&self) -> Tool {
+        Tool::new(
+            "press_key",
+            "Press a key combination. Works with any app. Requires Accessibility permission on macOS.",
+            Arc::new(json_to_object(serde_json::json!({
+                "type": "object",
+                "required": ["key"],
+                "properties": {
+                    "key": {
+                        "type": "string",
+                        "description": "Key to press (e.g., 'return', 'tab', 'escape', 'a', 'f1', 'left', 'up')"
+                    },
+                    "modifiers": {
+                        "type": "array",
+                        "items": { "type": "string" },
+                        "description": "Modifier keys: 'shift', 'control', 'option', 'command'",
+                        "default": []
+                    }
+                }
+            }))),
+        )
+    }
+
+    async fn call(
+        &self,
+        args: serde_json::Value,
+        _ctx: &ToolContext,
+    ) -> Result<CallToolResult, McpError> {
+        let params: PressKeyParams = serde_json::from_value(args)
+            .map_err(|e| McpError::invalid_params(e.to_string(), None))?;
+        Ok(press_key(params).await)
+    }
+}
+
+/// `get_displays` MCP tool handler.
+pub struct GetDisplays;
+
+#[async_trait::async_trait]
+impl ToolHandler for GetDisplays {
+    fn name(&self) -> &'static str {
+        "get_displays"
+    }
+
+    fn schema(&self) -> Tool {
+        Tool::new(
+            "get_displays",
+            "Get information about all connected displays including bounds, scale factors, and resolution.",
+            Arc::new(json_to_object(serde_json::json!({
+                "type": "object",
+                "properties": {}
+            }))),
+        )
+    }
+
+    async fn call(
+        &self,
+        args: serde_json::Value,
+        _ctx: &ToolContext,
+    ) -> Result<CallToolResult, McpError> {
+        let params: GetDisplaysParams = serde_json::from_value(args)
+            .map_err(|e| McpError::invalid_params(e.to_string(), None))?;
+        Ok(get_displays(params))
+    }
+}
+
+/// `find_text` MCP tool handler.
+pub struct FindText;
+
+#[async_trait::async_trait]
+impl ToolHandler for FindText {
+    fn name(&self) -> &'static str {
+        "find_text"
+    }
+
+    fn schema(&self) -> Tool {
+        Tool::new(
+            "find_text",
+            "PREFERRED for clicking buttons/labels by name. Finds text on screen using the platform accessibility API (macOS Accessibility, Windows UI Automation) with OCR fallback, and returns screen coordinates ready for the click tool. Use this instead of visually estimating coordinates from screenshots. Can be scoped to a specific app window for faster, more precise results. Note: accessibility results use semantic element names (e.g., 'All Clear' instead of 'AC', 'Subtract' instead of '\u{2212}'), so search by meaning rather than displayed symbol. When no matches are found, the response includes an available_elements array listing all UI element names in the target window — use this to find the correct name and retry. Requires macOS 10.15+ or Windows 10 1903+.",
+            Arc::new(json_to_object(serde_json::json!({
+                "type": "object",
+                "required": ["text"],
+                "properties": {
+                    "text": {
+                        "type": "string",
+                        "description": "Text to search for (case-insensitive substring match). Matches against accessibility element names first (e.g., 'All Clear', 'Subtract'), then falls back to OCR on visible text."
+                    },
+                    "app_name": {
+                        "type": "string",
+                        "description": "Application name to scope the search to a specific app's window (e.g., 'Calculator'). Faster and avoids false matches from other windows."
+                    },
+                    "window_id": {
+                        "type": "integer",
+                        "description": "Window ID to scope the search to a specific window"
+                    },
+                    "display_id": {
+                        "type": "integer",
+                        "description": "Display ID to search on. Use get_displays to list available displays. If omitted, searches the main display. Ignored when window_id or app_name is provided."
+                    },
+                    "uses_language_correction": {
+                        "type": "boolean",
+                        "description": "Enable language correction for better word accuracy in OCR fallback. Default is false, which is better for UI automation (buttons, labels, single characters). Has no effect when results come from the accessibility API."
+                    }
+                }
+            }))),
+        )
+    }
+
+    async fn call(
+        &self,
+        args: serde_json::Value,
+        _ctx: &ToolContext,
+    ) -> Result<CallToolResult, McpError> {
+        let params: FindTextParams = serde_json::from_value(args)
+            .map_err(|e| McpError::invalid_params(e.to_string(), None))?;
+        Ok(find_text(params))
+    }
+}
+
+/// `element_at_point` MCP tool handler.
+pub struct ElementAtPoint;
+
+#[async_trait::async_trait]
+impl ToolHandler for ElementAtPoint {
+    fn name(&self) -> &'static str {
+        "element_at_point"
+    }
+
+    fn schema(&self) -> Tool {
+        Tool::new(
+            "element_at_point",
+            "Given screen coordinates (x, y), return the accessibility element at that point (name, role, label, value, bounds, pid, app_name). Optional app_name param to scope the lookup to a specific application for faster, more precise results.",
+            Arc::new(json_to_object(serde_json::json!({
+                "type": "object",
+                "required": ["x", "y"],
+                "properties": {
+                    "x": {
+                        "type": "number",
+                        "description": "Screen X coordinate"
+                    },
+                    "y": {
+                        "type": "number",
+                        "description": "Screen Y coordinate"
+                    },
+                    "app_name": {
+                        "type": "string",
+                        "description": "Application name to scope the lookup to a specific app (e.g., 'Calculator'). Faster and avoids ambiguity at window edges."
+                    }
+                }
+            }))),
+        )
+    }
+
+    async fn call(
+        &self,
+        args: serde_json::Value,
+        _ctx: &ToolContext,
+    ) -> Result<CallToolResult, McpError> {
+        let params: ElementAtPointParams = serde_json::from_value(args)
+            .map_err(|e| McpError::invalid_params(e.to_string(), None))?;
+        Ok(element_at_point(params))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

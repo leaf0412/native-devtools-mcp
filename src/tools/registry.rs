@@ -104,6 +104,15 @@ impl ToolRegistry {
         tools.push(Box::new(crate::tools::navigation::LaunchApp));
         tools.push(Box::new(crate::tools::navigation::QuitApp));
         tools.push(Box::new(crate::tools::probe_app::ProbeApp));
+        tools.push(Box::new(crate::tools::input::Click));
+        tools.push(Box::new(crate::tools::input::MoveMouse));
+        tools.push(Box::new(crate::tools::input::Drag));
+        tools.push(Box::new(crate::tools::input::Scroll));
+        tools.push(Box::new(crate::tools::input::TypeText));
+        tools.push(Box::new(crate::tools::input::PressKey));
+        tools.push(Box::new(crate::tools::input::GetDisplays));
+        tools.push(Box::new(crate::tools::input::FindText));
+        tools.push(Box::new(crate::tools::input::ElementAtPoint));
         Self { tools }
     }
 
