@@ -274,6 +274,184 @@ fn capture_frontmost_frame(
     }
 }
 
+// ============================================================================
+// MCP tool handlers. Each wraps the screen-recording state machine with its
+// name, schema, and availability. `start_recording` is always visible (so the
+// user can begin a session); `stop_recording` is gated `WhenRecording`,
+// mirroring the deleted `get_recording_tools` + the recording gate in
+// `get_tools`. Schema JSON moved verbatim from that getter; call bodies copied
+// verbatim from the deleted `call_tool` arms, with `ctx.screen_recorder` /
+// `ctx.peer` replacing `self.screen_recorder` / `context.peer`. Every
+// `notify_tool_list_changed` is preserved so the visible tool set mutates on
+// start/stop.
+// ============================================================================
+
+use crate::tools::registry::{
+    json_to_object, parse_string_field, to_json_pretty, Availability, ToolContext, ToolHandler,
+};
+use rmcp::{
+    model::{CallToolResult, Content, Tool},
+    Error as McpError,
+};
+
+/// `start_recording` — always visible so a session can be started. Fires
+/// `notify_tool_list_changed` so `stop_recording` becomes visible once recording.
+pub struct StartRecording;
+
+#[async_trait::async_trait]
+impl ToolHandler for StartRecording {
+    fn name(&self) -> &'static str {
+        "start_recording"
+    }
+
+    fn schema(&self) -> Tool {
+        Tool::new(
+            "start_recording",
+            "Start recording the frontmost app's window at ~5fps. Writes timestamped JPEG frames to the specified output directory. Use stop_recording to end the session and get the frame list.",
+            Arc::new(json_to_object(serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "output_dir": {
+                        "type": "string",
+                        "description": "Directory to write JPEG frames to (created if needed)"
+                    },
+                    "fps": {
+                        "type": "integer",
+                        "description": "Frames per second (default: 5)",
+                        "default": 5
+                    },
+                    "max_duration_ms": {
+                        "type": "integer",
+                        "description": "Auto-stop after this many milliseconds (default: 60000 = 1 min)",
+                        "default": 60000
+                    }
+                },
+                "required": ["output_dir"]
+            }))),
+        )
+    }
+
+    async fn call(
+        &self,
+        args: serde_json::Value,
+        ctx: &ToolContext,
+    ) -> Result<CallToolResult, McpError> {
+        // Check if a previous recording auto-stopped (max_duration elapsed).
+        // If so, drain remaining frames (log count) and clear stale state.
+        {
+            let guard = ctx.screen_recorder.read().await;
+            if let Some(recorder) = guard.as_ref() {
+                if recorder.is_finished() {
+                    let stale_count = recorder.drain_frames().len();
+                    if stale_count > 0 {
+                        tracing::warn!(
+                            "Discarding {stale_count} frames from auto-stopped recording \
+                             (stop_recording was not called)"
+                        );
+                    }
+                    drop(guard);
+                    ctx.screen_recorder.write().await.take();
+                    let _ = ctx.peer.notify_tool_list_changed().await;
+                } else {
+                    return Ok(CallToolResult::error(vec![Content::text(
+                        "Recording is already active. Use stop_recording to end the current session first.",
+                    )]));
+                }
+            }
+        }
+
+        let output_dir = parse_string_field(&args, "output_dir")?;
+        let fps = args.get("fps").and_then(|v| v.as_u64()).unwrap_or(5) as u32;
+        let max_duration_ms = args
+            .get("max_duration_ms")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(60_000)
+            .clamp(1_000, u32::MAX as u64) as u32;
+
+        let output_path = std::path::PathBuf::from(&output_dir);
+        if let Err(e) = std::fs::create_dir_all(&output_path) {
+            return Ok(CallToolResult::error(vec![Content::text(format!(
+                "Failed to create output directory: {e}"
+            ))]));
+        }
+        // Probe-write to fail fast if the directory is not writable.
+        match tempfile::tempfile_in(&output_path) {
+            Ok(_) => {} // drops and deletes automatically
+            Err(e) => {
+                return Ok(CallToolResult::error(vec![Content::text(format!(
+                    "Output directory is not writable: {e}"
+                ))]));
+            }
+        }
+
+        let frames = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let cancel = tokio_util::sync::CancellationToken::new();
+
+        let task_handle = crate::tools::screen_recorder::start_recording(
+            frames.clone(),
+            cancel.clone(),
+            output_path,
+            fps,
+            max_duration_ms,
+        );
+
+        let recorder =
+            crate::tools::screen_recorder::ScreenRecorder::new(frames, task_handle, cancel);
+        *ctx.screen_recorder.write().await = Some(recorder);
+        let _ = ctx.peer.notify_tool_list_changed().await;
+
+        Ok(CallToolResult::success(vec![Content::text(format!(
+            "Recording started ({fps}fps, max: {max_duration_ms}ms, dir: {output_dir}). Use stop_recording to end.",
+        ))]))
+    }
+}
+
+/// `stop_recording` — visible only while recording. Cancels the background task,
+/// drains remaining frames, and fires `notify_tool_list_changed`.
+pub struct StopRecording;
+
+#[async_trait::async_trait]
+impl ToolHandler for StopRecording {
+    fn name(&self) -> &'static str {
+        "stop_recording"
+    }
+
+    fn availability(&self) -> Availability {
+        Availability::WhenRecording
+    }
+
+    fn schema(&self) -> Tool {
+        Tool::new(
+            "stop_recording",
+            "Stop screen recording and return all frame metadata as a JSON array.",
+            Arc::new(json_to_object(serde_json::json!({
+                "type": "object",
+                "properties": {}
+            }))),
+        )
+    }
+
+    async fn call(
+        &self,
+        _args: serde_json::Value,
+        ctx: &ToolContext,
+    ) -> Result<CallToolResult, McpError> {
+        let recorder = ctx.screen_recorder.write().await.take();
+        match recorder {
+            Some(recorder) => {
+                let frames = recorder.cancel_and_drain().await;
+                let _ = ctx.peer.notify_tool_list_changed().await;
+                Ok(CallToolResult::success(vec![Content::text(
+                    to_json_pretty(&frames),
+                )]))
+            }
+            None => Ok(CallToolResult::error(vec![Content::text(
+                "No recording session is active.",
+            )])),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

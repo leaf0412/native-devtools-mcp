@@ -176,6 +176,11 @@ const MIGRATED: &[&str] = &[
     "android_launch_app",
     "android_get_display_info",
     "android_get_current_activity",
+    "start_hover_tracking",
+    "get_hover_events",
+    "stop_hover_tracking",
+    "start_recording",
+    "stop_recording",
 ];
 
 #[derive(Clone)]
@@ -483,96 +488,20 @@ impl MacOSDevToolsServer {
         Vec::new()
     }
 
-    /// Hover tracking tools. `start_hover_tracking` is always visible.
-    /// `get_hover_events` and `stop_hover_tracking` only appear while tracking is active.
-    fn get_hover_tracking_tools(tracking_active: bool) -> Vec<Tool> {
-        let mut tools = vec![Tool::new(
-            "start_hover_tracking",
-            "Start tracking hover state changes. Polls cursor position and accessibility element at configurable intervals, recording transitions. Use get_hover_events to retrieve recorded events, and stop_hover_tracking to end the session. Only one tracking session can be active at a time.",
-            Arc::new(json_to_object(serde_json::json!({
-                "type": "object",
-                "properties": {
-                    "app_name": {
-                        "type": "string",
-                        "description": "Scope element lookup to a specific application (e.g., 'Safari'). Faster and avoids ambiguity."
-                    },
-                    "poll_interval_ms": {
-                        "type": "integer",
-                        "description": "Polling interval in milliseconds (default: 100)",
-                        "default": 100
-                    },
-                    "max_duration_ms": {
-                        "type": "integer",
-                        "description": "Auto-stop after this many milliseconds (default: 60000 = 60s)",
-                        "default": 60000
-                    },
-                    "min_dwell_ms": {
-                        "type": "integer",
-                        "description": "Minimum time (ms) cursor must stay on a new element before recording a transition. Filters out pass-through elements during fast mouse movement. 0 = record every change immediately. (default: 300)",
-                        "default": 300
-                    }
-                }
-            }))),
-        )];
-        if tracking_active {
-            tools.push(Tool::new(
-                "get_hover_events",
-                "Retrieve and drain buffered hover events since the last call. Returns a JSON array of transition events, each with cursor position, element info, timestamp, and dwell time. Events are consumed — subsequent calls return only new events.",
-                Arc::new(json_to_object(serde_json::json!({
-                    "type": "object",
-                    "properties": {}
-                }))),
-            ));
-            tools.push(Tool::new(
-                "stop_hover_tracking",
-                "Stop hover tracking and return any remaining buffered events. Ends the background polling task.",
-                Arc::new(json_to_object(serde_json::json!({
-                    "type": "object",
-                    "properties": {}
-                }))),
-            ));
-        }
-        tools
+    /// Hover tracking tools — all now live on the [`ToolRegistry`]
+    /// (`start_hover_tracking` is `Always`; `get_hover_events` /
+    /// `stop_hover_tracking` are gated `WhenHoverTracking`). This getter stays
+    /// as the seam the legacy union appends to and currently emits nothing.
+    fn get_hover_tracking_tools(_tracking_active: bool) -> Vec<Tool> {
+        Vec::new()
     }
 
-    /// Screen recording tools. `start_recording` always visible,
-    /// `stop_recording` only while recording is active.
-    fn get_recording_tools(recording_active: bool) -> Vec<Tool> {
-        let mut tools = vec![Tool::new(
-            "start_recording",
-            "Start recording the frontmost app's window at ~5fps. Writes timestamped JPEG frames to the specified output directory. Use stop_recording to end the session and get the frame list.",
-            Arc::new(json_to_object(serde_json::json!({
-                "type": "object",
-                "properties": {
-                    "output_dir": {
-                        "type": "string",
-                        "description": "Directory to write JPEG frames to (created if needed)"
-                    },
-                    "fps": {
-                        "type": "integer",
-                        "description": "Frames per second (default: 5)",
-                        "default": 5
-                    },
-                    "max_duration_ms": {
-                        "type": "integer",
-                        "description": "Auto-stop after this many milliseconds (default: 60000 = 1 min)",
-                        "default": 60000
-                    }
-                },
-                "required": ["output_dir"]
-            }))),
-        )];
-        if recording_active {
-            tools.push(Tool::new(
-                "stop_recording",
-                "Stop screen recording and return all frame metadata as a JSON array.",
-                Arc::new(json_to_object(serde_json::json!({
-                    "type": "object",
-                    "properties": {}
-                }))),
-            ));
-        }
-        tools
+    /// Screen recording tools — all now live on the [`ToolRegistry`]
+    /// (`start_recording` is `Always`; `stop_recording` is gated
+    /// `WhenRecording`). This getter stays as the seam the legacy union appends
+    /// to and currently emits nothing.
+    fn get_recording_tools(_recording_active: bool) -> Vec<Tool> {
+        Vec::new()
     }
 
     #[cfg(feature = "cdp")]
@@ -1106,202 +1035,6 @@ impl ServerHandler for MacOSDevToolsServer {
         }
 
         match request.name.as_ref() {
-            "start_hover_tracking" => {
-                // Auto-clean finished tracker (e.g. from max duration timeout)
-                let already_active = {
-                    let guard = self.hover_tracker.read().await;
-                    match guard.as_ref() {
-                        Some(t) if t.is_finished() => false, // will clean up below
-                        Some(_) => true,
-                        None => false,
-                    }
-                };
-                if already_active {
-                    return Ok(CallToolResult::error(vec![Content::text(
-                        "Hover tracking is already active. Use stop_hover_tracking to end the current session first.",
-                    )]));
-                }
-                // Clean up any finished tracker before starting a new one
-                if self.hover_tracker.read().await.is_some() {
-                    self.hover_tracker.write().await.take();
-                }
-
-                let app_name = args
-                    .get("app_name")
-                    .and_then(|v| v.as_str())
-                    .map(String::from);
-                let poll_interval_ms = args
-                    .get("poll_interval_ms")
-                    .and_then(|v| v.as_u64())
-                    .unwrap_or(100)
-                    .clamp(10, 10_000) as u32;
-                let max_duration_ms = args
-                    .get("max_duration_ms")
-                    .and_then(|v| v.as_u64())
-                    .unwrap_or(60000)
-                    .clamp(100, u32::MAX as u64) as u32;
-                let min_dwell_ms = args
-                    .get("min_dwell_ms")
-                    .and_then(|v| v.as_u64())
-                    .unwrap_or(300)
-                    .clamp(0, 10_000) as u32;
-
-                let events = Arc::new(std::sync::Mutex::new(Vec::new()));
-                let cancel = tokio_util::sync::CancellationToken::new();
-
-                let task_handle = crate::tools::hover_tracker::start_polling(
-                    events.clone(),
-                    cancel.clone(),
-                    app_name.clone(),
-                    poll_interval_ms,
-                    max_duration_ms,
-                    min_dwell_ms,
-                );
-
-                let tracker =
-                    crate::tools::hover_tracker::HoverTracker::new(events, task_handle, cancel);
-                *self.hover_tracker.write().await = Some(tracker);
-                let _ = context.peer.notify_tool_list_changed().await;
-
-                let msg = format!(
-                    "Hover tracking started (poll: {}ms, max: {}ms, dwell: {}ms{}). Use get_hover_events to read transitions, stop_hover_tracking to end.",
-                    poll_interval_ms,
-                    max_duration_ms,
-                    min_dwell_ms,
-                    app_name.map_or(String::new(), |a| format!(", app: {}", a)),
-                );
-                Ok(CallToolResult::success(vec![Content::text(msg)]))
-            }
-            "get_hover_events" => {
-                // Single lock: check auto-stop and drain events together
-                let result = {
-                    let guard = self.hover_tracker.read().await;
-                    guard.as_ref().map(|t| {
-                        let auto_stopped = t.is_finished();
-                        let events = t.drain_events();
-                        (auto_stopped, events)
-                    })
-                };
-
-                match result {
-                    Some((auto_stopped, events)) => {
-                        let json = to_json_pretty(&events);
-
-                        if auto_stopped {
-                            self.hover_tracker.write().await.take();
-                            let _ = context.peer.notify_tool_list_changed().await;
-                        }
-
-                        // Always return the JSON array for consistent parsing.
-                        // The timeout sentinel event (with timeout: true) signals
-                        // auto-stop within the event stream itself.
-                        Ok(CallToolResult::success(vec![Content::text(json)]))
-                    }
-                    None => Ok(CallToolResult::error(vec![Content::text(
-                        "No hover tracking session is active. Use start_hover_tracking first.",
-                    )])),
-                }
-            }
-            "stop_hover_tracking" => {
-                let tracker = self.hover_tracker.write().await.take();
-                match tracker {
-                    Some(tracker) => {
-                        let events = tracker.cancel_and_drain().await;
-                        let _ = context.peer.notify_tool_list_changed().await;
-                        // Return raw JSON array for consistent parsing with get_hover_events
-                        Ok(CallToolResult::success(vec![Content::text(
-                            to_json_pretty(&events),
-                        )]))
-                    }
-                    None => Ok(CallToolResult::error(vec![Content::text(
-                        "No hover tracking session is active.",
-                    )])),
-                }
-            }
-            "start_recording" => {
-                // Check if a previous recording auto-stopped (max_duration elapsed).
-                // If so, drain remaining frames (log count) and clear stale state.
-                {
-                    let guard = self.screen_recorder.read().await;
-                    if let Some(recorder) = guard.as_ref() {
-                        if recorder.is_finished() {
-                            let stale_count = recorder.drain_frames().len();
-                            if stale_count > 0 {
-                                tracing::warn!(
-                                    "Discarding {stale_count} frames from auto-stopped recording \
-                                     (stop_recording was not called)"
-                                );
-                            }
-                            drop(guard);
-                            self.screen_recorder.write().await.take();
-                            let _ = context.peer.notify_tool_list_changed().await;
-                        } else {
-                            return Ok(CallToolResult::error(vec![Content::text(
-                                "Recording is already active. Use stop_recording to end the current session first.",
-                            )]));
-                        }
-                    }
-                }
-
-                let output_dir = parse_string_field(&args, "output_dir")?;
-                let fps = args.get("fps").and_then(|v| v.as_u64()).unwrap_or(5) as u32;
-                let max_duration_ms = args
-                    .get("max_duration_ms")
-                    .and_then(|v| v.as_u64())
-                    .unwrap_or(60_000)
-                    .clamp(1_000, u32::MAX as u64) as u32;
-
-                let output_path = std::path::PathBuf::from(&output_dir);
-                if let Err(e) = std::fs::create_dir_all(&output_path) {
-                    return Ok(CallToolResult::error(vec![Content::text(format!(
-                        "Failed to create output directory: {e}"
-                    ))]));
-                }
-                // Probe-write to fail fast if the directory is not writable.
-                match tempfile::tempfile_in(&output_path) {
-                    Ok(_) => {} // drops and deletes automatically
-                    Err(e) => {
-                        return Ok(CallToolResult::error(vec![Content::text(format!(
-                            "Output directory is not writable: {e}"
-                        ))]));
-                    }
-                }
-
-                let frames = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
-                let cancel = tokio_util::sync::CancellationToken::new();
-
-                let task_handle = crate::tools::screen_recorder::start_recording(
-                    frames.clone(),
-                    cancel.clone(),
-                    output_path,
-                    fps,
-                    max_duration_ms,
-                );
-
-                let recorder =
-                    crate::tools::screen_recorder::ScreenRecorder::new(frames, task_handle, cancel);
-                *self.screen_recorder.write().await = Some(recorder);
-                let _ = context.peer.notify_tool_list_changed().await;
-
-                Ok(CallToolResult::success(vec![Content::text(format!(
-                    "Recording started ({fps}fps, max: {max_duration_ms}ms, dir: {output_dir}). Use stop_recording to end.",
-                ))]))
-            }
-            "stop_recording" => {
-                let recorder = self.screen_recorder.write().await.take();
-                match recorder {
-                    Some(recorder) => {
-                        let frames = recorder.cancel_and_drain().await;
-                        let _ = context.peer.notify_tool_list_changed().await;
-                        Ok(CallToolResult::success(vec![Content::text(
-                            to_json_pretty(&frames),
-                        )]))
-                    }
-                    None => Ok(CallToolResult::error(vec![Content::text(
-                        "No recording session is active.",
-                    )])),
-                }
-            }
             #[cfg(feature = "cdp")]
             "cdp_connect" => {
                 let port_num = args.get("port").and_then(|v| v.as_u64()).ok_or_else(|| {

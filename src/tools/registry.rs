@@ -148,6 +148,11 @@ impl ToolRegistry {
         tools.push(Box::new(crate::android::tools::AndroidLaunchApp));
         tools.push(Box::new(crate::android::tools::AndroidGetDisplayInfo));
         tools.push(Box::new(crate::android::tools::AndroidGetCurrentActivity));
+        tools.push(Box::new(crate::tools::hover_tracker::StartHoverTracking));
+        tools.push(Box::new(crate::tools::hover_tracker::GetHoverEvents));
+        tools.push(Box::new(crate::tools::hover_tracker::StopHoverTracking));
+        tools.push(Box::new(crate::tools::screen_recorder::StartRecording));
+        tools.push(Box::new(crate::tools::screen_recorder::StopRecording));
         Self { tools }
     }
 
