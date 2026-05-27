@@ -241,6 +241,76 @@ fn format_ocr_results(matches: &[platform::TextMatch]) -> String {
     result
 }
 
+use crate::tools::registry::{json_to_object, ToolContext, ToolHandler};
+use rmcp::{model::Tool, Error as McpError};
+
+/// `take_screenshot` MCP tool handler.
+pub struct TakeScreenshot;
+
+#[async_trait::async_trait]
+impl ToolHandler for TakeScreenshot {
+    fn name(&self) -> &'static str {
+        "take_screenshot"
+    }
+
+    fn schema(&self) -> Tool {
+        Tool::new(
+            "take_screenshot",
+            "Capture a screenshot of the screen, a specific window, or a region. Returns a base64-encoded image, JSON metadata for coordinate conversion, and OCR text annotations including clickable coordinates.",
+            Arc::new(json_to_object(serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "mode": {
+                        "type": "string",
+                        "enum": ["screen", "window", "region"],
+                        "description": "Capture mode (default: 'window'). Prefer 'window' with app_name for focused screenshots. Only use 'screen' when you need to see multiple windows or the desktop.",
+                        "default": "window"
+                    },
+                    "window_id": {
+                        "type": "integer",
+                        "description": "Window ID to capture (required for mode='window')"
+                    },
+                    "app_name": {
+                        "type": "string",
+                        "description": "Application name to capture (for mode='window', alternative to window_id)"
+                    },
+                    "x": {
+                        "type": "number",
+                        "description": "X coordinate of region (required for mode='region')"
+                    },
+                    "y": {
+                        "type": "number",
+                        "description": "Y coordinate of region (required for mode='region')"
+                    },
+                    "width": {
+                        "type": "number",
+                        "description": "Width of region (required for mode='region')"
+                    },
+                    "height": {
+                        "type": "number",
+                        "description": "Height of region (required for mode='region')"
+                    },
+                    "include_ocr": {
+                        "type": "boolean",
+                        "description": "Include OCR text detection with clickable coordinates (default: true)",
+                        "default": true
+                    }
+                }
+            }))),
+        )
+    }
+
+    async fn call(
+        &self,
+        args: serde_json::Value,
+        ctx: &ToolContext,
+    ) -> Result<CallToolResult, McpError> {
+        let params: TakeScreenshotParams = serde_json::from_value(args)
+            .map_err(|e| McpError::invalid_params(e.to_string(), None))?;
+        Ok(take_screenshot(params, Some(ctx.screenshot_cache.clone())).await)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

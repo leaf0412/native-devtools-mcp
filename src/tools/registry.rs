@@ -97,6 +97,7 @@ impl ToolRegistry {
     pub fn build() -> Self {
         #[allow(unused_mut)]
         let mut tools: Vec<Box<dyn ToolHandler>> = Vec::new();
+        tools.push(Box::new(crate::tools::screenshot::TakeScreenshot));
         Self { tools }
     }
 

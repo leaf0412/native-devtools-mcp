@@ -128,7 +128,7 @@ fn annotate_tools(tools: &mut [Tool], names: &[&str], annotation: ToolAnnotation
 /// moved batch by batch; this list is the coexistence seam — schemas and
 /// dispatch for these names come from the registry, and the legacy paths are
 /// filtered/short-circuited so the net tool set is invariant.
-const MIGRATED: &[&str] = &[];
+const MIGRATED: &[&str] = &["take_screenshot"];
 
 #[derive(Clone)]
 pub struct MacOSDevToolsServer {
@@ -425,50 +425,6 @@ impl MacOSDevToolsServer {
     fn get_base_tools() -> Vec<Tool> {
         #[allow(unused_mut)]
         let mut tools = vec![
-            Tool::new(
-                "take_screenshot",
-                "Capture a screenshot of the screen, a specific window, or a region. Returns a base64-encoded image, JSON metadata for coordinate conversion, and OCR text annotations including clickable coordinates.",
-                Arc::new(json_to_object(serde_json::json!({
-                    "type": "object",
-                    "properties": {
-                        "mode": {
-                            "type": "string",
-                            "enum": ["screen", "window", "region"],
-                            "description": "Capture mode (default: 'window'). Prefer 'window' with app_name for focused screenshots. Only use 'screen' when you need to see multiple windows or the desktop.",
-                            "default": "window"
-                        },
-                        "window_id": {
-                            "type": "integer",
-                            "description": "Window ID to capture (required for mode='window')"
-                        },
-                        "app_name": {
-                            "type": "string",
-                            "description": "Application name to capture (for mode='window', alternative to window_id)"
-                        },
-                        "x": {
-                            "type": "number",
-                            "description": "X coordinate of region (required for mode='region')"
-                        },
-                        "y": {
-                            "type": "number",
-                            "description": "Y coordinate of region (required for mode='region')"
-                        },
-                        "width": {
-                            "type": "number",
-                            "description": "Width of region (required for mode='region')"
-                        },
-                        "height": {
-                            "type": "number",
-                            "description": "Height of region (required for mode='region')"
-                        },
-                        "include_ocr": {
-                            "type": "boolean",
-                            "description": "Include OCR text detection with clickable coordinates (default: true)",
-                            "default": true
-                        }
-                    }
-                }))),
-            ),
             Tool::new(
                 "list_windows",
                 "List all visible windows on screen with their IDs, titles, app names, and bounds.",
@@ -2070,11 +2026,6 @@ impl ServerHandler for MacOSDevToolsServer {
         }
 
         match request.name.as_ref() {
-            "take_screenshot" => {
-                let params: screenshot::TakeScreenshotParams = serde_json::from_value(args)
-                    .map_err(|e| McpError::invalid_params(e.to_string(), None))?;
-                Ok(screenshot::take_screenshot(params, Some(self.screenshot_cache.clone())).await)
-            }
             "list_windows" => {
                 let params: navigation::ListWindowsParams = serde_json::from_value(args)
                     .map_err(|e| McpError::invalid_params(e.to_string(), None))?;
