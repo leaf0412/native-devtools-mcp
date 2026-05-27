@@ -135,6 +135,13 @@ impl ToolRegistry {
         tools.push(Box::new(crate::tools::app_protocol::AppPressKey));
         tools.push(Box::new(crate::tools::app_protocol::AppFocus));
         tools.push(Box::new(crate::tools::app_protocol::AppScreenshot));
+        tools.push(Box::new(crate::android::tools::AndroidListDevices));
+        tools.push(Box::new(crate::android::tools::AndroidConnect));
+        tools.push(Box::new(crate::android::tools::AndroidDisconnect));
+        tools.push(Box::new(crate::android::tools::AndroidScreenshot));
+        tools.push(Box::new(crate::android::tools::AndroidClick));
+        tools.push(Box::new(crate::android::tools::AndroidTypeText));
+        tools.push(Box::new(crate::android::tools::AndroidPressKey));
         Self { tools }
     }
 
