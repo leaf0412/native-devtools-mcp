@@ -5,6 +5,7 @@
 //! - `element_at_point`: resolve screen coordinates to snapshot UIDs
 
 mod element_at_point;
+pub mod handlers;
 mod input;
 mod pages;
 mod script;

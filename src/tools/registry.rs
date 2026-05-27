@@ -135,6 +135,16 @@ impl ToolRegistry {
         tools.push(Box::new(crate::tools::app_protocol::AppPressKey));
         tools.push(Box::new(crate::tools::app_protocol::AppFocus));
         tools.push(Box::new(crate::tools::app_protocol::AppScreenshot));
+        #[cfg(feature = "cdp")]
+        {
+            tools.push(Box::new(crate::cdp::tools::handlers::CdpConnect));
+            tools.push(Box::new(crate::cdp::tools::handlers::CdpDisconnect));
+            tools.push(Box::new(crate::cdp::tools::handlers::CdpNavigate));
+            tools.push(Box::new(crate::cdp::tools::handlers::CdpNewPage));
+            tools.push(Box::new(crate::cdp::tools::handlers::CdpListPages));
+            tools.push(Box::new(crate::cdp::tools::handlers::CdpSelectPage));
+            tools.push(Box::new(crate::cdp::tools::handlers::CdpClosePage));
+        }
         tools.push(Box::new(crate::android::tools::AndroidListDevices));
         tools.push(Box::new(crate::android::tools::AndroidConnect));
         tools.push(Box::new(crate::android::tools::AndroidDisconnect));
