@@ -2,7 +2,7 @@ use crate::app_protocol::AppProtocolClient;
 use crate::tools::registry::{ConnectionState, ToolContext, ToolRegistry};
 use crate::tools::{
     app_protocol as app_tools, find_image, image_cache::ImageCache, input as input_tools,
-    load_image, navigation, screenshot, screenshot_cache::ScreenshotCache,
+    load_image, screenshot, screenshot_cache::ScreenshotCache,
 };
 use base64::Engine;
 use rmcp::model::Content;
@@ -128,7 +128,15 @@ fn annotate_tools(tools: &mut [Tool], names: &[&str], annotation: ToolAnnotation
 /// moved batch by batch; this list is the coexistence seam — schemas and
 /// dispatch for these names come from the registry, and the legacy paths are
 /// filtered/short-circuited so the net tool set is invariant.
-const MIGRATED: &[&str] = &["take_screenshot"];
+const MIGRATED: &[&str] = &[
+    "take_screenshot",
+    "list_windows",
+    "list_apps",
+    "focus_window",
+    "launch_app",
+    "quit_app",
+    "probe_app",
+];
 
 #[derive(Clone)]
 pub struct MacOSDevToolsServer {
@@ -425,98 +433,6 @@ impl MacOSDevToolsServer {
     fn get_base_tools() -> Vec<Tool> {
         #[allow(unused_mut)]
         let mut tools = vec![
-            Tool::new(
-                "list_windows",
-                "List all visible windows on screen with their IDs, titles, app names, and bounds.",
-                Arc::new(json_to_object(serde_json::json!({
-                    "type": "object",
-                    "properties": {
-                        "app_name": {
-                            "type": "string",
-                            "description": "Filter windows by application name (optional)"
-                        }
-                    }
-                }))),
-            ),
-            Tool::new(
-                "list_apps",
-                "List all running applications with their names, bundle IDs, and PIDs.",
-                Arc::new(json_to_object(serde_json::json!({
-                    "type": "object",
-                    "properties": {
-                        "app_name": {
-                            "type": "string",
-                            "description": "Filter by application name (case-insensitive substring match)"
-                        },
-                        "user_apps_only": {
-                            "type": "boolean",
-                            "description": "Only return user-facing apps (excludes system agents, helpers, and daemons)"
-                        }
-                    }
-                }))),
-            ),
-            Tool::new(
-                "focus_window",
-                "Bring a window or application to the front. Specify window_id, app_name, or pid.",
-                Arc::new(json_to_object(serde_json::json!({
-                    "type": "object",
-                    "properties": {
-                        "window_id": {
-                            "type": "integer",
-                            "description": "Window ID to focus"
-                        },
-                        "app_name": {
-                            "type": "string",
-                            "description": "Application name to focus"
-                        },
-                        "pid": {
-                            "type": "integer",
-                            "description": "Process ID to focus"
-                        }
-                    }
-                }))),
-            ),
-            Tool::new(
-                "launch_app",
-                "Launch an application by name. On macOS, finds apps in /Applications and other standard locations. If the app is already running and no args are provided, brings it to the front. If args are provided and the app is already running, returns an error — use quit_app first.",
-                Arc::new(json_to_object(serde_json::json!({
-                    "type": "object",
-                    "required": ["app_name"],
-                    "properties": {
-                        "app_name": {
-                            "type": "string",
-                            "description": "Application name to launch (e.g., 'Calculator', 'Safari')"
-                        },
-                        "args": {
-                            "type": "array",
-                            "items": { "type": "string" },
-                            "description": "CLI arguments to pass to the app (e.g., ['--remote-debugging-port=9222']). Only applied on fresh launch — if the app is already running, returns an error."
-                        },
-                        "background": {
-                            "type": "boolean",
-                            "description": "If true, launch without bringing the app to the foreground (uses `open -g` on macOS). Recommended when the next action will use CDP or AX dispatch, which are focus-preserving."
-                        }
-                    }
-                }))),
-            ),
-            Tool::new(
-                "quit_app",
-                "Quit a running application by name. Graceful by default (app can save state). Use force=true to kill immediately.",
-                Arc::new(json_to_object(serde_json::json!({
-                    "type": "object",
-                    "required": ["app_name"],
-                    "properties": {
-                        "app_name": {
-                            "type": "string",
-                            "description": "Application name to quit (e.g., 'Calculator', 'Safari')"
-                        },
-                        "force": {
-                            "type": "boolean",
-                            "description": "Force kill instead of graceful quit (default: false)"
-                        }
-                    }
-                }))),
-            ),
             // System-level input tools (CGEvent on macOS, SendInput on Windows)
             Tool::new(
                 "click",
@@ -894,20 +810,6 @@ impl MacOSDevToolsServer {
                         "app_name": {
                             "type": "string",
                             "description": "Application name (defaults to frontmost app if omitted)"
-                        }
-                    }
-                }))),
-            ),
-            Tool::new(
-                "probe_app",
-                "Probe an application to determine its type (Native, ElectronApp, or ChromeBrowser). Works whether the app is running or not. Use this to decide between native automation (take_ax_snapshot, click, find_text) and CDP-based tools (cdp_connect, cdp_find_elements, cdp_take_dom_snapshot).",
-                Arc::new(json_to_object(serde_json::json!({
-                    "type": "object",
-                    "required": ["app_name"],
-                    "properties": {
-                        "app_name": {
-                            "type": "string",
-                            "description": "Application name to probe (e.g., 'Signal', 'Google Chrome', 'Safari')"
                         }
                     }
                 }))),
@@ -2026,31 +1928,6 @@ impl ServerHandler for MacOSDevToolsServer {
         }
 
         match request.name.as_ref() {
-            "list_windows" => {
-                let params: navigation::ListWindowsParams = serde_json::from_value(args)
-                    .map_err(|e| McpError::invalid_params(e.to_string(), None))?;
-                Ok(navigation::list_windows(params))
-            }
-            "list_apps" => {
-                let params: navigation::ListAppsParams = serde_json::from_value(args)
-                    .map_err(|e| McpError::invalid_params(e.to_string(), None))?;
-                Ok(navigation::list_apps(params))
-            }
-            "focus_window" => {
-                let params: navigation::FocusWindowParams = serde_json::from_value(args)
-                    .map_err(|e| McpError::invalid_params(e.to_string(), None))?;
-                Ok(navigation::focus_window(params))
-            }
-            "launch_app" => {
-                let params: navigation::LaunchAppParams = serde_json::from_value(args)
-                    .map_err(|e| McpError::invalid_params(e.to_string(), None))?;
-                Ok(navigation::launch_app(params))
-            }
-            "quit_app" => {
-                let params: navigation::QuitAppParams = serde_json::from_value(args)
-                    .map_err(|e| McpError::invalid_params(e.to_string(), None))?;
-                Ok(navigation::quit_app(params))
-            }
             // App Debug Protocol tools
             "app_connect" => {
                 let params: app_tools::AppConnectParams = serde_json::from_value(args)
@@ -2219,11 +2096,6 @@ impl ServerHandler for MacOSDevToolsServer {
                 let params: crate::tools::ax_select::AxSelectParams = serde_json::from_value(args)
                     .map_err(|e| McpError::invalid_params(e.to_string(), None))?;
                 Ok(crate::tools::ax_select::ax_select(params, self.ax_session.clone()).await)
-            }
-            "probe_app" => {
-                let params: crate::tools::probe_app::ProbeAppParams = serde_json::from_value(args)
-                    .map_err(|e| McpError::invalid_params(e.to_string(), None))?;
-                Ok(crate::tools::probe_app::probe_app(params))
             }
             // Android tools
             "android_list_devices" => match crate::android::device::list_devices() {

@@ -282,6 +282,217 @@ fn focus_by_window_id(window_id: u32) -> CallToolResult {
     }
 }
 
+use crate::tools::registry::{json_to_object, ToolContext, ToolHandler};
+use rmcp::{model::Tool, Error as McpError};
+use std::sync::Arc;
+
+/// `list_windows` MCP tool handler.
+pub struct ListWindows;
+
+#[async_trait::async_trait]
+impl ToolHandler for ListWindows {
+    fn name(&self) -> &'static str {
+        "list_windows"
+    }
+
+    fn schema(&self) -> Tool {
+        Tool::new(
+            "list_windows",
+            "List all visible windows on screen with their IDs, titles, app names, and bounds.",
+            Arc::new(json_to_object(serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "app_name": {
+                        "type": "string",
+                        "description": "Filter windows by application name (optional)"
+                    }
+                }
+            }))),
+        )
+    }
+
+    async fn call(
+        &self,
+        args: serde_json::Value,
+        _ctx: &ToolContext,
+    ) -> Result<CallToolResult, McpError> {
+        let params: ListWindowsParams = serde_json::from_value(args)
+            .map_err(|e| McpError::invalid_params(e.to_string(), None))?;
+        Ok(list_windows(params))
+    }
+}
+
+/// `list_apps` MCP tool handler.
+pub struct ListApps;
+
+#[async_trait::async_trait]
+impl ToolHandler for ListApps {
+    fn name(&self) -> &'static str {
+        "list_apps"
+    }
+
+    fn schema(&self) -> Tool {
+        Tool::new(
+            "list_apps",
+            "List all running applications with their names, bundle IDs, and PIDs.",
+            Arc::new(json_to_object(serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "app_name": {
+                        "type": "string",
+                        "description": "Filter by application name (case-insensitive substring match)"
+                    },
+                    "user_apps_only": {
+                        "type": "boolean",
+                        "description": "Only return user-facing apps (excludes system agents, helpers, and daemons)"
+                    }
+                }
+            }))),
+        )
+    }
+
+    async fn call(
+        &self,
+        args: serde_json::Value,
+        _ctx: &ToolContext,
+    ) -> Result<CallToolResult, McpError> {
+        let params: ListAppsParams = serde_json::from_value(args)
+            .map_err(|e| McpError::invalid_params(e.to_string(), None))?;
+        Ok(list_apps(params))
+    }
+}
+
+/// `focus_window` MCP tool handler.
+pub struct FocusWindow;
+
+#[async_trait::async_trait]
+impl ToolHandler for FocusWindow {
+    fn name(&self) -> &'static str {
+        "focus_window"
+    }
+
+    fn schema(&self) -> Tool {
+        Tool::new(
+            "focus_window",
+            "Bring a window or application to the front. Specify window_id, app_name, or pid.",
+            Arc::new(json_to_object(serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "window_id": {
+                        "type": "integer",
+                        "description": "Window ID to focus"
+                    },
+                    "app_name": {
+                        "type": "string",
+                        "description": "Application name to focus"
+                    },
+                    "pid": {
+                        "type": "integer",
+                        "description": "Process ID to focus"
+                    }
+                }
+            }))),
+        )
+    }
+
+    async fn call(
+        &self,
+        args: serde_json::Value,
+        _ctx: &ToolContext,
+    ) -> Result<CallToolResult, McpError> {
+        let params: FocusWindowParams = serde_json::from_value(args)
+            .map_err(|e| McpError::invalid_params(e.to_string(), None))?;
+        Ok(focus_window(params))
+    }
+}
+
+/// `launch_app` MCP tool handler.
+pub struct LaunchApp;
+
+#[async_trait::async_trait]
+impl ToolHandler for LaunchApp {
+    fn name(&self) -> &'static str {
+        "launch_app"
+    }
+
+    fn schema(&self) -> Tool {
+        Tool::new(
+            "launch_app",
+            "Launch an application by name. On macOS, finds apps in /Applications and other standard locations. If the app is already running and no args are provided, brings it to the front. If args are provided and the app is already running, returns an error — use quit_app first.",
+            Arc::new(json_to_object(serde_json::json!({
+                "type": "object",
+                "required": ["app_name"],
+                "properties": {
+                    "app_name": {
+                        "type": "string",
+                        "description": "Application name to launch (e.g., 'Calculator', 'Safari')"
+                    },
+                    "args": {
+                        "type": "array",
+                        "items": { "type": "string" },
+                        "description": "CLI arguments to pass to the app (e.g., ['--remote-debugging-port=9222']). Only applied on fresh launch — if the app is already running, returns an error."
+                    },
+                    "background": {
+                        "type": "boolean",
+                        "description": "If true, launch without bringing the app to the foreground (uses `open -g` on macOS). Recommended when the next action will use CDP or AX dispatch, which are focus-preserving."
+                    }
+                }
+            }))),
+        )
+    }
+
+    async fn call(
+        &self,
+        args: serde_json::Value,
+        _ctx: &ToolContext,
+    ) -> Result<CallToolResult, McpError> {
+        let params: LaunchAppParams = serde_json::from_value(args)
+            .map_err(|e| McpError::invalid_params(e.to_string(), None))?;
+        Ok(launch_app(params))
+    }
+}
+
+/// `quit_app` MCP tool handler.
+pub struct QuitApp;
+
+#[async_trait::async_trait]
+impl ToolHandler for QuitApp {
+    fn name(&self) -> &'static str {
+        "quit_app"
+    }
+
+    fn schema(&self) -> Tool {
+        Tool::new(
+            "quit_app",
+            "Quit a running application by name. Graceful by default (app can save state). Use force=true to kill immediately.",
+            Arc::new(json_to_object(serde_json::json!({
+                "type": "object",
+                "required": ["app_name"],
+                "properties": {
+                    "app_name": {
+                        "type": "string",
+                        "description": "Application name to quit (e.g., 'Calculator', 'Safari')"
+                    },
+                    "force": {
+                        "type": "boolean",
+                        "description": "Force kill instead of graceful quit (default: false)"
+                    }
+                }
+            }))),
+        )
+    }
+
+    async fn call(
+        &self,
+        args: serde_json::Value,
+        _ctx: &ToolContext,
+    ) -> Result<CallToolResult, McpError> {
+        let params: QuitAppParams = serde_json::from_value(args)
+            .map_err(|e| McpError::invalid_params(e.to_string(), None))?;
+        Ok(quit_app(params))
+    }
+}
+
 #[cfg(test)]
 mod focus_window_tests {
     use super::*;

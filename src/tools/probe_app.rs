@@ -85,6 +85,47 @@ pub fn probe_app(params: ProbeAppParams) -> CallToolResult {
     )])
 }
 
+use crate::tools::registry::{json_to_object, ToolContext, ToolHandler};
+use rmcp::{model::Tool, Error as McpError};
+use std::sync::Arc;
+
+/// `probe_app` MCP tool handler.
+pub struct ProbeApp;
+
+#[async_trait::async_trait]
+impl ToolHandler for ProbeApp {
+    fn name(&self) -> &'static str {
+        "probe_app"
+    }
+
+    fn schema(&self) -> Tool {
+        Tool::new(
+            "probe_app",
+            "Probe an application to determine its type (Native, ElectronApp, or ChromeBrowser). Works whether the app is running or not. Use this to decide between native automation (take_ax_snapshot, click, find_text) and CDP-based tools (cdp_connect, cdp_find_elements, cdp_take_dom_snapshot).",
+            Arc::new(json_to_object(serde_json::json!({
+                "type": "object",
+                "required": ["app_name"],
+                "properties": {
+                    "app_name": {
+                        "type": "string",
+                        "description": "Application name to probe (e.g., 'Signal', 'Google Chrome', 'Safari')"
+                    }
+                }
+            }))),
+        )
+    }
+
+    async fn call(
+        &self,
+        args: serde_json::Value,
+        _ctx: &ToolContext,
+    ) -> Result<CallToolResult, McpError> {
+        let params: ProbeAppParams = serde_json::from_value(args)
+            .map_err(|e| McpError::invalid_params(e.to_string(), None))?;
+        Ok(probe_app(params))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

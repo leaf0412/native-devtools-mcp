@@ -98,6 +98,12 @@ impl ToolRegistry {
         #[allow(unused_mut)]
         let mut tools: Vec<Box<dyn ToolHandler>> = Vec::new();
         tools.push(Box::new(crate::tools::screenshot::TakeScreenshot));
+        tools.push(Box::new(crate::tools::navigation::ListWindows));
+        tools.push(Box::new(crate::tools::navigation::ListApps));
+        tools.push(Box::new(crate::tools::navigation::FocusWindow));
+        tools.push(Box::new(crate::tools::navigation::LaunchApp));
+        tools.push(Box::new(crate::tools::navigation::QuitApp));
+        tools.push(Box::new(crate::tools::probe_app::ProbeApp));
         Self { tools }
     }
 
