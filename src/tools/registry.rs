@@ -142,6 +142,12 @@ impl ToolRegistry {
         tools.push(Box::new(crate::android::tools::AndroidClick));
         tools.push(Box::new(crate::android::tools::AndroidTypeText));
         tools.push(Box::new(crate::android::tools::AndroidPressKey));
+        tools.push(Box::new(crate::android::tools::AndroidSwipe));
+        tools.push(Box::new(crate::android::tools::AndroidFindText));
+        tools.push(Box::new(crate::android::tools::AndroidListApps));
+        tools.push(Box::new(crate::android::tools::AndroidLaunchApp));
+        tools.push(Box::new(crate::android::tools::AndroidGetDisplayInfo));
+        tools.push(Box::new(crate::android::tools::AndroidGetCurrentActivity));
         Self { tools }
     }
 

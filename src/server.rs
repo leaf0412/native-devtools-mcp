@@ -1,8 +1,6 @@
 use crate::app_protocol::AppProtocolClient;
 use crate::tools::registry::{ConnectionState, ToolContext, ToolRegistry};
-use crate::tools::{
-    image_cache::ImageCache, input as input_tools, screenshot_cache::ScreenshotCache,
-};
+use crate::tools::{image_cache::ImageCache, screenshot_cache::ScreenshotCache};
 use rmcp::model::Content;
 use rmcp::{
     handler::server::ServerHandler,
@@ -172,6 +170,12 @@ const MIGRATED: &[&str] = &[
     "android_click",
     "android_type_text",
     "android_press_key",
+    "android_swipe",
+    "android_find_text",
+    "android_list_apps",
+    "android_launch_app",
+    "android_get_display_info",
+    "android_get_current_activity",
 ];
 
 #[derive(Clone)]
@@ -242,16 +246,6 @@ impl MacOSDevToolsServer {
 
     async fn is_recording(&self) -> bool {
         self.screen_recorder.read().await.is_some()
-    }
-
-    /// Thin delegate to the relocated free function in `android::tools`, kept
-    /// while the remaining (not-yet-migrated) android arms still call it via
-    /// `&self`. Removed once those arms move to the registry in the next batch.
-    async fn with_android_device<F>(&self, f: F) -> CallToolResult
-    where
-        F: FnOnce(&mut AndroidDevice) -> CallToolResult,
-    {
-        crate::android::tools::with_android_device(self.android_device.clone(), f).await
     }
 
     #[cfg(feature = "cdp")]
@@ -482,97 +476,11 @@ impl MacOSDevToolsServer {
         Vec::new()
     }
 
-    /// Android tools available only when a device is connected
+    /// Android tools available only when a device is connected — all now live
+    /// on the [`ToolRegistry`] (gated `WhenAndroidConnected`); this getter stays
+    /// as the seam the legacy union appends to and currently emits nothing.
     fn get_android_tools() -> Vec<Tool> {
-        vec![
-            Tool::new(
-                "android_swipe",
-                "Swipe from one point to another on the Android device.",
-                Arc::new(json_to_object(serde_json::json!({
-                    "type": "object",
-                    "required": ["start_x", "start_y", "end_x", "end_y"],
-                    "properties": {
-                        "start_x": {
-                            "type": "number",
-                            "description": "Start X coordinate"
-                        },
-                        "start_y": {
-                            "type": "number",
-                            "description": "Start Y coordinate"
-                        },
-                        "end_x": {
-                            "type": "number",
-                            "description": "End X coordinate"
-                        },
-                        "end_y": {
-                            "type": "number",
-                            "description": "End Y coordinate"
-                        },
-                        "duration_ms": {
-                            "type": "integer",
-                            "description": "Duration of the swipe in milliseconds (optional, default is instant)"
-                        }
-                    }
-                }))),
-            ),
-            Tool::new(
-                "android_find_text",
-                "Find UI elements on the Android device screen that match the given text. Uses uiautomator to dump the view hierarchy and search for matching elements. Returns coordinates for clicking. When no matches are found, the response includes an available_elements array listing all UI element names on screen — use this to find the correct name and retry.",
-                Arc::new(json_to_object(serde_json::json!({
-                    "type": "object",
-                    "required": ["text"],
-                    "properties": {
-                        "text": {
-                            "type": "string",
-                            "description": "Text to search for (case-insensitive substring match against text and content-desc attributes)"
-                        }
-                    }
-                }))),
-            ),
-            Tool::new(
-                "android_list_apps",
-                "List installed apps on the Android device.",
-                Arc::new(json_to_object(serde_json::json!({
-                    "type": "object",
-                    "properties": {
-                        "user_apps_only": {
-                            "type": "boolean",
-                            "description": "Only return user-installed (third-party) apps. Default is false (all packages)."
-                        }
-                    }
-                }))),
-            ),
-            Tool::new(
-                "android_launch_app",
-                "Launch an app on the Android device by its package name.",
-                Arc::new(json_to_object(serde_json::json!({
-                    "type": "object",
-                    "required": ["package_name"],
-                    "properties": {
-                        "package_name": {
-                            "type": "string",
-                            "description": "Package name to launch (e.g., 'com.android.settings')"
-                        }
-                    }
-                }))),
-            ),
-            Tool::new(
-                "android_get_display_info",
-                "Get display information (size and density) from the Android device.",
-                Arc::new(json_to_object(serde_json::json!({
-                    "type": "object",
-                    "properties": {}
-                }))),
-            ),
-            Tool::new(
-                "android_get_current_activity",
-                "Get the currently resumed activity on the Android device.",
-                Arc::new(json_to_object(serde_json::json!({
-                    "type": "object",
-                    "properties": {}
-                }))),
-            ),
-        ]
+        Vec::new()
     }
 
     /// Hover tracking tools. `start_hover_tracking` is always visible.
@@ -1198,110 +1106,6 @@ impl ServerHandler for MacOSDevToolsServer {
         }
 
         match request.name.as_ref() {
-            // Android tools
-            "android_swipe" => {
-                #[derive(serde::Deserialize)]
-                struct Params {
-                    start_x: f64,
-                    start_y: f64,
-                    end_x: f64,
-                    end_y: f64,
-                    duration_ms: Option<u32>,
-                }
-                let p: Params = serde_json::from_value(args)
-                    .map_err(|e| McpError::invalid_params(e.to_string(), None))?;
-                Ok(self
-                    .with_android_device(|device| {
-                        match crate::android::input::swipe(
-                            device,
-                            p.start_x,
-                            p.start_y,
-                            p.end_x,
-                            p.end_y,
-                            p.duration_ms,
-                        ) {
-                            Ok(()) => CallToolResult::success(vec![Content::text(format!(
-                                "Swiped from ({:.0}, {:.0}) to ({:.0}, {:.0})",
-                                p.start_x, p.start_y, p.end_x, p.end_y
-                            ))]),
-                            Err(e) => CallToolResult::error(vec![Content::text(e)]),
-                        }
-                    })
-                    .await)
-            }
-            "android_find_text" => {
-                let text = parse_string_field(&args, "text")?;
-                Ok(self
-                    .with_android_device(|device| {
-                        match crate::android::ui_automator::find_text(device, &text) {
-                            Ok(result) => {
-                                let mut content =
-                                    vec![Content::text(to_json_pretty(&result.matches))];
-                                if result.matches.is_empty() {
-                                    content.push(Content::text(
-                                        input_tools::build_no_matches_hint(
-                                            &text,
-                                            &result.available_elements,
-                                        ),
-                                    ));
-                                }
-                                CallToolResult::success(content)
-                            }
-                            Err(e) => CallToolResult::error(vec![Content::text(e)]),
-                        }
-                    })
-                    .await)
-            }
-            "android_list_apps" => {
-                let user_apps_only = args
-                    .get("user_apps_only")
-                    .and_then(|v| v.as_bool())
-                    .unwrap_or(false);
-                Ok(self
-                    .with_android_device(|device| {
-                        match crate::android::navigation::list_apps(device, user_apps_only) {
-                            Ok(apps) => {
-                                CallToolResult::success(vec![Content::text(to_json_pretty(&apps))])
-                            }
-                            Err(e) => CallToolResult::error(vec![Content::text(e)]),
-                        }
-                    })
-                    .await)
-            }
-            "android_launch_app" => {
-                let package_name = parse_string_field(&args, "package_name")?;
-                Ok(self
-                    .with_android_device(|device| {
-                        match crate::android::navigation::launch_app(device, &package_name) {
-                            Ok(()) => CallToolResult::success(vec![Content::text(format!(
-                                "Launched {}",
-                                package_name
-                            ))]),
-                            Err(e) => CallToolResult::error(vec![Content::text(e)]),
-                        }
-                    })
-                    .await)
-            }
-            "android_get_display_info" => Ok(self
-                .with_android_device(|device| {
-                    match crate::android::navigation::get_display_info(device) {
-                        Ok(info) => {
-                            CallToolResult::success(vec![Content::text(to_json_pretty(&info))])
-                        }
-                        Err(e) => CallToolResult::error(vec![Content::text(e)]),
-                    }
-                })
-                .await),
-            "android_get_current_activity" => Ok(self
-                .with_android_device(
-                    |device| match crate::android::navigation::get_current_activity(device) {
-                        Ok(activity) => {
-                            CallToolResult::success(vec![Content::text(to_json_pretty(&activity))])
-                        }
-                        Err(e) => CallToolResult::error(vec![Content::text(e)]),
-                    },
-                )
-                .await),
             "start_hover_tracking" => {
                 // Auto-clean finished tracker (e.g. from max duration timeout)
                 let already_active = {
