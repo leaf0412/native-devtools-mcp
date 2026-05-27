@@ -1,4 +1,5 @@
 use crate::app_protocol::AppProtocolClient;
+use crate::tools::registry::{ConnectionState, ToolContext, ToolRegistry};
 use crate::tools::{
     app_protocol as app_tools, find_image, image_cache::ImageCache, input as input_tools,
     load_image, navigation, screenshot, screenshot_cache::ScreenshotCache,
@@ -122,6 +123,13 @@ fn annotate_tools(tools: &mut [Tool], names: &[&str], annotation: ToolAnnotation
     }
 }
 
+/// Tool names that have been migrated to the [`ToolRegistry`]. The legacy
+/// schema getters and `call_tool` match still contain entries that are being
+/// moved batch by batch; this list is the coexistence seam — schemas and
+/// dispatch for these names come from the registry, and the legacy paths are
+/// filtered/short-circuited so the net tool set is invariant.
+const MIGRATED: &[&str] = &[];
+
 #[derive(Clone)]
 pub struct MacOSDevToolsServer {
     app_client: Arc<RwLock<Option<AppProtocolClient>>>,
@@ -155,6 +163,24 @@ impl MacOSDevToolsServer {
             cdp_client: Arc::new(RwLock::new(None)),
             #[cfg(target_os = "macos")]
             ax_session: Arc::new(crate::tools::ax_session::AxSession::new()),
+        }
+    }
+
+    /// Build a [`ToolContext`] for the duration of one `call_tool`, capturing
+    /// the request's `peer` so handlers can emit `notify_tool_list_changed`.
+    fn tool_context(&self, peer: rmcp::service::Peer<RoleServer>) -> ToolContext {
+        ToolContext {
+            app_client: self.app_client.clone(),
+            screenshot_cache: self.screenshot_cache.clone(),
+            image_cache: self.image_cache.clone(),
+            android_device: self.android_device.clone(),
+            hover_tracker: self.hover_tracker.clone(),
+            screen_recorder: self.screen_recorder.clone(),
+            #[cfg(feature = "cdp")]
+            cdp_client: self.cdp_client.clone(),
+            #[cfg(target_os = "macos")]
+            ax_session: self.ax_session.clone(),
+            peer,
         }
     }
 
@@ -212,6 +238,36 @@ impl MacOSDevToolsServer {
         recording: bool,
     ) -> Vec<Tool> {
         let _ = cdp_connected;
+        let state = ConnectionState {
+            app_connected,
+            android_connected,
+            hover_tracking,
+            recording,
+        };
+        let registry = ToolRegistry::build();
+
+        // Registry-owned tools, filtered by availability.
+        let mut tools = registry.schemas(&state);
+
+        // Legacy getters minus already-migrated names — the coexistence seam.
+        // As tools move to the registry their name lands in MIGRATED and is
+        // dropped here, keeping the net set invariant.
+        let mut legacy = Self::get_legacy_tools(app_connected, android_connected, hover_tracking, recording);
+        legacy.retain(|t| !MIGRATED.contains(&t.name.as_ref()));
+        tools.append(&mut legacy);
+
+        Self::apply_tool_annotations(&mut tools);
+        tools
+    }
+
+    /// Hand-written schema getters that have not yet been migrated to the
+    /// registry. Shrinks one batch at a time until step 8 deletes it.
+    fn get_legacy_tools(
+        app_connected: bool,
+        android_connected: bool,
+        hover_tracking: bool,
+        recording: bool,
+    ) -> Vec<Tool> {
         let mut tools = Self::get_base_tools();
         tools.push(Self::get_app_connect_tool());
         if app_connected {
@@ -228,7 +284,6 @@ impl MacOSDevToolsServer {
         }
         tools.extend(Self::get_hover_tracking_tools(hover_tracking));
         tools.extend(Self::get_recording_tools(recording));
-        Self::apply_tool_annotations(&mut tools);
         tools
     }
 
@@ -2005,6 +2060,14 @@ impl ServerHandler for MacOSDevToolsServer {
             .arguments
             .map(Value::Object)
             .unwrap_or(Value::Object(Default::default()));
+
+        // Try the registry first; fall through to the legacy match for tools
+        // not yet migrated. Migrated arms are deleted as they move.
+        let registry = ToolRegistry::build();
+        if let Some(handler) = registry.get(request.name.as_ref()) {
+            let ctx = self.tool_context(context.peer);
+            return handler.call(args, &ctx).await;
+        }
 
         match request.name.as_ref() {
             "take_screenshot" => {
