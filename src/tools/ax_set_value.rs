@@ -73,3 +73,53 @@ pub async fn ax_set_value(params: AxSetValueParams, session: Arc<AxSession>) -> 
         ),
     }
 }
+
+use crate::tools::registry::{json_to_object, ToolContext, ToolHandler};
+use rmcp::{model::Tool, Error as McpError};
+
+/// `ax_set_value` MCP tool handler (macOS only).
+pub struct AxSetValue;
+
+#[async_trait::async_trait]
+impl ToolHandler for AxSetValue {
+    fn name(&self) -> &'static str {
+        "ax_set_value"
+    }
+
+    fn schema(&self) -> Tool {
+        Tool::new(
+            "ax_set_value",
+            "macOS only. Write to an element's kAXValueAttribute — value assignment, \
+             not key-event typing. Use for AXTextField / AXTextArea / AXSearchField and \
+             similar text widgets. Does NOT fire keydown/keyup, does NOT participate in \
+             IME/composition, does NOT populate the app's undo stack, and will not work \
+             on rich editors that refuse AXValue writes. On not_dispatchable, the caller \
+             should fall back to a two-step sequence: click(fallback.x, fallback.y) to \
+             focus, then type_text(text) for key-event input.",
+            Arc::new(json_to_object(serde_json::json!({
+                "type": "object",
+                "required": ["uid", "text"],
+                "properties": {
+                    "uid": {
+                        "type": "string",
+                        "description": "Element uid from the most recent take_ax_snapshot, e.g. \"a42g3\"."
+                    },
+                    "text": {
+                        "type": "string",
+                        "description": "Text to assign via kAXValueAttribute."
+                    }
+                }
+            }))),
+        )
+    }
+
+    async fn call(
+        &self,
+        args: serde_json::Value,
+        ctx: &ToolContext,
+    ) -> Result<CallToolResult, McpError> {
+        let params: AxSetValueParams = serde_json::from_value(args)
+            .map_err(|e| McpError::invalid_params(e.to_string(), None))?;
+        Ok(ax_set_value(params, ctx.ax_session.clone()).await)
+    }
+}

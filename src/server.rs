@@ -147,6 +147,13 @@ const MIGRATED: &[&str] = &[
     "element_at_point",
     "find_image",
     "load_image",
+    "take_ax_snapshot",
+    #[cfg(target_os = "macos")]
+    "ax_click",
+    #[cfg(target_os = "macos")]
+    "ax_set_value",
+    #[cfg(target_os = "macos")]
+    "ax_select",
 ];
 
 #[derive(Clone)]
@@ -440,123 +447,13 @@ impl MacOSDevToolsServer {
         }
     }
 
-    /// Tools that are always available (system tools, CGEvent tools, etc.)
+    /// Tools that are always available (system tools, CGEvent tools, etc.).
+    ///
+    /// `take_ax_snapshot` and the macOS `ax_*` tools now live on the
+    /// [`ToolRegistry`]; this getter holds the remaining legacy base tools
+    /// (currently none) and stays as the seam the legacy union appends to.
     fn get_base_tools() -> Vec<Tool> {
-        #[allow(unused_mut)]
-        let mut tools = vec![
-            Tool::new(
-                "take_ax_snapshot",
-                "Take an accessibility tree snapshot of an application. Returns a \
-                 structured text representation with unique element IDs, roles, names, \
-                 state attributes, and (on macOS) per-element bounding boxes. Works for \
-                 any app without requiring a debug port. \
-                 macOS note: this tool mutates server state — each call bumps a \
-                 monotonic generation and invalidates every prior uid for ax_click / \
-                 ax_set_value / ax_select consumption. Snapshot IDs on macOS look like \
-                 'a42g3' (generation-tagged); Windows IDs remain bare 'a42'. \
-                 Re-snapshot immediately before any ax_click / ax_set_value / ax_select \
-                 call.",
-                Arc::new(json_to_object(serde_json::json!({
-                    "type": "object",
-                    "properties": {
-                        "app_name": {
-                            "type": "string",
-                            "description": "Application name (defaults to frontmost app if omitted)"
-                        }
-                    }
-                }))),
-            ),
-        ];
-        #[cfg(target_os = "macos")]
-        {
-            tools.push(Self::get_ax_click_tool());
-            tools.push(Self::get_ax_set_value_tool());
-            tools.push(Self::get_ax_select_tool());
-        }
-        tools
-    }
-
-    #[cfg(target_os = "macos")]
-    fn get_ax_click_tool() -> Tool {
-        Tool::new(
-            "ax_click",
-            "macOS only. Dispatch AXPress against a UI element identified by its uid \
-             from the most recent take_ax_snapshot (e.g. \"a42g3\"). The 'g<gen>' \
-             suffix is a generation tag — any fresh take_ax_snapshot invalidates all \
-             prior uids, so always snapshot immediately before the uid is used. Does \
-             not move the mouse cursor and does not steal focus from the frontmost \
-             app. On failure the tool returns an error whose JSON body includes \
-             { error: { code, message, fallback: { x, y } | null } }; when fallback is \
-             populated you can retry via click(x, y).",
-            Arc::new(json_to_object(serde_json::json!({
-                "type": "object",
-                "required": ["uid"],
-                "properties": {
-                    "uid": {
-                        "type": "string",
-                        "description": "Element uid from the most recent take_ax_snapshot, e.g. \"a42g3\". Must match the current snapshot generation."
-                    }
-                }
-            }))),
-        )
-    }
-
-    #[cfg(target_os = "macos")]
-    fn get_ax_set_value_tool() -> Tool {
-        Tool::new(
-            "ax_set_value",
-            "macOS only. Write to an element's kAXValueAttribute — value assignment, \
-             not key-event typing. Use for AXTextField / AXTextArea / AXSearchField and \
-             similar text widgets. Does NOT fire keydown/keyup, does NOT participate in \
-             IME/composition, does NOT populate the app's undo stack, and will not work \
-             on rich editors that refuse AXValue writes. On not_dispatchable, the caller \
-             should fall back to a two-step sequence: click(fallback.x, fallback.y) to \
-             focus, then type_text(text) for key-event input.",
-            Arc::new(json_to_object(serde_json::json!({
-                "type": "object",
-                "required": ["uid", "text"],
-                "properties": {
-                    "uid": {
-                        "type": "string",
-                        "description": "Element uid from the most recent take_ax_snapshot, e.g. \"a42g3\"."
-                    },
-                    "text": {
-                        "type": "string",
-                        "description": "Text to assign via kAXValueAttribute."
-                    }
-                }
-            }))),
-        )
-    }
-
-    #[cfg(target_os = "macos")]
-    fn get_ax_select_tool() -> Tool {
-        Tool::new(
-            "ax_select",
-            "macOS only. Select a row inside an NSOutlineView / NSTableView (sidebars, \
-             rule lists, file browsers) by writing AXSelectedRows on the enclosing \
-             outline or table. Accepts a uid pointing at the row, a cell inside the row, \
-             or any descendant — the tool walks up to the enclosing AXRow then the \
-             enclosing AXOutline / AXTable. Does not move the cursor and does not steal \
-             focus. Use ax_select instead of ax_click for row targets: rows typically \
-             refuse AXPress (returning not_dispatchable or AX error -25205), and a \
-             coordinate click steals focus. On failure the tool returns { error: { code, \
-             message, fallback: { x, y } | null } } with codes snapshot_expired, \
-             uid_not_found, no_row_ancestor, no_outline_container, not_dispatchable, or \
-             ax_error. The fallback centre falls back from the row bbox to the \
-             originally-targeted element bbox so the caller can still click(x, y) if \
-             desired.",
-            Arc::new(json_to_object(serde_json::json!({
-                "type": "object",
-                "required": ["uid"],
-                "properties": {
-                    "uid": {
-                        "type": "string",
-                        "description": "Element uid from the most recent take_ax_snapshot. Points at the row itself, a cell within the row, or any descendant."
-                    }
-                }
-            }))),
-        )
+        Vec::new()
     }
 
     /// The app_connect tool - always available to initiate connections
@@ -1638,55 +1535,6 @@ impl ServerHandler for MacOSDevToolsServer {
                 let params: app_tools::AppFocusWindowParams = serde_json::from_value(args)
                     .map_err(|e| McpError::invalid_params(e.to_string(), None))?;
                 Ok(app_tools::app_focus_window(params, self.app_client.clone()).await)
-            }
-            "take_ax_snapshot" => {
-                let params: crate::tools::ax_snapshot::TakeAxSnapshotParams =
-                    serde_json::from_value(args)
-                        .map_err(|e| McpError::invalid_params(e.to_string(), None))?;
-                #[cfg(target_os = "macos")]
-                {
-                    // Native macOS path: walk the AX tree, capture retained
-                    // AXRef handles, swap them into the session (generation
-                    // bump), format with the assigned generation so uids are
-                    // stamped `a<N>g<gen>`.
-                    let (nodes, refs) =
-                        match crate::macos::ax::collect_ax_tree_indexed(params.app_name.as_deref())
-                        {
-                            Ok(v) => v,
-                            Err(e) => return Ok(CallToolResult::error(vec![Content::text(e)])),
-                        };
-                    let generation = self.ax_session.create_snapshot(refs).await;
-                    let snapshot =
-                        crate::tools::ax_snapshot::format_snapshot(&nodes, Some(generation));
-                    Ok(CallToolResult::success(vec![Content::text(snapshot)]))
-                }
-                #[cfg(not(target_os = "macos"))]
-                {
-                    // Windows UIA path: unchanged — no session, uids stay bare `a<N>`.
-                    match crate::tools::ax_snapshot::take_ax_snapshot(params) {
-                        Ok(snapshot) => Ok(CallToolResult::success(vec![Content::text(snapshot)])),
-                        Err(e) => Ok(CallToolResult::error(vec![Content::text(e)])),
-                    }
-                }
-            }
-            #[cfg(target_os = "macos")]
-            "ax_click" => {
-                let params: crate::tools::ax_click::AxClickParams = serde_json::from_value(args)
-                    .map_err(|e| McpError::invalid_params(e.to_string(), None))?;
-                Ok(crate::tools::ax_click::ax_click(params, self.ax_session.clone()).await)
-            }
-            #[cfg(target_os = "macos")]
-            "ax_set_value" => {
-                let params: crate::tools::ax_set_value::AxSetValueParams =
-                    serde_json::from_value(args)
-                        .map_err(|e| McpError::invalid_params(e.to_string(), None))?;
-                Ok(crate::tools::ax_set_value::ax_set_value(params, self.ax_session.clone()).await)
-            }
-            #[cfg(target_os = "macos")]
-            "ax_select" => {
-                let params: crate::tools::ax_select::AxSelectParams = serde_json::from_value(args)
-                    .map_err(|e| McpError::invalid_params(e.to_string(), None))?;
-                Ok(crate::tools::ax_select::ax_select(params, self.ax_session.clone()).await)
             }
             // Android tools
             "android_list_devices" => match crate::android::device::list_devices() {

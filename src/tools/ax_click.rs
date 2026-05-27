@@ -74,3 +74,50 @@ pub async fn ax_click(params: AxClickParams, session: Arc<AxSession>) -> CallToo
         ),
     }
 }
+
+use crate::tools::registry::{json_to_object, ToolContext, ToolHandler};
+use rmcp::{model::Tool, Error as McpError};
+
+/// `ax_click` MCP tool handler (macOS only).
+pub struct AxClick;
+
+#[async_trait::async_trait]
+impl ToolHandler for AxClick {
+    fn name(&self) -> &'static str {
+        "ax_click"
+    }
+
+    fn schema(&self) -> Tool {
+        Tool::new(
+            "ax_click",
+            "macOS only. Dispatch AXPress against a UI element identified by its uid \
+             from the most recent take_ax_snapshot (e.g. \"a42g3\"). The 'g<gen>' \
+             suffix is a generation tag — any fresh take_ax_snapshot invalidates all \
+             prior uids, so always snapshot immediately before the uid is used. Does \
+             not move the mouse cursor and does not steal focus from the frontmost \
+             app. On failure the tool returns an error whose JSON body includes \
+             { error: { code, message, fallback: { x, y } | null } }; when fallback is \
+             populated you can retry via click(x, y).",
+            Arc::new(json_to_object(serde_json::json!({
+                "type": "object",
+                "required": ["uid"],
+                "properties": {
+                    "uid": {
+                        "type": "string",
+                        "description": "Element uid from the most recent take_ax_snapshot, e.g. \"a42g3\". Must match the current snapshot generation."
+                    }
+                }
+            }))),
+        )
+    }
+
+    async fn call(
+        &self,
+        args: serde_json::Value,
+        ctx: &ToolContext,
+    ) -> Result<CallToolResult, McpError> {
+        let params: AxClickParams = serde_json::from_value(args)
+            .map_err(|e| McpError::invalid_params(e.to_string(), None))?;
+        Ok(ax_click(params, ctx.ax_session.clone()).await)
+    }
+}

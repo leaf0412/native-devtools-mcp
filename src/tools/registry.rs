@@ -115,6 +115,13 @@ impl ToolRegistry {
         tools.push(Box::new(crate::tools::input::ElementAtPoint));
         tools.push(Box::new(crate::tools::find_image::FindImage));
         tools.push(Box::new(crate::tools::load_image::LoadImage));
+        tools.push(Box::new(crate::tools::ax_snapshot::TakeAxSnapshot));
+        #[cfg(target_os = "macos")]
+        {
+            tools.push(Box::new(crate::tools::ax_click::AxClick));
+            tools.push(Box::new(crate::tools::ax_set_value::AxSetValue));
+            tools.push(Box::new(crate::tools::ax_select::AxSelect));
+        }
         Self { tools }
     }
 

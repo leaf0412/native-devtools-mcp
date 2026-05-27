@@ -111,3 +111,55 @@ pub async fn ax_select(params: AxSelectParams, session: Arc<AxSession>) -> CallT
         ),
     }
 }
+
+use crate::tools::registry::{json_to_object, ToolContext, ToolHandler};
+use rmcp::{model::Tool, Error as McpError};
+
+/// `ax_select` MCP tool handler (macOS only).
+pub struct AxSelect;
+
+#[async_trait::async_trait]
+impl ToolHandler for AxSelect {
+    fn name(&self) -> &'static str {
+        "ax_select"
+    }
+
+    fn schema(&self) -> Tool {
+        Tool::new(
+            "ax_select",
+            "macOS only. Select a row inside an NSOutlineView / NSTableView (sidebars, \
+             rule lists, file browsers) by writing AXSelectedRows on the enclosing \
+             outline or table. Accepts a uid pointing at the row, a cell inside the row, \
+             or any descendant — the tool walks up to the enclosing AXRow then the \
+             enclosing AXOutline / AXTable. Does not move the cursor and does not steal \
+             focus. Use ax_select instead of ax_click for row targets: rows typically \
+             refuse AXPress (returning not_dispatchable or AX error -25205), and a \
+             coordinate click steals focus. On failure the tool returns { error: { code, \
+             message, fallback: { x, y } | null } } with codes snapshot_expired, \
+             uid_not_found, no_row_ancestor, no_outline_container, not_dispatchable, or \
+             ax_error. The fallback centre falls back from the row bbox to the \
+             originally-targeted element bbox so the caller can still click(x, y) if \
+             desired.",
+            Arc::new(json_to_object(serde_json::json!({
+                "type": "object",
+                "required": ["uid"],
+                "properties": {
+                    "uid": {
+                        "type": "string",
+                        "description": "Element uid from the most recent take_ax_snapshot. Points at the row itself, a cell within the row, or any descendant."
+                    }
+                }
+            }))),
+        )
+    }
+
+    async fn call(
+        &self,
+        args: serde_json::Value,
+        ctx: &ToolContext,
+    ) -> Result<CallToolResult, McpError> {
+        let params: AxSelectParams = serde_json::from_value(args)
+            .map_err(|e| McpError::invalid_params(e.to_string(), None))?;
+        Ok(ax_select(params, ctx.ax_session.clone()).await)
+    }
+}

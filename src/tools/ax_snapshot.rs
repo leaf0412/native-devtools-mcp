@@ -188,6 +188,83 @@ pub fn map_uia_control_type(control_type_id: i32) -> String {
     .to_string()
 }
 
+use crate::tools::registry::{json_to_object, ToolContext, ToolHandler};
+use rmcp::{
+    model::{CallToolResult, Content, Tool},
+    Error as McpError,
+};
+use std::sync::Arc;
+
+/// `take_ax_snapshot` MCP tool handler. Cross-platform: visible on every OS.
+/// On macOS it bumps the AX session generation; on other platforms it reads
+/// the native accessibility tree with bare uids.
+pub struct TakeAxSnapshot;
+
+#[async_trait::async_trait]
+impl ToolHandler for TakeAxSnapshot {
+    fn name(&self) -> &'static str {
+        "take_ax_snapshot"
+    }
+
+    fn schema(&self) -> Tool {
+        Tool::new(
+            "take_ax_snapshot",
+            "Take an accessibility tree snapshot of an application. Returns a \
+             structured text representation with unique element IDs, roles, names, \
+             state attributes, and (on macOS) per-element bounding boxes. Works for \
+             any app without requiring a debug port. \
+             macOS note: this tool mutates server state — each call bumps a \
+             monotonic generation and invalidates every prior uid for ax_click / \
+             ax_set_value / ax_select consumption. Snapshot IDs on macOS look like \
+             'a42g3' (generation-tagged); Windows IDs remain bare 'a42'. \
+             Re-snapshot immediately before any ax_click / ax_set_value / ax_select \
+             call.",
+            Arc::new(json_to_object(serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "app_name": {
+                        "type": "string",
+                        "description": "Application name (defaults to frontmost app if omitted)"
+                    }
+                }
+            }))),
+        )
+    }
+
+    #[cfg_attr(not(target_os = "macos"), allow(unused_variables))]
+    async fn call(
+        &self,
+        args: serde_json::Value,
+        ctx: &ToolContext,
+    ) -> Result<CallToolResult, McpError> {
+        let params: TakeAxSnapshotParams = serde_json::from_value(args)
+            .map_err(|e| McpError::invalid_params(e.to_string(), None))?;
+        #[cfg(target_os = "macos")]
+        {
+            // Native macOS path: walk the AX tree, capture retained
+            // AXRef handles, swap them into the session (generation
+            // bump), format with the assigned generation so uids are
+            // stamped `a<N>g<gen>`.
+            let (nodes, refs) =
+                match crate::macos::ax::collect_ax_tree_indexed(params.app_name.as_deref()) {
+                    Ok(v) => v,
+                    Err(e) => return Ok(CallToolResult::error(vec![Content::text(e)])),
+                };
+            let generation = ctx.ax_session.create_snapshot(refs).await;
+            let snapshot = format_snapshot(&nodes, Some(generation));
+            Ok(CallToolResult::success(vec![Content::text(snapshot)]))
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            // Windows UIA path: unchanged — no session, uids stay bare `a<N>`.
+            match take_ax_snapshot(params) {
+                Ok(snapshot) => Ok(CallToolResult::success(vec![Content::text(snapshot)])),
+                Err(e) => Ok(CallToolResult::error(vec![Content::text(e)])),
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
