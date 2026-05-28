@@ -1,27 +1,23 @@
-//! Template matching tool for locating images within screenshots.
+//! CPU-bound matching algorithm for `find_image`.
 //!
-//! This module implements the `find_image` MCP tool which uses normalized
-//! cross-correlation (NCC) to find template images within screenshots.
-//!
-//! ## Performance Optimizations
-//!
-//! This module supports several optional performance optimizations:
-//!
-//! - **Algorithmic**: Dynamic downscaling in fast mode, early exit on high-confidence
-//!   matches, and efficient scale loop termination.
-//! - **Parallelism** (`find_image_parallel` feature): Uses Rayon to process
-//!   scale/rotation combinations in parallel.
-//! - **SIMD** (`find_image_simd` feature): Uses the `wide` crate for vectorized
-//!   NCC computation on x86_64 and aarch64.
+//! Hosts the orchestrator (`find_image`), the blocking `run_matching` loop,
+//! work-item construction, per-position NCC (scalar + optional SIMD), and the
+//! `MatchingInput` / `MatchingResult` structs that cross the
+//! `spawn_blocking` boundary.
 
+use crate::tools::find_image::nms::non_maximum_suppression;
+use crate::tools::find_image::params::{
+    normalize_rotation, validate_scale_range, BoundingBox, FindImageParams, FindImageResponse,
+    MatchResult, ModeDefaults, Point, ScaleRange, SearchRegion,
+};
+use crate::tools::find_image::transform::{
+    decode_base64_to_gray, decode_png_to_gray, extract_region, resize_image, rotate_image,
+};
 use crate::tools::image_cache::ImageCache;
 use crate::tools::screenshot_cache::{ScreenshotCache, ScreenshotMetadata};
-use base64::Engine;
-use image::{GrayImage, ImageReader};
+use image::GrayImage;
 use rmcp::model::{CallToolResult, Content};
-use serde::{Deserialize, Serialize};
 use std::borrow::Cow;
-use std::io::Cursor;
 use std::sync::Arc;
 use tokio::sync::RwLock;
 
@@ -47,258 +43,48 @@ fn get_thread_pool() -> &'static rayon::ThreadPool {
     })
 }
 
-/// Parameters for the find_image tool.
-#[derive(Debug, Deserialize)]
-pub struct FindImageParams {
-    /// Screenshot ID from a previous take_screenshot call.
-    pub screenshot_id: Option<String>,
-
-    /// Base64-encoded screenshot image (used if no screenshot_id).
-    pub screenshot_image_base64: Option<String>,
-
-    /// Image ID from a previous load_image call (preferred over template_image_base64).
-    pub template_id: Option<String>,
-
-    /// Base64-encoded template image to find (used if no template_id).
-    pub template_image_base64: Option<String>,
-
-    /// Image ID from a previous load_image call for the mask.
-    pub mask_id: Option<String>,
-
-    /// Base64-encoded mask image (optional; white=match, black=ignore).
-    pub mask_image_base64: Option<String>,
-
-    /// Mode: "fast" (default) or "accurate".
-    #[serde(default = "default_mode")]
-    pub mode: String,
-
-    /// Minimum match score threshold (default depends on mode).
-    pub threshold: Option<f64>,
-
-    /// Maximum number of results to return (default depends on mode).
-    pub max_results: Option<usize>,
-
-    /// Scale search range: {min, max, step}.
-    pub scales: Option<ScaleRange>,
-
-    /// Rotations to try in degrees. Only 0, 90, 180, 270 are supported.
-    pub rotations: Option<Vec<f64>>,
-
-    /// Search region within the screenshot: {x, y, w, h}.
-    pub search_region: Option<SearchRegion>,
-
-    /// Stride for matching (default: 2 in fast mode, 1 in accurate mode).
-    pub stride: Option<u32>,
-
-    /// Return screen coordinates (requires screenshot metadata).
-    #[serde(default = "default_return_screen_coords")]
-    pub return_screen_coords: bool,
-}
-
-fn default_mode() -> String {
-    "fast".to_string()
-}
-
-fn default_return_screen_coords() -> bool {
-    true
-}
-
-/// Scale search range configuration.
-#[derive(Debug, Clone, Deserialize, Serialize)]
-pub struct ScaleRange {
-    pub min: f64,
-    pub max: f64,
-    pub step: f64,
-}
-
-impl Default for ScaleRange {
-    fn default() -> Self {
-        Self {
-            min: 0.8,
-            max: 1.2,
-            step: 0.1,
-        }
-    }
-}
-
-/// Search region within the screenshot.
-#[derive(Debug, Clone, Deserialize, Serialize)]
-pub struct SearchRegion {
-    pub x: u32,
-    pub y: u32,
-    pub w: u32,
-    pub h: u32,
-}
-
-/// A single match result.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct MatchResult {
-    /// Match confidence score (0.0 to 1.0).
-    pub score: f64,
-    /// Bounding box in screenshot pixels.
-    pub bbox: BoundingBox,
-    /// Center point in screenshot pixels.
-    pub center: Point,
-    /// Scale at which the match was found.
-    pub scale: f64,
-    /// Rotation at which the match was found (degrees).
-    pub rotation: f64,
-    /// Screen X coordinate (if metadata available).
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub screen_x: Option<f64>,
-    /// Screen Y coordinate (if metadata available).
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub screen_y: Option<f64>,
-}
-
-/// Bounding box.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct BoundingBox {
-    pub x: u32,
-    pub y: u32,
-    pub w: u32,
-    pub h: u32,
-}
-
-/// Point coordinate.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct Point {
-    pub x: f64,
-    pub y: f64,
-}
-
-/// Response from find_image tool.
-#[derive(Debug, Serialize, Deserialize)]
-pub struct FindImageResponse {
-    pub matches: Vec<MatchResult>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub warning: Option<String>,
-}
-
-/// Mode-specific defaults.
-struct ModeDefaults {
-    threshold: f64,
-    max_results: usize,
-    scales: ScaleRange,
-    stride: u32,
-}
-
-impl ModeDefaults {
-    fn fast() -> Self {
-        Self {
-            threshold: 0.75,
-            max_results: 3,
-            scales: ScaleRange {
-                min: 0.8,
-                max: 1.2,
-                step: 0.1,
-            },
-            stride: 2,
-        }
-    }
-
-    fn accurate() -> Self {
-        Self {
-            threshold: 0.75,
-            max_results: 5,
-            scales: ScaleRange {
-                min: 0.5,
-                max: 2.0,
-                step: 0.05,
-            },
-            stride: 1,
-        }
-    }
-
-    fn for_mode(mode: &str) -> Self {
-        match mode {
-            "accurate" => Self::accurate(),
-            _ => Self::fast(),
-        }
-    }
-}
-
-/// Normalize a rotation angle to one of the supported values (0, 90, 180, 270).
-/// Returns None if the angle is not within ±1° tolerance of a supported value.
-fn normalize_rotation(r: f64) -> Option<f64> {
-    let normalized = ((r % 360.0) + 360.0) % 360.0;
-    // ±1° tolerance (inclusive)
-    if normalized <= 1.0 || normalized >= 359.0 {
-        Some(0.0)
-    } else if (normalized - 90.0).abs() <= 1.0 {
-        Some(90.0)
-    } else if (normalized - 180.0).abs() <= 1.0 {
-        Some(180.0)
-    } else if (normalized - 270.0).abs() <= 1.0 {
-        Some(270.0)
-    } else {
-        None
-    }
-}
-
-/// Validate scale range parameters.
-/// Returns Ok(()) if valid, Err(message) if invalid.
-fn validate_scale_range(scales: &ScaleRange) -> Result<(), String> {
-    if scales.step <= 0.0 {
-        return Err("scales.step must be positive (got 0 or negative)".to_string());
-    }
-    if scales.min <= 0.0 {
-        return Err(format!("scales.min must be positive (got {})", scales.min));
-    }
-    if scales.max <= 0.0 {
-        return Err(format!("scales.max must be positive (got {})", scales.max));
-    }
-    if scales.min > scales.max {
-        return Err(format!(
-            "scales.min ({}) must not exceed scales.max ({})",
-            scales.min, scales.max
-        ));
-    }
-    Ok(())
-}
-
 /// Input data for the blocking matching operation.
-struct MatchingInput {
-    screenshot_png_data: Option<Vec<u8>>,
-    screenshot_b64: Option<String>,
-    template_png_data: Option<Vec<u8>>,
-    template_b64: Option<String>,
-    mask_png_data: Option<Vec<u8>>,
-    mask_b64: Option<String>,
-    search_region: Option<SearchRegion>,
-    threshold: f64,
-    max_results: usize,
-    scales: ScaleRange,
-    stride: u32,
-    rotations: Vec<f64>,
-    return_screen_coords: bool,
-    screenshot_metadata: Option<ScreenshotMetadata>,
+pub(super) struct MatchingInput {
+    pub(super) screenshot_png_data: Option<Vec<u8>>,
+    pub(super) screenshot_b64: Option<String>,
+    pub(super) template_png_data: Option<Vec<u8>>,
+    pub(super) template_b64: Option<String>,
+    pub(super) mask_png_data: Option<Vec<u8>>,
+    pub(super) mask_b64: Option<String>,
+    pub(super) search_region: Option<SearchRegion>,
+    pub(super) threshold: f64,
+    pub(super) max_results: usize,
+    pub(super) scales: ScaleRange,
+    pub(super) stride: u32,
+    pub(super) rotations: Vec<f64>,
+    pub(super) return_screen_coords: bool,
+    pub(super) screenshot_metadata: Option<ScreenshotMetadata>,
     /// Whether this is "fast" mode (enables downscaling and early exit).
-    is_fast_mode: bool,
+    pub(super) is_fast_mode: bool,
 }
 
 /// Work item for parallel processing of scale/rotation combinations.
 #[derive(Clone)]
-struct WorkItem {
-    rotation: f64,
-    rotation_idx: usize,
-    scale: f64,
+pub(super) struct WorkItem {
+    pub(super) rotation: f64,
+    pub(super) rotation_idx: usize,
+    pub(super) scale: f64,
 }
 
 /// Pre-rotated template and mask for a specific rotation angle.
-struct RotatedTemplates {
-    template: GrayImage,
-    mask: Option<GrayImage>,
+pub(super) struct RotatedTemplates {
+    pub(super) template: GrayImage,
+    pub(super) mask: Option<GrayImage>,
 }
 
 /// Result from the blocking matching operation.
-enum MatchingResult {
+pub(super) enum MatchingResult {
     Success(Vec<MatchResult>),
     Error(String),
 }
 
 /// Execute the find_image tool.
-pub async fn find_image(
+pub(super) async fn find_image(
     params: FindImageParams,
     screenshot_cache: Arc<RwLock<ScreenshotCache>>,
     image_cache: Arc<RwLock<ImageCache>>,
@@ -476,7 +262,7 @@ pub async fn find_image(
 /// In fast mode, if the search image max dimension exceeds 1200px, we downscale
 /// to reduce NCC computation. The downscale factor is capped at 0.5 to avoid
 /// losing too much detail.
-fn compute_downscale_factor(search_img: &GrayImage, _template: &GrayImage) -> f64 {
+pub(super) fn compute_downscale_factor(search_img: &GrayImage, _template: &GrayImage) -> f64 {
     let max_dim = search_img.width().max(search_img.height()) as f64;
     const TARGET_MAX_DIM: f64 = 1200.0;
     const MIN_DOWNSCALE: f64 = 0.5;
@@ -490,7 +276,7 @@ fn compute_downscale_factor(search_img: &GrayImage, _template: &GrayImage) -> f6
 
 /// Build a list of work items from rotations and scales, pruning scales that
 /// would make the template larger than the search image.
-fn build_work_items(
+pub(super) fn build_work_items(
     rotations: &[f64],
     scales: &ScaleRange,
     rotated_templates: &[RotatedTemplates],
@@ -518,7 +304,7 @@ fn build_work_items(
 
 /// Pre-compute rotated templates for each unique rotation angle.
 /// Returns a Vec indexed by rotation_idx.
-fn build_rotated_templates(
+pub(super) fn build_rotated_templates(
     template: &GrayImage,
     mask: Option<&GrayImage>,
     rotations: &[f64],
@@ -536,7 +322,7 @@ fn build_rotated_templates(
 /// Returns matches for this specific configuration.
 /// The `rotated_template` and `rotated_mask` should be pre-rotated for this work item's rotation.
 #[allow(clippy::too_many_arguments)]
-fn process_work_item(
+pub(super) fn process_work_item(
     item: &WorkItem,
     search_img: &GrayImage,
     rotated_template: &GrayImage,
@@ -641,7 +427,7 @@ fn process_work_item(
 }
 
 /// CPU-intensive matching logic, runs on a blocking thread.
-fn run_matching(input: MatchingInput) -> MatchingResult {
+pub(super) fn run_matching(input: MatchingInput) -> MatchingResult {
     // Decode screenshot
     let (screenshot_gray, screenshot_metadata) = if let Some(png_data) = input.screenshot_png_data {
         match decode_png_to_gray(&png_data) {
@@ -851,69 +637,6 @@ fn run_matching(input: MatchingInput) -> MatchingResult {
     let final_matches = non_maximum_suppression(sorted_matches, 0.3, input.max_results);
 
     MatchingResult::Success(final_matches)
-}
-
-/// Decode base64 image data to grayscale.
-fn decode_base64_to_gray(b64: &str) -> Result<GrayImage, String> {
-    let data = base64::engine::general_purpose::STANDARD
-        .decode(b64)
-        .map_err(|e| format!("Invalid base64: {}", e))?;
-    decode_png_to_gray(&data)
-}
-
-/// Decode PNG/JPEG bytes to grayscale.
-fn decode_png_to_gray(data: &[u8]) -> Result<GrayImage, String> {
-    let img = ImageReader::new(Cursor::new(data))
-        .with_guessed_format()
-        .map_err(|e| format!("Failed to read image format: {}", e))?
-        .decode()
-        .map_err(|e| format!("Failed to decode image: {}", e))?;
-    Ok(img.to_luma8())
-}
-
-/// Extract a region from an image.
-fn extract_region(img: &GrayImage, region: &SearchRegion) -> GrayImage {
-    let x = region.x.min(img.width().saturating_sub(1));
-    let y = region.y.min(img.height().saturating_sub(1));
-    let w = region.w.min(img.width() - x);
-    let h = region.h.min(img.height() - y);
-
-    let sub = image::imageops::crop_imm(img, x, y, w, h);
-    sub.to_image()
-}
-
-/// Resize image by scale factor.
-fn resize_image(img: &GrayImage, scale: f64) -> GrayImage {
-    if (scale - 1.0).abs() < f64::EPSILON {
-        return img.clone();
-    }
-
-    let new_width = ((img.width() as f64) * scale).round() as u32;
-    let new_height = ((img.height() as f64) * scale).round() as u32;
-
-    if new_width == 0 || new_height == 0 {
-        return GrayImage::new(1, 1);
-    }
-
-    image::imageops::resize(
-        img,
-        new_width,
-        new_height,
-        image::imageops::FilterType::Triangle,
-    )
-}
-
-/// Simple rotation (only supports 0, 90, 180, 270).
-/// Expects normalized input from validation (exact 0.0, 90.0, 180.0, or 270.0).
-fn rotate_image(img: &GrayImage, degrees: f64) -> GrayImage {
-    // Use rounding to handle any floating point imprecision
-    let rounded = degrees.round() as i32;
-    match rounded {
-        90 => image::imageops::rotate90(img),
-        180 => image::imageops::rotate180(img),
-        270 => image::imageops::rotate270(img),
-        _ => img.clone(), // 0 or fallback
-    }
 }
 
 /// Normalized Cross-Correlation template matching.
@@ -1216,220 +939,15 @@ fn compute_ncc_at_simd(
     (numerator / denominator).clamp(-1.0, 1.0)
 }
 
-/// Non-Maximum Suppression to remove overlapping detections.
-fn non_maximum_suppression(
-    mut matches: Vec<MatchResult>,
-    iou_threshold: f64,
-    max_results: usize,
-) -> Vec<MatchResult> {
-    // Sort by score descending
-    matches.sort_by(|a, b| {
-        b.score
-            .partial_cmp(&a.score)
-            .unwrap_or(std::cmp::Ordering::Equal)
-    });
-
-    let mut keep = Vec::new();
-
-    while !matches.is_empty() && keep.len() < max_results {
-        let best = matches.remove(0);
-
-        // Remove all matches that overlap too much with the best
-        matches.retain(|m| compute_iou(&best.bbox, &m.bbox) < iou_threshold);
-
-        keep.push(best);
-    }
-
-    keep
-}
-
-/// Compute Intersection over Union of two bounding boxes.
-fn compute_iou(a: &BoundingBox, b: &BoundingBox) -> f64 {
-    let x1 = a.x.max(b.x);
-    let y1 = a.y.max(b.y);
-    let x2 = (a.x + a.w).min(b.x + b.w);
-    let y2 = (a.y + a.h).min(b.y + b.h);
-
-    if x2 <= x1 || y2 <= y1 {
-        return 0.0;
-    }
-
-    let intersection = (x2 - x1) as f64 * (y2 - y1) as f64;
-    let area_a = a.w as f64 * a.h as f64;
-    let area_b = b.w as f64 * b.h as f64;
-    let union = area_a + area_b - intersection;
-
-    if union < f64::EPSILON {
-        return 0.0;
-    }
-
-    intersection / union
-}
-
-use crate::tools::registry::{json_to_object, ToolContext, ToolHandler};
-use rmcp::{model::Tool, Error as McpError};
-
-/// `find_image` MCP tool handler.
-pub struct FindImage;
-
-#[async_trait::async_trait]
-impl ToolHandler for FindImage {
-    fn name(&self) -> &'static str {
-        "find_image"
-    }
-
-    fn schema(&self) -> Tool {
-        Tool::new(
-            "find_image",
-            "Find a template image within a screenshot using template matching. Returns precise click coordinates for non-text UI elements like icons and shapes. Use screenshot_id from take_screenshot or provide screenshot_image_base64. Use template_id from load_image or provide template_image_base64.",
-            Arc::new(json_to_object(serde_json::json!({
-                "type": "object",
-                "properties": {
-                    "screenshot_id": {
-                        "type": "string",
-                        "description": "Screenshot ID from a previous take_screenshot call (preferred)"
-                    },
-                    "screenshot_image_base64": {
-                        "type": "string",
-                        "description": "Base64-encoded screenshot image (used if no screenshot_id)"
-                    },
-                    "template_id": {
-                        "type": "string",
-                        "description": "Image ID from a previous load_image call (preferred over template_image_base64)"
-                    },
-                    "template_image_base64": {
-                        "type": "string",
-                        "description": "Base64-encoded template image to find (used if no template_id)"
-                    },
-                    "mask_id": {
-                        "type": "string",
-                        "description": "Image ID from a previous load_image call for the mask"
-                    },
-                    "mask_image_base64": {
-                        "type": "string",
-                        "description": "Base64-encoded mask image (optional; white=match, black=ignore)"
-                    },
-                    "mode": {
-                        "type": "string",
-                        "enum": ["fast", "accurate"],
-                        "description": "Matching mode: 'fast' (default) for quick searches, 'accurate' for thorough matching",
-                        "default": "fast"
-                    },
-                    "threshold": {
-                        "type": "number",
-                        "description": "Minimum match score 0.0-1.0 (default: 0.75)"
-                    },
-                    "max_results": {
-                        "type": "integer",
-                        "description": "Maximum matches to return (default: 3 fast, 5 accurate)"
-                    },
-                    "scales": {
-                        "type": "object",
-                        "description": "Scale search range {min, max, step}",
-                        "properties": {
-                            "min": { "type": "number", "default": 0.8 },
-                            "max": { "type": "number", "default": 1.2 },
-                            "step": { "type": "number", "default": 0.1 }
-                        }
-                    },
-                    "search_region": {
-                        "type": "object",
-                        "description": "Limit search to region {x, y, w, h} in screenshot pixels",
-                        "properties": {
-                            "x": { "type": "integer" },
-                            "y": { "type": "integer" },
-                            "w": { "type": "integer" },
-                            "h": { "type": "integer" }
-                        }
-                    },
-                    "stride": {
-                        "type": "integer",
-                        "description": "Search step size (default: 2 fast, 1 accurate)"
-                    },
-                    "rotations": {
-                        "type": "array",
-                        "items": { "type": "number" },
-                        "description": "Rotations to try in degrees (only 0, 90, 180, 270 supported)"
-                    },
-                    "return_screen_coords": {
-                        "type": "boolean",
-                        "description": "Include screen coordinates for clicking (default: true)",
-                        "default": true
-                    }
-                }
-            }))),
-        )
-    }
-
-    async fn call(
-        &self,
-        args: serde_json::Value,
-        ctx: &ToolContext,
-    ) -> Result<CallToolResult, McpError> {
-        let params: FindImageParams = serde_json::from_value(args)
-            .map_err(|e| McpError::invalid_params(e.to_string(), None))?;
-        Ok(find_image(params, ctx.screenshot_cache.clone(), ctx.image_cache.clone()).await)
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use image::Luma;
-
-    #[test]
-    fn test_nms() {
-        let matches = vec![
-            MatchResult {
-                score: 0.9,
-                bbox: BoundingBox {
-                    x: 0,
-                    y: 0,
-                    w: 10,
-                    h: 10,
-                },
-                center: Point { x: 5.0, y: 5.0 },
-                scale: 1.0,
-                rotation: 0.0,
-                screen_x: None,
-                screen_y: None,
-            },
-            MatchResult {
-                score: 0.85,
-                bbox: BoundingBox {
-                    x: 2,
-                    y: 2,
-                    w: 10,
-                    h: 10,
-                },
-                center: Point { x: 7.0, y: 7.0 },
-                scale: 1.0,
-                rotation: 0.0,
-                screen_x: None,
-                screen_y: None,
-            },
-            MatchResult {
-                score: 0.8,
-                bbox: BoundingBox {
-                    x: 50,
-                    y: 50,
-                    w: 10,
-                    h: 10,
-                },
-                center: Point { x: 55.0, y: 55.0 },
-                scale: 1.0,
-                rotation: 0.0,
-                screen_x: None,
-                screen_y: None,
-            },
-        ];
-
-        let result = non_maximum_suppression(matches, 0.3, 5);
-        // First two overlap significantly, third doesn't
-        assert_eq!(result.len(), 2);
-        assert!((result[0].score - 0.9).abs() < f64::EPSILON);
-        assert!((result[1].score - 0.8).abs() < f64::EPSILON);
-    }
+    use crate::tools::find_image::params::{FindImageResponse, ScaleRange};
+    use crate::tools::image_cache::{ImageCache, ImageMetadata};
+    use crate::tools::screenshot_cache::ScreenshotCache;
+    use base64::Engine;
+    use image::{GenericImage, Luma};
+    use std::io::Cursor;
 
     #[test]
     fn test_ncc_matching_finds_exact_template() {
@@ -1494,135 +1012,211 @@ mod tests {
     }
 
     #[test]
-    fn test_extract_region_clamps_to_bounds() {
-        let img = GrayImage::from_fn(100, 100, |x, y| Luma([(x + y) as u8]));
+    fn test_compute_downscale_factor_small_image() {
+        // Image smaller than 1200px max dimension - no downscale
+        let img = GrayImage::new(800, 600);
+        let template = GrayImage::new(32, 32);
+        let factor = compute_downscale_factor(&img, &template);
+        assert!(
+            (factor - 1.0).abs() < f64::EPSILON,
+            "Small images should not be downscaled"
+        );
+    }
 
-        // Region exceeds image bounds
-        let region = SearchRegion {
-            x: 80,
-            y: 90,
-            w: 50,
-            h: 50,
+    #[test]
+    fn test_compute_downscale_factor_large_image() {
+        // 1920x1080 image - should be downscaled
+        let img = GrayImage::new(1920, 1080);
+        let template = GrayImage::new(32, 32);
+        let factor = compute_downscale_factor(&img, &template);
+        // 1200 / 1920 = 0.625
+        assert!(factor < 1.0, "Large images should be downscaled");
+        assert!(factor >= 0.5, "Downscale should not go below 0.5");
+        assert!(
+            (factor - 0.625).abs() < 0.01,
+            "Expected ~0.625, got {}",
+            factor
+        );
+    }
+
+    #[test]
+    fn test_compute_downscale_factor_very_large_image() {
+        // 4K image - should be capped at 0.5
+        let img = GrayImage::new(3840, 2160);
+        let template = GrayImage::new(32, 32);
+        let factor = compute_downscale_factor(&img, &template);
+        // 1200 / 3840 = 0.3125, but capped at 0.5
+        assert!(
+            (factor - 0.5).abs() < f64::EPSILON,
+            "Very large images should cap at 0.5"
+        );
+    }
+
+    #[test]
+    fn test_build_work_items() {
+        let rotations = vec![0.0, 90.0];
+        let template = GrayImage::new(10, 10);
+        let search_img = GrayImage::new(100, 100);
+        let rotated_templates = build_rotated_templates(&template, None, &rotations);
+        let scales = ScaleRange {
+            min: 0.8,
+            max: 1.2,
+            step: 0.2,
         };
-        let extracted = extract_region(&img, &region);
+        let items = build_work_items(&rotations, &scales, &rotated_templates, &search_img);
 
-        // Should be clamped to available space
-        assert_eq!(extracted.width(), 20); // 100 - 80
-        assert_eq!(extracted.height(), 10); // 100 - 90
+        // Should have: 0.8, 1.0, 1.2 for each rotation = 3 * 2 = 6 items
+        assert_eq!(items.len(), 6, "Expected 6 work items, got {}", items.len());
+
+        // Verify first rotation (0.0) items
+        assert!((items[0].rotation - 0.0).abs() < f64::EPSILON);
+        assert!((items[0].scale - 0.8).abs() < f64::EPSILON);
+        assert!((items[1].rotation - 0.0).abs() < f64::EPSILON);
+        assert!((items[1].scale - 1.0).abs() < f64::EPSILON);
+        assert!((items[2].rotation - 0.0).abs() < f64::EPSILON);
+        assert!((items[2].scale - 1.2).abs() < f64::EPSILON);
+
+        // Verify second rotation (90.0) items
+        assert!((items[3].rotation - 90.0).abs() < f64::EPSILON);
+        assert!((items[3].scale - 0.8).abs() < f64::EPSILON);
     }
 
     #[test]
-    fn test_rotate_image_90_degrees() {
-        // Create a simple 2x3 image
-        let img = GrayImage::from_vec(2, 3, vec![1, 2, 3, 4, 5, 6]).unwrap();
-        let rotated = rotate_image(&img, 90.0);
-
-        // After 90 degree rotation, 2x3 becomes 3x2
-        assert_eq!(rotated.width(), 3);
-        assert_eq!(rotated.height(), 2);
-    }
-
-    #[test]
-    fn test_resize_image_zero_scale() {
-        let img = GrayImage::from_fn(10, 10, |_, _| Luma([128]));
-
-        // Very small scale should produce 1x1 minimum
-        let tiny = resize_image(&img, 0.01);
-        assert!(tiny.width() >= 1);
-        assert!(tiny.height() >= 1);
-    }
-
-    // Tests now use the production normalize_rotation function from super::*
-
-    #[test]
-    fn test_rotation_normalization_wrapping() {
-        // Values that wrap around 360
-        assert_eq!(normalize_rotation(360.0), Some(0.0));
-        assert_eq!(normalize_rotation(450.0), Some(90.0));
-        assert_eq!(normalize_rotation(540.0), Some(180.0));
-        assert_eq!(normalize_rotation(-90.0), Some(270.0));
-        assert_eq!(normalize_rotation(-270.0), Some(90.0));
-    }
-
-    #[test]
-    fn test_scale_validation_step_must_be_positive() {
-        // Zero step
-        let result = validate_scale_range(&ScaleRange {
-            min: 0.8,
-            max: 1.2,
-            step: 0.0,
-        });
-        assert!(result.is_err());
-        assert!(result.unwrap_err().contains("step"));
-
-        // Negative step
-        let result = validate_scale_range(&ScaleRange {
-            min: 0.8,
-            max: 1.2,
-            step: -0.1,
-        });
-        assert!(result.is_err());
-        assert!(result.unwrap_err().contains("step"));
-    }
-
-    #[test]
-    fn test_scale_validation_min_must_be_positive() {
-        // Zero min
-        let result = validate_scale_range(&ScaleRange {
-            min: 0.0,
-            max: 1.2,
+    fn test_build_work_items_single_scale() {
+        let rotations = vec![0.0];
+        let template = GrayImage::new(10, 10);
+        let search_img = GrayImage::new(100, 100);
+        let rotated_templates = build_rotated_templates(&template, None, &rotations);
+        let scales = ScaleRange {
+            min: 1.0,
+            max: 1.0,
             step: 0.1,
-        });
-        assert!(result.is_err());
-        assert!(result.unwrap_err().contains("min"));
+        };
+        let items = build_work_items(&rotations, &scales, &rotated_templates, &search_img);
 
-        // Negative min
-        let result = validate_scale_range(&ScaleRange {
-            min: -0.5,
-            max: 1.2,
-            step: 0.1,
-        });
-        assert!(result.is_err());
-        assert!(result.unwrap_err().contains("min"));
+        assert_eq!(items.len(), 1, "Expected 1 work item for single scale");
+        assert!((items[0].scale - 1.0).abs() < f64::EPSILON);
     }
 
     #[test]
-    fn test_scale_validation_max_must_be_positive() {
-        // Zero max
-        let result = validate_scale_range(&ScaleRange {
-            min: 0.5,
-            max: 0.0,
-            step: 0.1,
-        });
-        assert!(result.is_err());
-        assert!(result.unwrap_err().contains("max"));
+    fn test_process_work_item_template_too_large() {
+        let search_img = GrayImage::new(50, 50);
+        let template = GrayImage::new(100, 100); // Larger than search image
 
-        // Negative max
-        let result = validate_scale_range(&ScaleRange {
-            min: 0.5,
-            max: -1.0,
-            step: 0.1,
-        });
-        assert!(result.is_err());
-        assert!(result.unwrap_err().contains("max"));
+        let item = WorkItem {
+            rotation: 0.0,
+            rotation_idx: 0,
+            scale: 1.0,
+        };
+
+        let result = process_work_item(
+            &item,
+            &search_img,
+            &template,
+            None,
+            0.88,
+            1,
+            (0, 0),
+            1.0,
+            None,
+            false,
+        );
+
+        assert!(
+            result.is_none(),
+            "Should return None when template exceeds image"
+        );
     }
 
     #[test]
-    fn test_scale_validation_min_not_exceed_max() {
-        let result = validate_scale_range(&ScaleRange {
-            min: 2.0,
-            max: 0.5,
-            step: 0.1,
+    fn test_process_work_item_downscale_coordinate_mapping() {
+        // Create a search image and template
+        let mut search_img = GrayImage::from_fn(100, 100, |_, _| Luma([128]));
+
+        // Place a distinct pattern at position (40, 50)
+        for y in 0..10u32 {
+            for x in 0..10u32 {
+                let val = ((x + y) * 12 + 50) as u8;
+                search_img.put_pixel(40 + x, 50 + y, Luma([val]));
+            }
+        }
+
+        // Create matching template
+        let template = GrayImage::from_fn(10, 10, |x, y| {
+            let val = ((x + y) * 12 + 50) as u8;
+            Luma([val])
         });
-        assert!(result.is_err());
-        assert!(result.unwrap_err().contains("must not exceed"));
+
+        let item = WorkItem {
+            rotation: 0.0,
+            rotation_idx: 0,
+            scale: 1.0,
+        };
+
+        // Test with downscale_factor = 1.0 (no downscaling)
+        let result = process_work_item(
+            &item,
+            &search_img,
+            &template,
+            None,
+            0.9,
+            1,
+            (0, 0),
+            1.0, // No downscale
+            None,
+            false,
+        );
+
+        assert!(result.is_some(), "Should find matches");
+        let matches = result.unwrap();
+        assert!(!matches.is_empty(), "Should have at least one match");
+
+        // Best match should be near (40, 50)
+        let best = matches
+            .iter()
+            .max_by(|a, b| a.score.partial_cmp(&b.score).unwrap())
+            .unwrap();
+        assert!(
+            (best.bbox.x as i32 - 40).abs() <= 2,
+            "X should be near 40, got {}",
+            best.bbox.x
+        );
+        assert!(
+            (best.bbox.y as i32 - 50).abs() <= 2,
+            "Y should be near 50, got {}",
+            best.bbox.y
+        );
+    }
+
+    #[cfg(feature = "find_image_simd")]
+    #[test]
+    fn test_simd_ncc_matches_scalar() {
+        // Create test images
+        let image = GrayImage::from_fn(100, 100, |x, y| {
+            Luma([((x.wrapping_mul(3).wrapping_add(y.wrapping_mul(7))) % 255) as u8])
+        });
+        let template = GrayImage::from_fn(20, 20, |x, y| {
+            Luma([((x.wrapping_mul(3).wrapping_add(y.wrapping_mul(7))) % 255) as u8])
+        });
+
+        let tpl_stats = compute_template_stats(&template, None);
+
+        // Compute scalar result
+        let scalar_score = compute_ncc_at(&image, &template, None, 0, 0, &tpl_stats);
+
+        // Compute SIMD result
+        let simd_score = compute_ncc_at_simd(&image, &template, 0, 0, &tpl_stats);
+
+        // Results should be very close (within floating point tolerance)
+        assert!(
+            (scalar_score - simd_score).abs() < 0.001,
+            "SIMD and scalar should match: scalar={}, simd={}",
+            scalar_score,
+            simd_score
+        );
     }
 
     // ============ Integration tests for template_id / mask_id ============
-
-    use crate::tools::image_cache::{ImageCache, ImageMetadata};
-    use image::GenericImage;
-    use std::io::Cursor;
 
     /// Create a test PNG in memory and return bytes
     fn create_test_png_bytes(width: u32, height: u32) -> Vec<u8> {
@@ -2021,212 +1615,5 @@ mod tests {
                 text
             );
         }
-    }
-
-    // ============ Tests for optimization functions ============
-
-    #[test]
-    fn test_compute_downscale_factor_small_image() {
-        // Image smaller than 1200px max dimension - no downscale
-        let img = GrayImage::new(800, 600);
-        let template = GrayImage::new(32, 32);
-        let factor = compute_downscale_factor(&img, &template);
-        assert!(
-            (factor - 1.0).abs() < f64::EPSILON,
-            "Small images should not be downscaled"
-        );
-    }
-
-    #[test]
-    fn test_compute_downscale_factor_large_image() {
-        // 1920x1080 image - should be downscaled
-        let img = GrayImage::new(1920, 1080);
-        let template = GrayImage::new(32, 32);
-        let factor = compute_downscale_factor(&img, &template);
-        // 1200 / 1920 = 0.625
-        assert!(factor < 1.0, "Large images should be downscaled");
-        assert!(factor >= 0.5, "Downscale should not go below 0.5");
-        assert!(
-            (factor - 0.625).abs() < 0.01,
-            "Expected ~0.625, got {}",
-            factor
-        );
-    }
-
-    #[test]
-    fn test_compute_downscale_factor_very_large_image() {
-        // 4K image - should be capped at 0.5
-        let img = GrayImage::new(3840, 2160);
-        let template = GrayImage::new(32, 32);
-        let factor = compute_downscale_factor(&img, &template);
-        // 1200 / 3840 = 0.3125, but capped at 0.5
-        assert!(
-            (factor - 0.5).abs() < f64::EPSILON,
-            "Very large images should cap at 0.5"
-        );
-    }
-
-    #[test]
-    fn test_build_work_items() {
-        let rotations = vec![0.0, 90.0];
-        let template = GrayImage::new(10, 10);
-        let search_img = GrayImage::new(100, 100);
-        let rotated_templates = build_rotated_templates(&template, None, &rotations);
-        let scales = ScaleRange {
-            min: 0.8,
-            max: 1.2,
-            step: 0.2,
-        };
-        let items = build_work_items(&rotations, &scales, &rotated_templates, &search_img);
-
-        // Should have: 0.8, 1.0, 1.2 for each rotation = 3 * 2 = 6 items
-        assert_eq!(items.len(), 6, "Expected 6 work items, got {}", items.len());
-
-        // Verify first rotation (0.0) items
-        assert!((items[0].rotation - 0.0).abs() < f64::EPSILON);
-        assert!((items[0].scale - 0.8).abs() < f64::EPSILON);
-        assert!((items[1].rotation - 0.0).abs() < f64::EPSILON);
-        assert!((items[1].scale - 1.0).abs() < f64::EPSILON);
-        assert!((items[2].rotation - 0.0).abs() < f64::EPSILON);
-        assert!((items[2].scale - 1.2).abs() < f64::EPSILON);
-
-        // Verify second rotation (90.0) items
-        assert!((items[3].rotation - 90.0).abs() < f64::EPSILON);
-        assert!((items[3].scale - 0.8).abs() < f64::EPSILON);
-    }
-
-    #[test]
-    fn test_build_work_items_single_scale() {
-        let rotations = vec![0.0];
-        let template = GrayImage::new(10, 10);
-        let search_img = GrayImage::new(100, 100);
-        let rotated_templates = build_rotated_templates(&template, None, &rotations);
-        let scales = ScaleRange {
-            min: 1.0,
-            max: 1.0,
-            step: 0.1,
-        };
-        let items = build_work_items(&rotations, &scales, &rotated_templates, &search_img);
-
-        assert_eq!(items.len(), 1, "Expected 1 work item for single scale");
-        assert!((items[0].scale - 1.0).abs() < f64::EPSILON);
-    }
-
-    #[test]
-    fn test_process_work_item_template_too_large() {
-        let search_img = GrayImage::new(50, 50);
-        let template = GrayImage::new(100, 100); // Larger than search image
-
-        let item = WorkItem {
-            rotation: 0.0,
-            rotation_idx: 0,
-            scale: 1.0,
-        };
-
-        let result = process_work_item(
-            &item,
-            &search_img,
-            &template,
-            None,
-            0.88,
-            1,
-            (0, 0),
-            1.0,
-            None,
-            false,
-        );
-
-        assert!(
-            result.is_none(),
-            "Should return None when template exceeds image"
-        );
-    }
-
-    #[test]
-    fn test_process_work_item_downscale_coordinate_mapping() {
-        // Create a search image and template
-        let mut search_img = GrayImage::from_fn(100, 100, |_, _| Luma([128]));
-
-        // Place a distinct pattern at position (40, 50)
-        for y in 0..10u32 {
-            for x in 0..10u32 {
-                let val = ((x + y) * 12 + 50) as u8;
-                search_img.put_pixel(40 + x, 50 + y, Luma([val]));
-            }
-        }
-
-        // Create matching template
-        let template = GrayImage::from_fn(10, 10, |x, y| {
-            let val = ((x + y) * 12 + 50) as u8;
-            Luma([val])
-        });
-
-        let item = WorkItem {
-            rotation: 0.0,
-            rotation_idx: 0,
-            scale: 1.0,
-        };
-
-        // Test with downscale_factor = 1.0 (no downscaling)
-        let result = process_work_item(
-            &item,
-            &search_img,
-            &template,
-            None,
-            0.9,
-            1,
-            (0, 0),
-            1.0, // No downscale
-            None,
-            false,
-        );
-
-        assert!(result.is_some(), "Should find matches");
-        let matches = result.unwrap();
-        assert!(!matches.is_empty(), "Should have at least one match");
-
-        // Best match should be near (40, 50)
-        let best = matches
-            .iter()
-            .max_by(|a, b| a.score.partial_cmp(&b.score).unwrap())
-            .unwrap();
-        assert!(
-            (best.bbox.x as i32 - 40).abs() <= 2,
-            "X should be near 40, got {}",
-            best.bbox.x
-        );
-        assert!(
-            (best.bbox.y as i32 - 50).abs() <= 2,
-            "Y should be near 50, got {}",
-            best.bbox.y
-        );
-    }
-
-    #[cfg(feature = "find_image_simd")]
-    #[test]
-    fn test_simd_ncc_matches_scalar() {
-        // Create test images
-        let image = GrayImage::from_fn(100, 100, |x, y| {
-            Luma([((x.wrapping_mul(3).wrapping_add(y.wrapping_mul(7))) % 255) as u8])
-        });
-        let template = GrayImage::from_fn(20, 20, |x, y| {
-            Luma([((x.wrapping_mul(3).wrapping_add(y.wrapping_mul(7))) % 255) as u8])
-        });
-
-        let tpl_stats = compute_template_stats(&template, None);
-
-        // Compute scalar result
-        let scalar_score = compute_ncc_at(&image, &template, None, 0, 0, &tpl_stats);
-
-        // Compute SIMD result
-        let simd_score = compute_ncc_at_simd(&image, &template, 0, 0, &tpl_stats);
-
-        // Results should be very close (within floating point tolerance)
-        assert!(
-            (scalar_score - simd_score).abs() < 0.001,
-            "SIMD and scalar should match: scalar={}, simd={}",
-            scalar_score,
-            simd_score
-        );
     }
 }
