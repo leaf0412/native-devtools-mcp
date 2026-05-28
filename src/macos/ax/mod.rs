@@ -17,14 +17,17 @@
 mod attr;
 #[allow(dead_code, unused_imports)]
 mod dispatch;
-#[allow(dead_code, unused_imports)]
 mod tree;
 #[allow(dead_code, unused_imports)]
 mod app;
-#[allow(dead_code, unused_imports)]
 mod find;
 #[allow(dead_code, unused_imports)]
 mod ffi;
+
+// Public re-exports of relocated entry points so call sites continue
+// resolving through `crate::macos::ax::*`. Phasing: as each step relocates
+// more, this list grows; the module surface to external callers stays flat.
+pub use find::{element_at_point, list_element_names};
 
 use super::ocr::{TextBounds, TextMatch};
 use crate::tools::ax_snapshot::{map_ax_role, AXSnapshotNode};
@@ -41,8 +44,8 @@ use std::sync::Arc;
 
 use ffi::*;
 
-const MAX_DEPTH: u32 = 50;
-const MAX_ELEMENTS: usize = 10_000;
+pub(super) const MAX_DEPTH: u32 = 50;
+pub(super) const MAX_ELEMENTS: usize = 10_000;
 
 /// Retained, thread-safe handle to an `AXUIElement`.
 ///
@@ -139,7 +142,7 @@ pub fn find_text(search: &str, window_id: Option<u32>) -> Result<Vec<TextMatch>,
     let mut element_count: usize = 0;
 
     unsafe {
-        walk_ax_tree(app_element, &mut element_count, 0, &mut |element| {
+        tree::walk_ax_tree(app_element, &mut element_count, 0, &mut |element| {
             // `.ok().flatten()` is the project-wide convention for re-conflating
             // attr::* `Result<Option<T>, AxError>` into the legacy Option<T>
             // shape — Err (FFI / Decode failure) collapses to None alongside
@@ -190,6 +193,10 @@ pub fn find_text(search: &str, window_id: Option<u32>) -> Result<Vec<TextMatch>,
 
 /// Get the children of an AX element as a CFArray.
 /// Returns `None` if the element has no children or the attribute is unavailable.
+///
+/// Temporarily kept alive while `collect_ax_tree_recursive` lives in
+/// `mod.rs`; deleted in step 5 alongside the snapshot collector's move into
+/// `tree.rs` (where the walker uses `attr::array` directly).
 unsafe fn get_ax_children(element: AXUIElementRef) -> Option<CFArray<*const c_void>> {
     let attr = CFString::new("AXChildren");
     let mut children_ref: core_foundation::base::CFTypeRef = ptr::null();
@@ -200,34 +207,6 @@ unsafe fn get_ax_children(element: AXUIElementRef) -> Option<CFArray<*const c_vo
     }
 
     Some(CFArray::wrap_under_create_rule(children_ref as _))
-}
-
-/// Recursively walk the AX element tree and call `visitor` on each element.
-///
-/// `depth` limits recursion to prevent runaway traversal of deep trees.
-unsafe fn walk_ax_tree(
-    element: AXUIElementRef,
-    element_count: &mut usize,
-    depth: u32,
-    visitor: &mut dyn FnMut(AXUIElementRef),
-) {
-    // Guard against excessively deep or large trees
-    if depth > MAX_DEPTH || *element_count >= MAX_ELEMENTS {
-        return;
-    }
-
-    *element_count += 1;
-    visitor(element);
-
-    if let Some(children) = get_ax_children(element) {
-        for i in 0..children.len() {
-            let child = *children.get_unchecked(i) as AXUIElementRef;
-            // Retain the child for the duration of our walk since CFArray only gives a get-rule ref
-            core_foundation::base::CFRetain(child as core_foundation::base::CFTypeRef);
-            walk_ax_tree(child, element_count, depth + 1, visitor);
-            core_foundation::base::CFRelease(child as core_foundation::base::CFTypeRef);
-        }
-    }
 }
 
 /// Get a string attribute from an AX element. Returns None if the attribute
@@ -486,7 +465,7 @@ unsafe fn get_ax_value<T: Default>(
 }
 
 /// Get the PID that owns a given window ID, using CGWindowListCopyWindowInfo.
-fn pid_for_window(window_id: u32) -> Result<i32, String> {
+pub(super) fn pid_for_window(window_id: u32) -> Result<i32, String> {
     let window = super::window::find_window_by_id(window_id)?
         .ok_or_else(|| format!("Window {} not found", window_id))?;
     i32::try_from(window.owner_pid)
@@ -494,7 +473,7 @@ fn pid_for_window(window_id: u32) -> Result<i32, String> {
 }
 
 /// Get the application name for a PID via NSRunningApplication.
-fn app_name_for_pid(pid: i32) -> Option<String> {
+pub(super) fn app_name_for_pid(pid: i32) -> Option<String> {
     unsafe {
         let app: *mut Object = msg_send![
             Class::get("NSRunningApplication")?,
@@ -537,7 +516,7 @@ pub(crate) fn frontmost_pid() -> Result<i32, String> {
 }
 
 /// Resolve app_name to PID by finding the first matching window.
-fn pid_for_app_name(app_name: &str) -> Result<i32, String> {
+pub(super) fn pid_for_app_name(app_name: &str) -> Result<i32, String> {
     let windows = super::window::find_windows_by_app(app_name)
         .map_err(|e| format!("Failed to find windows: {}", e))?;
     let win = windows.first().ok_or_else(|| {
@@ -550,246 +529,13 @@ fn pid_for_app_name(app_name: &str) -> Result<i32, String> {
 }
 
 /// Get the PID of the process that owns an AX element.
-unsafe fn get_pid_for_element(element: AXUIElementRef) -> Option<i32> {
+pub(super) unsafe fn get_pid_for_element(element: AXUIElementRef) -> Option<i32> {
     let mut pid: i32 = 0;
     if AXUIElementGetPid(element, &mut pid) == K_AX_ERROR_SUCCESS {
         Some(pid)
     } else {
         None
     }
-}
-
-/// Container roles where `AXUIElementCopyElementAtPosition` may stop too
-/// early (e.g. Electron/Chromium web views). When the hit element has one of
-/// these roles, we drill deeper into AX children to find the most specific
-/// element at the coordinates.
-fn is_container_role(role: &str) -> bool {
-    matches!(
-        role,
-        "AXScrollArea"
-            | "AXWebArea"
-            | "AXGroup"
-            | "AXSplitGroup"
-            | "AXLayoutArea"
-            | "AXList"
-            | "AXOutline"
-            | "AXTable"
-            | "AXBrowser"
-    )
-}
-
-/// Full tree-walk hit-test: find the smallest-area AX element whose bounds
-/// contain (x, y). Walks the entire tree (no spatial pruning) because
-/// Electron/Chromium apps may have intermediate containers with inaccurate
-/// bounds that don't encompass their children.
-unsafe fn hit_test_tree(root: AXUIElementRef, x: f64, y: f64) -> Option<HitResult> {
-    let mut best: Option<HitResult> = None;
-    let mut element_count: usize = 0;
-
-    walk_ax_tree(root, &mut element_count, 0, &mut |element| {
-        if let Some((pos, size)) = get_position_and_size(element) {
-            if size.width > 0.0
-                && size.height > 0.0
-                && x >= pos.x
-                && x <= pos.x + size.width
-                && y >= pos.y
-                && y <= pos.y + size.height
-            {
-                let area = size.width * size.height;
-                let is_better = match &best {
-                    Some(current) => area < current.area,
-                    None => true,
-                };
-                if is_better {
-                    best = Some(HitResult {
-                        name: get_string_attribute(element, "AXTitle"),
-                        role: get_string_attribute(element, "AXRole"),
-                        subrole: get_string_attribute(element, "AXSubrole"),
-                        label: get_string_attribute(element, "AXDescription"),
-                        value: get_string_attribute(element, "AXValue"),
-                        position: pos,
-                        size,
-                        area,
-                    });
-                }
-            }
-        }
-    });
-
-    best
-}
-
-/// Result of a hit-test tree walk — captures all attributes at visit time
-/// since AX element references from the walk are borrowed, not owned.
-struct HitResult {
-    name: Option<String>,
-    role: Option<String>,
-    subrole: Option<String>,
-    label: Option<String>,
-    value: Option<String>,
-    position: CGPoint,
-    size: CGSize,
-    area: f64,
-}
-
-/// Get the accessibility element at the given screen coordinates.
-///
-/// Uses `AXUIElementCopyElementAtPosition` to find the element at (x, y).
-/// If the result is a container (e.g. AXScrollArea in Electron apps), drills
-/// deeper into AX children to find the most specific element.
-/// If `app_name` is provided, scopes the lookup to that app; otherwise uses
-/// a system-wide lookup.
-pub fn element_at_point(
-    x: f64,
-    y: f64,
-    app_name: Option<&str>,
-) -> Result<serde_json::Value, String> {
-    let root = if let Some(name) = app_name {
-        let pid = pid_for_app_name(name)?;
-        let el = unsafe { AXUIElementCreateApplication(pid) };
-        if el.is_null() {
-            return Err(format!("Failed to create AXUIElement for app '{}'", name));
-        }
-        el
-    } else {
-        let el = unsafe { AXUIElementCreateSystemWide() };
-        if el.is_null() {
-            return Err("Failed to create system-wide AXUIElement".to_string());
-        }
-        el
-    };
-
-    let mut element: AXUIElementRef = ptr::null_mut();
-    let err = unsafe { AXUIElementCopyElementAtPosition(root, x as f32, y as f32, &mut element) };
-
-    unsafe {
-        core_foundation::base::CFRelease(root as core_foundation::base::CFTypeRef);
-    }
-
-    if err != K_AX_ERROR_SUCCESS || element.is_null() {
-        return Err(format!("No accessibility element found at ({}, {})", x, y));
-    }
-
-    // Read PID early — needed for both paths and must happen before release.
-    let pid = unsafe { get_pid_for_element(element) };
-
-    // If the hit element is a container, try a full tree-walk hit-test
-    // from the app root. Needed for Electron/Chromium apps where
-    // AXUIElementCopyElementAtPosition returns a shallow container whose
-    // element reference exposes no children.
-    let role_str = unsafe { get_string_attribute(element, "AXRole") };
-    let is_container = role_str.as_deref().is_some_and(is_container_role);
-
-    let (name, role, subrole, label, value, bounds) = if is_container {
-        unsafe {
-            core_foundation::base::CFRelease(element as core_foundation::base::CFTypeRef);
-        }
-        let hit = pid.and_then(|p| unsafe {
-            let app = AXUIElementCreateApplication(p);
-            if app.is_null() {
-                return None;
-            }
-            let result = hit_test_tree(app, x, y);
-            core_foundation::base::CFRelease(app as core_foundation::base::CFTypeRef);
-            result
-        });
-        match hit {
-            Some(h) => (
-                h.name,
-                h.role,
-                h.subrole,
-                h.label,
-                h.value,
-                Some((h.position, h.size)),
-            ),
-            None => (None, role_str, None, None, None, None),
-        }
-    } else {
-        let name = unsafe { get_string_attribute(element, "AXTitle") };
-        let subrole = unsafe { get_string_attribute(element, "AXSubrole") };
-        let label = unsafe { get_string_attribute(element, "AXDescription") };
-        let value = unsafe { get_string_attribute(element, "AXValue") };
-        let bounds = unsafe { get_position_and_size(element) };
-        unsafe {
-            core_foundation::base::CFRelease(element as core_foundation::base::CFTypeRef);
-        }
-        (name, role_str, subrole, label, value, bounds)
-    };
-
-    // Resolve app name from PID
-    let resolved_app_name = pid.and_then(app_name_for_pid);
-
-    // Build response, omitting null fields
-    let mut result = serde_json::Map::new();
-
-    if let Some(r) = role {
-        result.insert("role".to_string(), serde_json::Value::String(r));
-    }
-    if let Some(sr) = subrole {
-        result.insert("subrole".to_string(), serde_json::Value::String(sr));
-    }
-    if let Some(n) = name {
-        result.insert("name".to_string(), serde_json::Value::String(n));
-    }
-    if let Some(l) = label {
-        result.insert("label".to_string(), serde_json::Value::String(l));
-    }
-    if let Some(v) = value {
-        result.insert("value".to_string(), serde_json::Value::String(v));
-    }
-    if let Some((pos, size)) = bounds {
-        result.insert(
-            "bounds".to_string(),
-            serde_json::json!({
-                "x": pos.x,
-                "y": pos.y,
-                "width": size.width,
-                "height": size.height,
-            }),
-        );
-    }
-    if let Some(p) = pid {
-        result.insert("pid".to_string(), serde_json::Value::Number(p.into()));
-    }
-    if let Some(a) = resolved_app_name {
-        result.insert("app_name".to_string(), serde_json::Value::String(a));
-    }
-
-    Ok(serde_json::Value::Object(result))
-}
-
-/// Collect all unique non-empty element names from the accessibility tree.
-/// Used to provide a list of available elements when a search returns no matches.
-pub fn list_element_names(window_id: Option<u32>) -> Result<Vec<String>, String> {
-    let pid = match window_id {
-        Some(wid) => pid_for_window(wid)?,
-        None => frontmost_pid()?,
-    };
-
-    let app_element = unsafe { AXUIElementCreateApplication(pid) };
-    if app_element.is_null() {
-        return Err(format!("Failed to create AXUIElement for pid {}", pid));
-    }
-
-    let mut names = Vec::new();
-    let mut seen = std::collections::HashSet::new();
-    let mut element_count: usize = 0;
-
-    unsafe {
-        walk_ax_tree(app_element, &mut element_count, 0, &mut |element| {
-            for attr in &["AXTitle", "AXValue", "AXDescription"] {
-                if let Some(text) = get_string_attribute(element, attr) {
-                    let trimmed = text.trim();
-                    if !trimmed.is_empty() && seen.insert(trimmed.to_string()) {
-                        names.push(trimmed.to_string());
-                    }
-                }
-            }
-        });
-        core_foundation::base::CFRelease(app_element as core_foundation::base::CFTypeRef);
-    }
-
-    Ok(names)
 }
 
 /// Raise all windows of an application to the front using the Accessibility API.
