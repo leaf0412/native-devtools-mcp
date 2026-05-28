@@ -30,10 +30,8 @@ pub(super) struct Caches {
 ///
 /// `Screenshot` and `Image` carry the cache id; the corresponding cache
 /// is read under the lock kind documented on [`Caches`].
-#[allow(dead_code)] // InlinePng is a deliberate seam point, not yet exercised
 pub(super) enum ImageSource {
     Base64(String),
-    InlinePng(Vec<u8>),
     Screenshot(String),
     Image(String),
 }
@@ -68,14 +66,10 @@ pub(super) struct Resolved {
     pub(super) meta: SourceMeta,
 }
 
-/// Cache-miss outcome. `Error` is a hard stop; `FallbackWithWarning`
-/// asks the caller to warn and use the embedded fallback source.
-#[allow(dead_code)] // FallbackWithWarning is reserved for callers that
-                    // want fetch itself to bundle the fallback source;
-                    // current callers route fallback through resolve_slot.
+/// Cache-miss outcome. The seam currently signals a single hard-stop
+/// flavor; warning + fallback routing lives in `resolve_slot`.
 pub(super) enum Miss {
     Error(String),
-    FallbackWithWarning(String, ImageSource),
 }
 
 /// Slot wiring for `resolve_slot`: a primary source (typically an
@@ -126,9 +120,6 @@ pub(super) async fn resolve_slot(
             Some(src) => match src.fetch(caches).await {
                 Ok(resolved) => Ok((Some(resolved), None)),
                 Err(Miss::Error(e)) => Err(e),
-                Err(Miss::FallbackWithWarning(_, _)) => unreachable!(
-                    "Base64/InlinePng fetch never produces FallbackWithWarning"
-                ),
             },
             None => Ok((None, None)),
         };
@@ -151,9 +142,6 @@ pub(super) async fn resolve_slot(
                     match fb.fetch(caches).await {
                         Ok(resolved) => Ok((Some(resolved), Some(warning))),
                         Err(Miss::Error(e)) => Err(e),
-                        Err(Miss::FallbackWithWarning(_, _)) => unreachable!(
-                            "Base64/InlinePng fetch never produces FallbackWithWarning"
-                        ),
                     }
                 }
                 None => Err(format!(
@@ -163,9 +151,6 @@ pub(super) async fn resolve_slot(
                 )),
             }
         }
-        Err(Miss::FallbackWithWarning(_, _)) => unreachable!(
-            "ImageSource::fetch never produces FallbackWithWarning on its own"
-        ),
     }
 }
 
@@ -174,7 +159,7 @@ impl ImageSource {
     fn id_for_log(&self) -> &str {
         match self {
             ImageSource::Screenshot(id) | ImageSource::Image(id) => id.as_str(),
-            ImageSource::Base64(_) | ImageSource::InlinePng(_) => "<inline>",
+            ImageSource::Base64(_) => "<inline>",
         }
     }
 }
@@ -187,10 +172,6 @@ impl ImageSource {
         match self {
             ImageSource::Base64(b64) => Ok(Resolved {
                 bytes: RawImageBytes::Base64(b64.clone()),
-                meta: SourceMeta::default(),
-            }),
-            ImageSource::InlinePng(bytes) => Ok(Resolved {
-                bytes: RawImageBytes::Png(bytes.clone()),
                 meta: SourceMeta::default(),
             }),
             ImageSource::Screenshot(id) => {

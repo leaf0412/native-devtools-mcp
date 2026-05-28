@@ -197,9 +197,6 @@ async fn resolve_screenshot(
                 *warning = Some(warn_text);
                 (None, None)
             }
-            Err(Miss::FallbackWithWarning(..)) => unreachable!(
-                "screenshot fetch never produces FallbackWithWarning at this call site"
-            ),
         },
         None => (None, None),
     };
@@ -232,12 +229,33 @@ async fn resolve_template_or_mask(
     Ok(resolved.map(|r| r.bytes))
 }
 
-/// Public orchestrator: validate, resolve via the seam, decode + match
-/// on a blocking thread, finalize the response.
-pub(super) async fn execute(params: FindImageParams, caches: Caches) -> CallToolResult {
-    let defaults = ModeDefaults::for_mode(&params.mode);
-    let mut warning: Option<String> = None;
+/// Parameters that have had defaults applied and any cross-field
+/// validation completed. Held by value so the blocking thread can move
+/// them in.
+struct PreparedRequest {
+    threshold: f64,
+    max_results: usize,
+    scales: crate::tools::find_image::params::ScaleRange,
+    stride: u32,
+    rotations: Vec<f64>,
+}
 
+/// Slot bytes resolved through the source seam, ready for the blocking
+/// decode phase.
+struct ResolvedSlots {
+    screenshot_bytes: Option<RawImageBytes>,
+    screenshot_meta: Option<ScreenshotMetadata>,
+    template_bytes: Option<RawImageBytes>,
+    mask_bytes: Option<RawImageBytes>,
+}
+
+/// Apply mode defaults, validate scales / region, and normalise rotations.
+/// Pure (no I/O) — runs before any cache lookup.
+fn prepare_request(
+    params: &FindImageParams,
+    warning: &mut Option<String>,
+) -> Result<PreparedRequest, CallToolResult> {
+    let defaults = ModeDefaults::for_mode(&params.mode);
     let threshold = params.threshold.unwrap_or(defaults.threshold);
     let max_results = params.max_results.unwrap_or(defaults.max_results);
     let scales = params.scales.clone().unwrap_or(defaults.scales);
@@ -245,80 +263,197 @@ pub(super) async fn execute(params: FindImageParams, caches: Caches) -> CallTool
     let raw_rotations = params.rotations.clone().unwrap_or_else(|| vec![0.0]);
 
     if let Err(e) = validate_scale_range(&scales) {
-        return CallToolResult::error(vec![Content::text(e)]);
+        return Err(CallToolResult::error(vec![Content::text(e)]));
     }
 
     let (rotations, rotation_warning) = normalize_rotations(raw_rotations);
     if let Some(rw) = rotation_warning {
-        warning = merge_warning(warning, rw);
+        *warning = merge_warning(warning.take(), rw);
     }
 
     if let Some(region) = &params.search_region {
         if region.w == 0 || region.h == 0 {
-            return CallToolResult::error(vec![Content::text(
+            return Err(CallToolResult::error(vec![Content::text(
                 "search_region width and height must be positive",
-            )]);
+            )]));
         }
     }
 
-    // Resolve through the source seam. Lock order is preserved:
-    // screenshot → template → mask.
-    let (screenshot_bytes, screenshot_meta) =
-        resolve_screenshot(&params, &caches, &mut warning).await;
-
-    let template_bytes = match resolve_template_or_mask(
-        params.template_id.clone(),
-        params.template_image_base64.clone(),
-        SlotKind::Template,
-        &caches,
-        &mut warning,
-    )
-    .await
-    {
-        Ok(b) => b,
-        Err(e) => return CallToolResult::error(vec![Content::text(e)]),
-    };
-
-    let mask_bytes = match resolve_template_or_mask(
-        params.mask_id.clone(),
-        params.mask_image_base64.clone(),
-        SlotKind::Mask,
-        &caches,
-        &mut warning,
-    )
-    .await
-    {
-        Ok(b) => b,
-        Err(e) => return CallToolResult::error(vec![Content::text(e)]),
-    };
-
-    // Template-source guard (defence in depth; resolve_slot also signals).
-    if params.template_id.is_none() && params.template_image_base64.is_none() {
-        return CallToolResult::error(vec![Content::text(
-            "Either template_id or template_image_base64 must be provided",
-        )]);
-    }
-
-    let is_fast_mode = params.mode != "accurate";
-    let blocking_input = BlockingInput {
-        screenshot_bytes,
-        template_bytes,
-        mask_bytes,
-        screenshot_meta,
-        params,
+    Ok(PreparedRequest {
         threshold,
         max_results,
         scales,
         stride,
         rotations,
+    })
+}
+
+/// Resolve the three image slots in lock order: screenshot → template →
+/// mask. Hard errors from the slot resolver are converted to a
+/// `CallToolResult::error` for the caller.
+async fn resolve_all_slots(
+    params: &FindImageParams,
+    caches: &Caches,
+    warning: &mut Option<String>,
+) -> Result<ResolvedSlots, CallToolResult> {
+    let (screenshot_bytes, screenshot_meta) = resolve_screenshot(params, caches, warning).await;
+
+    let template_bytes = resolve_template_or_mask(
+        params.template_id.clone(),
+        params.template_image_base64.clone(),
+        SlotKind::Template,
+        caches,
+        warning,
+    )
+    .await
+    .map_err(|e| CallToolResult::error(vec![Content::text(e)]))?;
+
+    let mask_bytes = resolve_template_or_mask(
+        params.mask_id.clone(),
+        params.mask_image_base64.clone(),
+        SlotKind::Mask,
+        caches,
+        warning,
+    )
+    .await
+    .map_err(|e| CallToolResult::error(vec![Content::text(e)]))?;
+
+    // Template-source guard (defence in depth; resolve_slot also signals).
+    if params.template_id.is_none() && params.template_image_base64.is_none() {
+        return Err(CallToolResult::error(vec![Content::text(
+            "Either template_id or template_image_base64 must be provided",
+        )]));
+    }
+
+    Ok(ResolvedSlots {
+        screenshot_bytes,
+        screenshot_meta,
+        template_bytes,
+        mask_bytes,
+    })
+}
+
+/// Run the CPU-bound decode + match on a blocking thread, converting a
+/// task-panic into a `MatchOutcome::Error` so the rest of the pipeline
+/// stays panic-free.
+async fn run_blocking_match(input: BlockingInput) -> MatchOutcome {
+    tokio::task::spawn_blocking(move || decode_and_match(input))
+        .await
+        .unwrap_or_else(|e| MatchOutcome::Error(format!("Task panicked: {}", e)))
+}
+
+/// Public orchestrator: validate, resolve via the seam, decode + match
+/// on a blocking thread, finalize the response.
+pub(super) async fn execute(params: FindImageParams, caches: Caches) -> CallToolResult {
+    let mut warning: Option<String> = None;
+
+    let prepared = match prepare_request(&params, &mut warning) {
+        Ok(p) => p,
+        Err(e) => return e,
+    };
+
+    let slots = match resolve_all_slots(&params, &caches, &mut warning).await {
+        Ok(s) => s,
+        Err(e) => return e,
+    };
+
+    let is_fast_mode = params.mode != "accurate";
+    let blocking_input = BlockingInput {
+        screenshot_bytes: slots.screenshot_bytes,
+        template_bytes: slots.template_bytes,
+        mask_bytes: slots.mask_bytes,
+        screenshot_meta: slots.screenshot_meta,
+        params,
+        threshold: prepared.threshold,
+        max_results: prepared.max_results,
+        scales: prepared.scales,
+        stride: prepared.stride,
+        rotations: prepared.rotations,
         is_fast_mode,
     };
 
-    let outcome = tokio::task::spawn_blocking(move || decode_and_match(blocking_input))
-        .await
-        .unwrap_or_else(|e| MatchOutcome::Error(format!("Task panicked: {}", e)));
-
+    let outcome = run_blocking_match(blocking_input).await;
     finalize(outcome, warning)
+}
+
+/// Labels that pick which "Failed to decode ..." literal `decode_slot`
+/// emits for each variant of `RawImageBytes`. Kept as `&'static str`
+/// pairs (not enums) so the exact wording stays byte-identical with
+/// the pre-extraction code.
+struct DecodeLabels {
+    cached: &'static str,
+    base64: &'static str,
+}
+
+const SCREENSHOT_LABELS: DecodeLabels = DecodeLabels {
+    cached: "cached screenshot",
+    base64: "screenshot",
+};
+const TEMPLATE_LABELS: DecodeLabels = DecodeLabels {
+    cached: "cached template",
+    base64: "template image",
+};
+const MASK_LABELS: DecodeLabels = DecodeLabels {
+    cached: "cached mask",
+    base64: "mask image",
+};
+
+/// Decode one slot's bytes to a `GrayImage`, formatting the slot-specific
+/// "Failed to decode ..." literal on failure. Caller wraps the error
+/// string in `MatchOutcome::Error`.
+fn decode_slot(bytes: RawImageBytes, labels: &DecodeLabels) -> Result<image::GrayImage, String> {
+    let suffix = match &bytes {
+        RawImageBytes::Png(_) => labels.cached,
+        RawImageBytes::Base64(_) => labels.base64,
+    };
+    bytes
+        .decode()
+        .map_err(|e| format!("Failed to decode {}: {}", suffix, e))
+}
+
+/// Decode the screenshot slot. Returns the gray image alongside the
+/// cache-provided metadata (only retained for the Png branch — base64
+/// callers never produce screenshot metadata).
+fn decode_screenshot(
+    bytes: Option<RawImageBytes>,
+    cached_meta: Option<ScreenshotMetadata>,
+) -> Result<(image::GrayImage, Option<ScreenshotMetadata>), MatchOutcome> {
+    let Some(bytes) = bytes else {
+        return Err(MatchOutcome::Error(
+            "Either screenshot_id or screenshot_image_base64 must be provided".to_string(),
+        ));
+    };
+    let meta = match &bytes {
+        RawImageBytes::Png(_) => cached_meta,
+        RawImageBytes::Base64(_) => None,
+    };
+    match decode_slot(bytes, &SCREENSHOT_LABELS) {
+        Ok(gray) => Ok((gray, meta)),
+        Err(e) => Err(MatchOutcome::Error(e)),
+    }
+}
+
+/// Decode the template slot. Missing bytes are a hard error since the
+/// caller-side guard in `execute` already enforces presence; this path
+/// is kept as defence in depth.
+fn decode_template(bytes: Option<RawImageBytes>) -> Result<image::GrayImage, MatchOutcome> {
+    let Some(bytes) = bytes else {
+        return Err(MatchOutcome::Error(
+            "Either template_id or template_image_base64 must be provided".to_string(),
+        ));
+    };
+    decode_slot(bytes, &TEMPLATE_LABELS).map_err(MatchOutcome::Error)
+}
+
+/// Decode the optional mask slot. Absent bytes mean "no mask" — not an
+/// error.
+fn decode_mask(bytes: Option<RawImageBytes>) -> Result<Option<image::GrayImage>, MatchOutcome> {
+    match bytes {
+        Some(bytes) => decode_slot(bytes, &MASK_LABELS)
+            .map(Some)
+            .map_err(MatchOutcome::Error),
+        None => Ok(None),
+    }
 }
 
 /// Decode each resolved RawImageBytes into a GrayImage and hand off to
@@ -340,50 +475,17 @@ fn decode_and_match(input: BlockingInput) -> MatchOutcome {
         is_fast_mode,
     } = input;
 
-    let (screenshot, screenshot_meta) = match screenshot_bytes {
-        Some(RawImageBytes::Png(bytes)) => match RawImageBytes::Png(bytes).decode() {
-            Ok(gray) => (gray, screenshot_meta),
-            Err(e) => {
-                return MatchOutcome::Error(format!("Failed to decode cached screenshot: {}", e))
-            }
-        },
-        Some(RawImageBytes::Base64(b64)) => match RawImageBytes::Base64(b64).decode() {
-            Ok(gray) => (gray, None),
-            Err(e) => return MatchOutcome::Error(format!("Failed to decode screenshot: {}", e)),
-        },
-        None => {
-            return MatchOutcome::Error(
-                "Either screenshot_id or screenshot_image_base64 must be provided".to_string(),
-            );
-        }
+    let (screenshot, screenshot_meta) = match decode_screenshot(screenshot_bytes, screenshot_meta) {
+        Ok(pair) => pair,
+        Err(outcome) => return outcome,
     };
-
-    let template = match template_bytes {
-        Some(RawImageBytes::Png(bytes)) => match RawImageBytes::Png(bytes).decode() {
-            Ok(img) => img,
-            Err(e) => return MatchOutcome::Error(format!("Failed to decode cached template: {}", e)),
-        },
-        Some(RawImageBytes::Base64(b64)) => match RawImageBytes::Base64(b64).decode() {
-            Ok(img) => img,
-            Err(e) => return MatchOutcome::Error(format!("Failed to decode template image: {}", e)),
-        },
-        None => {
-            return MatchOutcome::Error(
-                "Either template_id or template_image_base64 must be provided".to_string(),
-            );
-        }
+    let template = match decode_template(template_bytes) {
+        Ok(img) => img,
+        Err(outcome) => return outcome,
     };
-
-    let mask = match mask_bytes {
-        Some(RawImageBytes::Png(bytes)) => match RawImageBytes::Png(bytes).decode() {
-            Ok(img) => Some(img),
-            Err(e) => return MatchOutcome::Error(format!("Failed to decode cached mask: {}", e)),
-        },
-        Some(RawImageBytes::Base64(b64)) => match RawImageBytes::Base64(b64).decode() {
-            Ok(img) => Some(img),
-            Err(e) => return MatchOutcome::Error(format!("Failed to decode mask image: {}", e)),
-        },
-        None => None,
+    let mask = match decode_mask(mask_bytes) {
+        Ok(opt) => opt,
+        Err(outcome) => return outcome,
     };
 
     run_matching(MatchRequest {

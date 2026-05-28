@@ -57,6 +57,37 @@ pub async fn cdp_wait_for(
     result
 }
 
+/// One probe of the page-text predicate. Re-acquires the CDP RwLock so
+/// concurrent CDP work can interleave between polls (load-bearing — do
+/// NOT hoist the lock above the loop). A failed `page.execute` is
+/// silently treated as "not found yet" to match the pre-extraction
+/// behaviour; only a missing CDP connection bubbles up as a hard error.
+async fn poll_text_once(
+    check_js: &str,
+    cdp_client: &Arc<RwLock<Option<CdpClient>>>,
+) -> Result<bool, CallToolResult> {
+    let guard = cdp_client.read().await;
+    let client = match guard.as_ref() {
+        Some(c) => c,
+        None => return Err(cdp_error("No CDP connection. Use cdp_connect first.")),
+    };
+    let page = client.require_page()?;
+
+    let mut eval_params = EvaluateParams::new(check_js);
+    eval_params.return_by_value = Some(true);
+
+    Ok(match page.execute(eval_params).await {
+        Ok(resp) => resp
+            .result
+            .result
+            .value
+            .as_ref()
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false),
+        Err(_) => false,
+    })
+}
+
 /// Page-text polling. Re-acquires the CDP RwLock per iteration so
 /// concurrent CDP work can interleave between sleeps (load-bearing).
 /// Returns the canonical success line, or an error result.
@@ -73,31 +104,7 @@ async fn wait_page_text(
     let start = std::time::Instant::now();
 
     loop {
-        let found = {
-            let guard = cdp_client.read().await;
-            let client = match guard.as_ref() {
-                Some(c) => c,
-                None => return Err(cdp_error("No CDP connection. Use cdp_connect first.")),
-            };
-            let page = match client.require_page() {
-                Ok(p) => p,
-                Err(e) => return Err(e),
-            };
-
-            let mut eval_params = EvaluateParams::new(&check_js);
-            eval_params.return_by_value = Some(true);
-
-            match page.execute(eval_params).await {
-                Ok(resp) => resp
-                    .result
-                    .result
-                    .value
-                    .as_ref()
-                    .and_then(|v| v.as_bool())
-                    .unwrap_or(false),
-                Err(_) => false,
-            }
-        };
+        let found = poll_text_once(&check_js, cdp_client).await?;
 
         if found {
             let elapsed_ms = start.elapsed().as_millis();
