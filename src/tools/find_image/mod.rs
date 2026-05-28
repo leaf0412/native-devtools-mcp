@@ -19,14 +19,20 @@
 //! - `params`    — request/response/scale/region types and pure validators
 //! - `source`    — image-source resolution seam (cache lookups + decode boundary)
 //! - `transform` — pure pixel decode/extract/resize/rotate helpers
-//! - `algorithm` — NCC matching, work items, parallel/SIMD entry points
+//! - `algorithm` — NCC matching, work items, scalar kernel, run_matching pipeline
+//! - `simd`      — vectorized NCC kernel (`find_image_simd` feature)
+//! - `parallel`  — Rayon thread pool helper (`find_image_parallel` feature)
 //! - `nms`       — non-maximum suppression for overlapping detections
-//! - `handler`   — MCP `ToolHandler` impl that wires schema → algorithm
+//! - `handler`   — MCP `ToolHandler` impl + orchestrator (`execute`)
 
 mod algorithm;
 mod handler;
 mod nms;
 mod params;
+#[cfg(feature = "find_image_parallel")]
+mod parallel;
+#[cfg(feature = "find_image_simd")]
+mod simd;
 mod source;
 mod transform;
 
