@@ -249,8 +249,8 @@ pub fn collect_ax_tree_indexed(
     app_name: Option<&str>,
 ) -> Result<(Vec<AXSnapshotNode>, std::collections::HashMap<u32, AXRef>), String> {
     let pid = match app_name {
-        Some(name) => super::pid_for_app_name(name)?,
-        None => super::frontmost_pid()?,
+        Some(name) => super::app::pid_for_app_name(name)?,
+        None => super::app::frontmost_pid()?,
     };
 
     let app_element = unsafe { AXUIElementCreateApplication(pid) };

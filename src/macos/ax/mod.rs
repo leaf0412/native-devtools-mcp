@@ -13,32 +13,27 @@
 //! - `find`: text search + element-at-point + element name listing.
 //! - `ffi`: extern "C" block + AX error/type constants + type aliases.
 
-#[allow(dead_code, unused_imports)]
-mod attr;
-#[allow(dead_code, unused_imports)]
-mod dispatch;
-mod tree;
-#[allow(dead_code, unused_imports)]
 mod app;
-mod find;
-#[allow(dead_code, unused_imports)]
+mod attr;
+mod dispatch;
 mod ffi;
+mod find;
+mod tree;
 
-// Public re-exports of relocated entry points so call sites continue
-// resolving through `crate::macos::ax::*`. Phasing: as each step relocates
-// more, this list grows; the module surface to external callers stays flat.
+// Public re-exports — call sites continue resolving through
+// `crate::macos::ax::*`; the module surface stays flat.
+pub use app::raise_windows;
+pub use dispatch::AXDispatchError;
 pub use find::{element_at_point, list_element_names};
 pub use tree::collect_ax_tree_indexed;
+pub(crate) use dispatch::{press_element, select_rows_attribute, set_value_attribute};
 pub(crate) use tree::{ancestor_role_chain, element_bbox};
 
 use super::ocr::{TextBounds, TextMatch};
-use core_foundation::array::{kCFTypeArrayCallBacks, CFArray, CFArrayCreate};
-use core_foundation::base::{kCFAllocatorDefault, CFType, TCFType};
+use core_foundation::base::{CFType, TCFType};
 use core_foundation::boolean::CFBoolean;
 use core_foundation::string::CFString;
 use core_graphics::geometry::{CGPoint, CGSize};
-use objc::runtime::{Class, Object};
-use objc::{msg_send, sel, sel_impl};
 use std::ffi::c_void;
 use std::ptr;
 use std::sync::Arc;
@@ -122,8 +117,8 @@ pub fn find_text(search: &str, window_id: Option<u32>) -> Result<Vec<TextMatch>,
     let debug = std::env::var("NATIVE_DEVTOOLS_DEBUG").is_ok();
 
     let pid = match window_id {
-        Some(wid) => pid_for_window(wid)?,
-        None => frontmost_pid()?,
+        Some(wid) => app::pid_for_window(wid)?,
+        None => app::frontmost_pid()?,
     };
 
     if debug {
@@ -240,129 +235,6 @@ unsafe fn get_position_and_size(element: AXUIElementRef) -> Option<(CGPoint, CGS
     Some((position, size))
 }
 
-/// Outcome of an `AXUIElementPerformAction` / `AXUIElementSetAttributeValue`
-/// call, classified into the MCP error taxonomy.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum AXDispatchError {
-    /// Action or attribute not supported by this element (element is not a
-    /// valid dispatch target — e.g. decorative label, read-only field).
-    NotDispatchable,
-    /// Any other AX error code. Carries the raw integer for diagnostics.
-    AxError(i32),
-}
-
-impl AXDispatchError {
-    /// Classify the return value of `AXUIElementPerformAction(kAXPressAction)`.
-    /// Returns `None` for success.
-    pub fn from_press_code(code: i32) -> Option<Self> {
-        match code {
-            K_AX_ERROR_SUCCESS => None,
-            K_AX_ERROR_ACTION_UNSUPPORTED => Some(AXDispatchError::NotDispatchable),
-            other => Some(AXDispatchError::AxError(other)),
-        }
-    }
-
-    /// Classify the return value of
-    /// `AXUIElementSetAttributeValue(kAXValueAttribute, ...)`. Returns
-    /// `None` for success.
-    pub fn from_set_value_code(code: i32) -> Option<Self> {
-        match code {
-            K_AX_ERROR_SUCCESS => None,
-            K_AX_ERROR_ATTRIBUTE_UNSUPPORTED | K_AX_ERROR_ILLEGAL_ARGUMENT => {
-                Some(AXDispatchError::NotDispatchable)
-            }
-            other => Some(AXDispatchError::AxError(other)),
-        }
-    }
-}
-
-/// Perform `kAXPressAction` on an element. Returns `Ok(())` on success.
-///
-/// Narrowed to `pub(crate)` so external Rust consumers cannot combine it
-/// with `AxSession::lookup` to recreate the lookup-then-dispatch race that
-/// `AxSession::dispatch` exists to close. The blessed entry point for
-/// dispatch is the session-pinned `dispatch` method.
-pub(crate) fn press_element(element: &AXRef) -> Result<(), AXDispatchError> {
-    let action = CFString::new("AXPress");
-    let code = unsafe { AXUIElementPerformAction(element.as_raw(), action.as_concrete_TypeRef()) };
-    match AXDispatchError::from_press_code(code) {
-        None => Ok(()),
-        Some(e) => Err(e),
-    }
-}
-
-/// Write `text` into an element's `kAXValueAttribute`. Returns `Ok(())` on
-/// success.
-///
-/// This is value assignment, not key-event typing: the target app does not
-/// observe keydown/keyup, does not see IME composition events, and does not
-/// record the change on its undo stack. Elements whose role does not expose
-/// a writable `kAXValueAttribute` return `NotDispatchable`.
-///
-/// Narrowed to `pub(crate)` so external Rust consumers cannot combine it
-/// with `AxSession::lookup` to recreate the lookup-then-dispatch race that
-/// `AxSession::dispatch` exists to close.
-pub(crate) fn set_value_attribute(element: &AXRef, text: &str) -> Result<(), AXDispatchError> {
-    let attr = CFString::new("AXValue");
-    let value = CFString::new(text);
-    let code = unsafe {
-        AXUIElementSetAttributeValue(
-            element.as_raw(),
-            attr.as_concrete_TypeRef(),
-            value.as_concrete_TypeRef() as core_foundation::base::CFTypeRef,
-        )
-    };
-    match AXDispatchError::from_set_value_code(code) {
-        None => Ok(()),
-        Some(e) => Err(e),
-    }
-}
-
-/// Write `rows` into the `AXSelectedRows` attribute of an outline/table.
-/// Returns `Ok(())` on success.
-///
-/// Callers must have already walked up to the enclosing `AXOutline` /
-/// `AXTable` and verified the row is a direct descendant. The MVP selects
-/// exactly one row per call — the list shape leaves room for multi-row
-/// selection later without re-plumbing the FFI boundary.
-///
-/// Narrowed to `pub(crate)` so external Rust consumers cannot combine it
-/// with `AxSession::lookup` to recreate the lookup-then-dispatch race that
-/// `AxSession::dispatch` exists to close.
-pub(crate) fn select_rows_attribute(
-    container: &AXRef,
-    rows: &[&AXRef],
-) -> Result<(), AXDispatchError> {
-    let attr = CFString::new("AXSelectedRows");
-    // Build a CFArray<AXUIElementRef>. `kCFTypeArrayCallBacks` tells CFArray
-    // to CFRetain each pointer on insert and CFRelease on destruction, which
-    // is what we want for `AXUIElementRef` — a CFType under the hood. Using
-    // `CFArray::from_copyable` would pass a null callback set, producing a
-    // bag of unmanaged raw pointers that AX probably still accepts but that
-    // leaks refcount semantics across the FFI boundary.
-    let raw_ptrs: Vec<*const c_void> = rows.iter().map(|r| r.as_raw() as *const c_void).collect();
-    let cf_array_ref = unsafe {
-        CFArrayCreate(
-            kCFAllocatorDefault,
-            raw_ptrs.as_ptr(),
-            raw_ptrs.len() as core_foundation::base::CFIndex,
-            &kCFTypeArrayCallBacks,
-        )
-    };
-    let cf_array: CFArray<*const c_void> = unsafe { CFArray::wrap_under_create_rule(cf_array_ref) };
-    let code = unsafe {
-        AXUIElementSetAttributeValue(
-            container.as_raw(),
-            attr.as_concrete_TypeRef(),
-            cf_array.as_concrete_TypeRef() as core_foundation::base::CFTypeRef,
-        )
-    };
-    match AXDispatchError::from_set_value_code(code) {
-        None => Ok(()),
-        Some(e) => Err(e),
-    }
-}
-
 /// Extract a typed value (CGPoint or CGSize) from an AXValue attribute.
 #[allow(dead_code)]
 unsafe fn get_ax_value<T: Default>(
@@ -391,167 +263,6 @@ unsafe fn get_ax_value<T: Default>(
         Some(result)
     } else {
         None
-    }
-}
-
-/// Get the PID that owns a given window ID, using CGWindowListCopyWindowInfo.
-pub(super) fn pid_for_window(window_id: u32) -> Result<i32, String> {
-    let window = super::window::find_window_by_id(window_id)?
-        .ok_or_else(|| format!("Window {} not found", window_id))?;
-    i32::try_from(window.owner_pid)
-        .map_err(|_| format!("PID {} exceeds i32 range", window.owner_pid))
-}
-
-/// Get the application name for a PID via NSRunningApplication.
-pub(super) fn app_name_for_pid(pid: i32) -> Option<String> {
-    unsafe {
-        let app: *mut Object = msg_send![
-            Class::get("NSRunningApplication")?,
-            runningApplicationWithProcessIdentifier: pid
-        ];
-        if app.is_null() {
-            return None;
-        }
-        let name_ns: *mut Object = msg_send![app, localizedName];
-        if name_ns.is_null() {
-            return None;
-        }
-        let utf8_ptr: *const std::ffi::c_char = msg_send![name_ns, UTF8String];
-        if utf8_ptr.is_null() {
-            return None;
-        }
-        Some(
-            std::ffi::CStr::from_ptr(utf8_ptr)
-                .to_string_lossy()
-                .into_owned(),
-        )
-    }
-}
-
-/// Get the PID of the frontmost application via NSWorkspace.
-pub(crate) fn frontmost_pid() -> Result<i32, String> {
-    unsafe {
-        let cls = Class::get("NSWorkspace").ok_or("NSWorkspace class not available")?;
-        let workspace: *mut Object = msg_send![cls, sharedWorkspace];
-        if workspace.is_null() {
-            return Err("NSWorkspace.sharedWorkspace returned nil".to_string());
-        }
-        let app: *mut Object = msg_send![workspace, frontmostApplication];
-        if app.is_null() {
-            return Err("No frontmost application found".to_string());
-        }
-        let pid: i32 = msg_send![app, processIdentifier];
-        Ok(pid)
-    }
-}
-
-/// Resolve app_name to PID by finding the first matching window.
-pub(super) fn pid_for_app_name(app_name: &str) -> Result<i32, String> {
-    let windows = super::window::find_windows_by_app(app_name)
-        .map_err(|e| format!("Failed to find windows: {}", e))?;
-    let win = windows.first().ok_or_else(|| {
-        format!(
-            "No app found matching '{}'. Use list_apps to find the correct app name.",
-            app_name
-        )
-    })?;
-    i32::try_from(win.owner_pid).map_err(|_| format!("PID {} exceeds i32 range", win.owner_pid))
-}
-
-/// Get the PID of the process that owns an AX element.
-pub(super) unsafe fn get_pid_for_element(element: AXUIElementRef) -> Option<i32> {
-    let mut pid: i32 = 0;
-    if AXUIElementGetPid(element, &mut pid) == K_AX_ERROR_SUCCESS {
-        Some(pid)
-    } else {
-        None
-    }
-}
-
-/// Raise all windows of an application to the front using the Accessibility API.
-///
-/// Two-step approach:
-/// 1. Set AXFrontmost on the app element (equivalent to System Events `set frontmost`)
-/// 2. AXRaise on each window (physically brings windows to front)
-///
-/// Step 1 is critical for apps without a proper macOS app bundle (e.g. Tauri dev builds)
-/// where NSRunningApplication.activate reports success but doesn't bring windows to front.
-pub fn raise_windows(pid: i32) -> bool {
-    let debug = std::env::var("NATIVE_DEVTOOLS_DEBUG").is_ok();
-
-    unsafe {
-        let app_element = AXUIElementCreateApplication(pid);
-        if app_element.is_null() {
-            if debug {
-                eprintln!(
-                    "[DEBUG ax::raise_windows] Failed to create AXUIElement for pid {}",
-                    pid
-                );
-            }
-            return false;
-        }
-
-        // Step 1: Set AXFrontmost on the app element to make it the frontmost process.
-        // This is the programmatic equivalent of AppleScript:
-        //   tell application "System Events" to set frontmost of process "X" to true
-        let frontmost_attr = CFString::new("AXFrontmost");
-        let frontmost_err = AXUIElementSetAttributeValue(
-            app_element,
-            frontmost_attr.as_concrete_TypeRef(),
-            core_foundation::boolean::CFBoolean::true_value().as_CFTypeRef(),
-        );
-        if debug {
-            eprintln!(
-                "[DEBUG ax::raise_windows] AXFrontmost set for pid {} (err={})",
-                pid, frontmost_err
-            );
-        }
-
-        // Step 2: AXRaise each window to bring them to front in the window order.
-        let windows_attr = CFString::new("AXWindows");
-        let mut windows_ref: core_foundation::base::CFTypeRef = ptr::null();
-        let err = AXUIElementCopyAttributeValue(
-            app_element,
-            windows_attr.as_concrete_TypeRef(),
-            &mut windows_ref,
-        );
-
-        let mut raised = frontmost_err == K_AX_ERROR_SUCCESS;
-
-        if err == K_AX_ERROR_SUCCESS && !windows_ref.is_null() {
-            let windows: CFArray<*const c_void> = CFArray::wrap_under_create_rule(windows_ref as _);
-            let raise_action = CFString::new("AXRaise");
-
-            for i in 0..windows.len() {
-                let window = *windows.get_unchecked(i) as AXUIElementRef;
-                let result = AXUIElementPerformAction(window, raise_action.as_concrete_TypeRef());
-                if result == K_AX_ERROR_SUCCESS {
-                    raised = true;
-                } else if debug {
-                    eprintln!(
-                        "[DEBUG ax::raise_windows] AXRaise failed for window {} (err={})",
-                        i, result
-                    );
-                }
-            }
-
-            if debug {
-                eprintln!(
-                    "[DEBUG ax::raise_windows] pid={}, windows={}, raised={}",
-                    pid,
-                    windows.len(),
-                    raised
-                );
-            }
-        } else if debug {
-            eprintln!(
-                "[DEBUG ax::raise_windows] No AXWindows for pid {} (err={})",
-                pid, err
-            );
-        }
-
-        core_foundation::base::CFRelease(app_element as core_foundation::base::CFTypeRef);
-        raised
     }
 }
 
