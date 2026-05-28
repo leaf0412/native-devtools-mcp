@@ -5,10 +5,6 @@
 //! `DOM.resolveNode`) that the wait code repeats. The legacy callers in
 //! `summary.rs` and `evaluate.rs` inline the same patterns; those stay as-is
 //! per the scalpel rule (TODO: migrate when those modules need touching).
-//!
-//! `ResolvedScope` / `borrow_page` / `resolve_element_scope` are wired in by
-//! step 4 (wait code move). The `#[allow(dead_code)]` markers below are
-//! removed in that step.
 
 use crate::cdp::{cdp_error, page_url, CdpClient};
 use chromiumoxide::cdp::browser_protocol::dom::{BackendNodeId, ResolveNodeParams};
@@ -19,9 +15,15 @@ use std::sync::Arc;
 use tokio::sync::RwLock;
 
 /// A scope UID fully resolved to a live remote object on the page.
-#[allow(dead_code)]
+///
+/// `uid` and `backend_node_id` are part of the resolver's public contract
+/// even though today only `object_id` is consumed (wait code). Keeping them
+/// lets a future scope-aware caller use them without another round-trip;
+/// the `allow(dead_code)` is honest about that intent.
 pub(super) struct ResolvedScope {
+    #[allow(dead_code)]
     pub uid: String,
+    #[allow(dead_code)]
     pub backend_node_id: i64,
     pub object_id: RemoteObjectId,
 }
@@ -45,7 +47,6 @@ pub(super) async fn release_object(page: &Page, object_id: RemoteObjectId) {
 
 /// Acquire a `Page` from the shared CDP client, surfacing the
 /// "No CDP connection" error verbatim if the client is absent.
-#[allow(dead_code)]
 pub(super) async fn borrow_page(
     cdp_client: &Arc<RwLock<Option<CdpClient>>>,
 ) -> Result<Page, CallToolResult> {
@@ -59,7 +60,6 @@ pub(super) async fn borrow_page(
 /// Resolve a scope UID end-to-end: snapshot lookup -> `backendNodeId` ->
 /// `DOM.resolveNode` -> live `objectId`. Returns one struct instead of the
 /// two-step pair the old code used.
-#[allow(dead_code)]
 pub(super) async fn resolve_element_scope(
     uid: &str,
     page: &Page,
