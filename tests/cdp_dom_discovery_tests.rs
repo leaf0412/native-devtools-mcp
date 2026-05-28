@@ -56,7 +56,7 @@ use harness::{
 };
 use native_devtools_mcp::cdp::tools::{
     cdp_click, cdp_evaluate_script, cdp_fill, cdp_find_elements, cdp_get_element_context,
-    cdp_summarize_page, cdp_wait_for_page_change,
+    cdp_summarize_page, cdp_wait_for_page_change, SemanticWaitParams,
 };
 
 const HTML_RICH_EDITOR_SEND_STATE: &str = r##"
@@ -232,13 +232,15 @@ async fn cdp_wait_for_page_change_detects_scoped_semantic_delta() {
     );
 
     let waited = cdp_wait_for_page_change(
-        Some(uid.clone()),
-        Some("new_visible_text".into()),
-        Some("new incoming message in the Messages log".into()),
-        Some(3_000),
-        Some(100),
-        Some(100),
-        false,
+        SemanticWaitParams::from_raw(
+            Some(uid.clone()),
+            Some("new_visible_text".into()),
+            Some("new incoming message in the Messages log".into()),
+            Some(3_000),
+            Some(100),
+            Some(100),
+            false,
+        ),
         h.client_handle(),
     )
     .await;

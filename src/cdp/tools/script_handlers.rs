@@ -373,7 +373,7 @@ impl ToolHandler for CdpWaitForPageChange {
             .get("include_snapshot")
             .and_then(|v| v.as_bool())
             .unwrap_or(false);
-        Ok(crate::cdp::tools::cdp_wait_for_page_change(
+        let params = crate::cdp::tools::SemanticWaitParams::from_raw(
             scope_uid,
             condition,
             goal,
@@ -381,8 +381,7 @@ impl ToolHandler for CdpWaitForPageChange {
             poll_interval_ms,
             stable_ms,
             include_snapshot,
-            ctx.cdp_client.clone(),
-        )
-        .await)
+        );
+        Ok(crate::cdp::tools::cdp_wait_for_page_change(params, ctx.cdp_client.clone()).await)
     }
 }

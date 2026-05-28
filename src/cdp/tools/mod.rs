@@ -18,7 +18,7 @@ pub use pages::{
 };
 pub use script::{
     cdp_evaluate_script, cdp_find_elements, cdp_get_element_context, cdp_summarize_page,
-    cdp_take_dom_snapshot, cdp_wait_for, cdp_wait_for_page_change,
+    cdp_take_dom_snapshot, cdp_wait_for, cdp_wait_for_page_change, SemanticWaitParams,
 };
 
 // Shared helpers used by input tools.

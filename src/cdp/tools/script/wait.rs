@@ -549,25 +549,9 @@ async fn run_semantic(
 }
 
 pub async fn cdp_wait_for_page_change(
-    scope_uid: Option<String>,
-    condition: Option<String>,
-    goal: Option<String>,
-    timeout_ms: Option<u64>,
-    poll_interval_ms: Option<u64>,
-    stable_ms: Option<u64>,
-    include_snapshot: bool,
+    params: SemanticWaitParams,
     cdp_client: Arc<RwLock<Option<CdpClient>>>,
 ) -> CallToolResult {
-    let params = SemanticWaitParams::from_raw(
-        scope_uid,
-        condition,
-        goal,
-        timeout_ms,
-        poll_interval_ms,
-        stable_ms,
-        include_snapshot,
-    );
-
     let page = match borrow_page(&cdp_client).await {
         Ok(page) => page,
         Err(e) => return e,
