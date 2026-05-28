@@ -30,7 +30,7 @@ pub(super) struct Caches {
 ///
 /// `Screenshot` and `Image` carry the cache id; the corresponding cache
 /// is read under the lock kind documented on [`Caches`].
-#[allow(dead_code)] // Image variant lights up in step 3
+#[allow(dead_code)] // InlinePng is a deliberate seam point, not yet exercised
 pub(super) enum ImageSource {
     Base64(String),
     InlinePng(Vec<u8>),
@@ -69,15 +69,115 @@ pub(super) struct Resolved {
 }
 
 /// Cache-miss outcome. `Error` is a hard stop; `FallbackWithWarning`
-/// asks the caller to warn and retry with the embedded source.
-///
-/// Step 2 only constructs `Error` (for the screenshot slot, which the
-/// algorithm intentionally converts back into a warning + no-data).
-/// `FallbackWithWarning` lights up in steps 3-4 via `SlotInput`.
-#[allow(dead_code)]
+/// asks the caller to warn and use the embedded fallback source.
+#[allow(dead_code)] // FallbackWithWarning is reserved for callers that
+                    // want fetch itself to bundle the fallback source;
+                    // current callers route fallback through resolve_slot.
 pub(super) enum Miss {
     Error(String),
     FallbackWithWarning(String, ImageSource),
+}
+
+/// Slot wiring for `resolve_slot`: a primary source (typically an
+/// `Image(id)`) plus an optional base64 fallback the caller wants
+/// used when the primary id misses the cache.
+pub(super) struct SlotInput {
+    pub(super) primary: Option<ImageSource>,
+    pub(super) fallback_b64: Option<ImageSource>,
+}
+
+/// Names a slot for the warn / hard-error message templates.
+///
+/// Literals chosen to match the pre-seam strings byte-for-byte:
+///   warn:  "{Label} ID '{id}' not found in cache, using base64 fallback"
+///   error: "{Label} ID '{id}' not found in image cache"
+#[derive(Clone, Copy)]
+#[allow(dead_code)] // Mask variant lights up in step 4
+pub(super) enum SlotKind {
+    Template,
+    Mask,
+}
+
+impl SlotKind {
+    fn label(self) -> &'static str {
+        match self {
+            SlotKind::Template => "Template",
+            SlotKind::Mask => "Mask",
+        }
+    }
+}
+
+/// Resolve a slot's bytes per the standard cache-miss policy:
+///   - no primary, no fallback → `Ok(None, None)`
+///   - primary resolves → use it
+///   - primary misses + fallback present → warn + use fallback
+///   - primary misses + no fallback → hard error (caller surfaces it)
+///
+/// Returns the resolved bytes (if any) and a warning string the caller
+/// must merge into its rolling warning. The hard-error path returns
+/// `Err(msg)` for the caller to wrap in `CallToolResult::error`.
+pub(super) async fn resolve_slot(
+    slot: SlotInput,
+    kind: SlotKind,
+    caches: &Caches,
+) -> Result<(Option<Resolved>, Option<String>), String> {
+    let Some(primary) = slot.primary else {
+        // No id: just take the fallback if any (no warning, no error).
+        return match slot.fallback_b64 {
+            Some(src) => match src.fetch(caches).await {
+                Ok(resolved) => Ok((Some(resolved), None)),
+                Err(Miss::Error(e)) => Err(e),
+                Err(Miss::FallbackWithWarning(_, _)) => unreachable!(
+                    "Base64/InlinePng fetch never produces FallbackWithWarning"
+                ),
+            },
+            None => Ok((None, None)),
+        };
+    };
+
+    match primary.fetch(caches).await {
+        Ok(resolved) => Ok((Some(resolved), None)),
+        Err(Miss::Error(_raw)) => {
+            // Re-derive the slot-flavored miss message; `_raw` carried
+            // the generic "Image ID ... not found in image cache" form,
+            // but the public-facing literals are slot-specific.
+            let id = primary.id_for_log();
+            match slot.fallback_b64 {
+                Some(fb) => {
+                    let warning = format!(
+                        "{} ID '{}' not found in cache, using base64 fallback",
+                        kind.label(),
+                        id,
+                    );
+                    match fb.fetch(caches).await {
+                        Ok(resolved) => Ok((Some(resolved), Some(warning))),
+                        Err(Miss::Error(e)) => Err(e),
+                        Err(Miss::FallbackWithWarning(_, _)) => unreachable!(
+                            "Base64/InlinePng fetch never produces FallbackWithWarning"
+                        ),
+                    }
+                }
+                None => Err(format!(
+                    "{} ID '{}' not found in image cache",
+                    kind.label(),
+                    id,
+                )),
+            }
+        }
+        Err(Miss::FallbackWithWarning(_, _)) => unreachable!(
+            "ImageSource::fetch never produces FallbackWithWarning on its own"
+        ),
+    }
+}
+
+impl ImageSource {
+    /// Best-effort id string for log/warning text.
+    fn id_for_log(&self) -> &str {
+        match self {
+            ImageSource::Screenshot(id) | ImageSource::Image(id) => id.as_str(),
+            ImageSource::Base64(_) | ImageSource::InlinePng(_) => "<inline>",
+        }
+    }
 }
 
 impl ImageSource {

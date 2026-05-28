@@ -10,7 +10,9 @@ use crate::tools::find_image::params::{
     normalize_rotation, validate_scale_range, BoundingBox, FindImageParams, FindImageResponse,
     MatchResult, ModeDefaults, Point, ScaleRange, SearchRegion,
 };
-use crate::tools::find_image::source::{Caches, ImageSource, Miss, RawImageBytes};
+use crate::tools::find_image::source::{
+    resolve_slot, Caches, ImageSource, Miss, RawImageBytes, SlotInput, SlotKind,
+};
 use crate::tools::find_image::transform::{
     decode_base64_to_gray, decode_png_to_gray, extract_region, resize_image, rotate_image,
 };
@@ -48,8 +50,10 @@ pub(super) struct MatchingInput {
     /// `None` means neither `screenshot_id` was usable nor base64 was
     /// provided — `run_matching` will then emit the hard error.
     pub(super) screenshot_bytes: Option<RawImageBytes>,
-    pub(super) template_png_data: Option<Vec<u8>>,
-    pub(super) template_b64: Option<String>,
+    /// Template bytes after the source-seam resolve. `None` is invalid
+    /// — the resolve site rejects empty template requests before we
+    /// build this struct.
+    pub(super) template_bytes: Option<RawImageBytes>,
     pub(super) mask_png_data: Option<Vec<u8>>,
     pub(super) mask_b64: Option<String>,
     pub(super) search_region: Option<SearchRegion>,
@@ -175,29 +179,25 @@ pub(super) async fn find_image(params: FindImageParams, caches: Caches) -> CallT
             .map(RawImageBytes::Base64)
     });
 
-    // Resolve template data from image cache
-    // Use write lock to update LRU access order via get()
-    let template_png_data = {
-        if let Some(id) = &params.template_id {
-            let mut cache_guard = image_cache.write().await;
-            if let Some(cached) = cache_guard.get(id) {
-                Some(cached.png_data.clone())
-            } else if params.template_image_base64.is_some() {
-                // ID not found but base64 fallback available - warn and continue
-                let msg = format!(
-                    "Template ID '{}' not found in cache, using base64 fallback",
-                    id
-                );
+    // Resolve template via the source seam. Image cache uses a WRITE
+    // lock + get() inside Image::fetch so LRU access order still bumps
+    // exactly when a stored template is consumed.
+    let template_slot = SlotInput {
+        primary: params.template_id.clone().map(ImageSource::Image),
+        fallback_b64: params
+            .template_image_base64
+            .clone()
+            .map(ImageSource::Base64),
+    };
+    let template_bytes = match resolve_slot(template_slot, SlotKind::Template, &caches).await {
+        Ok((resolved, warn_msg)) => {
+            if let Some(msg) = warn_msg {
                 warning = Some(warning.map_or(msg.clone(), |w| format!("{}; {}", w, msg)));
-                None
-            } else {
-                return CallToolResult::error(vec![Content::text(format!(
-                    "Template ID '{}' not found in image cache",
-                    id
-                ))]);
             }
-        } else {
-            None
+            resolved.map(|r| r.bytes)
+        }
+        Err(hard_error) => {
+            return CallToolResult::error(vec![Content::text(hard_error)]);
         }
     };
 
@@ -235,8 +235,7 @@ pub(super) async fn find_image(params: FindImageParams, caches: Caches) -> CallT
     let is_fast_mode = params.mode != "accurate";
     let input = MatchingInput {
         screenshot_bytes,
-        template_png_data,
-        template_b64: params.template_image_base64.clone(),
+        template_bytes,
         mask_png_data,
         mask_b64: params.mask_image_base64.clone(),
         search_region: params.search_region.clone(),
@@ -462,25 +461,31 @@ pub(super) fn run_matching(input: MatchingInput) -> MatchingResult {
         }
     };
 
-    // Decode template image (prefer cached PNG data over base64)
-    let template_gray = if let Some(png_data) = input.template_png_data {
-        match decode_png_to_gray(&png_data) {
+    // Decode template via the seam. Failure literals preserved:
+    // cache-derived bytes → "Failed to decode cached template";
+    // inline base64 → "Failed to decode template image". The hard
+    // error "Either template_id or template_image_base64 must be
+    // provided" still fires here — the resolve site validates that
+    // shape before reaching run_matching, but we keep the guard for
+    // defence in depth.
+    let template_gray = match input.template_bytes {
+        Some(RawImageBytes::Png(bytes)) => match RawImageBytes::Png(bytes).decode() {
             Ok(img) => img,
             Err(e) => {
                 return MatchingResult::Error(format!("Failed to decode cached template: {}", e))
             }
-        }
-    } else if let Some(b64) = &input.template_b64 {
-        match decode_base64_to_gray(b64) {
+        },
+        Some(RawImageBytes::Base64(b64)) => match RawImageBytes::Base64(b64).decode() {
             Ok(img) => img,
             Err(e) => {
                 return MatchingResult::Error(format!("Failed to decode template image: {}", e))
             }
+        },
+        None => {
+            return MatchingResult::Error(
+                "Either template_id or template_image_base64 must be provided".to_string(),
+            );
         }
-    } else {
-        return MatchingResult::Error(
-            "Either template_id or template_image_base64 must be provided".to_string(),
-        );
     };
 
     // Decode mask if provided (prefer cached PNG data over base64)
