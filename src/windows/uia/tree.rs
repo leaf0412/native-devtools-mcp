@@ -1,302 +1,16 @@
-//! Windows UI Automation (UIA) helpers.
-//!
-//! Uses the Windows Accessibility tree for:
-//! - Text search: find UI elements by name (faster than OCR for standard controls)
-//! - Snapshot: collect the full UIA tree as a flat list of snapshot nodes
-
-use super::ocr::{TextBounds, TextMatch};
+use super::find_text::{MAX_DEPTH, MAX_ELEMENTS};
 use crate::tools::ax_snapshot::{map_uia_control_type, AXSnapshotNode};
 use windows::Win32::System::Com::{
     CoCreateInstance, CoInitializeEx, CLSCTX_ALL, COINIT_MULTITHREADED,
 };
 use windows::Win32::UI::Accessibility::{
     CUIAutomation, IUIAutomation, IUIAutomationElement, IUIAutomationTreeWalker, TreeScope,
-    TreeScope_Descendants, TreeScope_Element,
+    TreeScope_Descendants,
 };
 use windows::Win32::UI::WindowsAndMessaging::GetForegroundWindow;
 
-const MAX_DEPTH: u32 = 50;
-const MAX_ELEMENTS: usize = 10_000;
-
-/// Enumerate all UIA elements in the foreground window, calling `visitor` on each
-/// element's name (non-empty names only). Returns early with an empty result if
-/// no foreground window is available.
-fn for_each_element_name(mut visitor: impl FnMut(&str)) -> Result<(), String> {
-    unsafe {
-        let _ = CoInitializeEx(None, COINIT_MULTITHREADED);
-
-        let automation: IUIAutomation = CoCreateInstance(&CUIAutomation, None, CLSCTX_ALL)
-            .map_err(|e| format!("Failed to create IUIAutomation: {}", e))?;
-
-        let hwnd = GetForegroundWindow();
-        if hwnd.0.is_null() {
-            return Ok(());
-        }
-
-        let root = automation
-            .ElementFromHandle(hwnd)
-            .map_err(|e| format!("Failed to get element from foreground window: {}", e))?;
-
-        let condition = automation
-            .CreateTrueCondition()
-            .map_err(|e| format!("Failed to create condition: {}", e))?;
-
-        let scope = TreeScope(TreeScope_Element.0 | TreeScope_Descendants.0);
-        let elements = root
-            .FindAll(scope, &condition)
-            .map_err(|e| format!("FindAll failed: {}", e))?;
-
-        let count = elements
-            .Length()
-            .map_err(|e| format!("Failed to get element count: {}", e))?;
-
-        for i in 0..count {
-            let elem = match elements.GetElement(i) {
-                Ok(e) => e,
-                Err(_) => continue,
-            };
-
-            let name = match elem.CurrentName() {
-                Ok(n) => n.to_string(),
-                Err(_) => continue,
-            };
-
-            if !name.is_empty() {
-                visitor(&name);
-            }
-        }
-
-        Ok(())
-    }
-}
-
-/// Check if any of the element's text properties contain the search string (case-insensitive).
-/// Returns the first matching text, or None. Checks name, then value, then help text.
-fn match_element_text(
-    name: Option<&str>,
-    value: Option<&str>,
-    help: Option<&str>,
-    search_lower: &str,
-) -> Option<String> {
-    [name, value, help]
-        .into_iter()
-        .flatten()
-        .find(|text| text.to_lowercase().contains(search_lower))
-        .map(|s| s.to_string())
-}
-
-/// Find text in UI elements of the foreground window using UIA.
-///
-/// Searches the accessibility tree of the foreground window for elements
-/// whose Name, Value, or HelpText property contains the search string (case-insensitive).
-/// Returns matching elements with screen coordinates for clicking.
-pub fn find_text(search: &str) -> Result<Vec<TextMatch>, String> {
-    let debug = std::env::var("NATIVE_DEVTOOLS_DEBUG").is_ok();
-    let search_lower = search.to_lowercase();
-    let mut matches = Vec::new();
-
-    unsafe {
-        let _ = CoInitializeEx(None, COINIT_MULTITHREADED);
-
-        let automation: IUIAutomation = CoCreateInstance(&CUIAutomation, None, CLSCTX_ALL)
-            .map_err(|e| format!("Failed to create IUIAutomation: {}", e))?;
-
-        let hwnd = GetForegroundWindow();
-        if hwnd.0.is_null() {
-            return Ok(Vec::new());
-        }
-
-        let root = automation
-            .ElementFromHandle(hwnd)
-            .map_err(|e| format!("Failed to get element from foreground window: {}", e))?;
-
-        if debug {
-            let name = root.CurrentName().unwrap_or_default();
-            eprintln!(
-                "[DEBUG uia::find_text] search='{}', foreground_hwnd={:?}, window_name='{}'",
-                search, hwnd, name
-            );
-        }
-
-        let condition = automation
-            .CreateTrueCondition()
-            .map_err(|e| format!("Failed to create condition: {}", e))?;
-
-        let scope = TreeScope(TreeScope_Element.0 | TreeScope_Descendants.0);
-        let elements = root
-            .FindAll(scope, &condition)
-            .map_err(|e| format!("FindAll failed: {}", e))?;
-
-        let count = elements
-            .Length()
-            .map_err(|e| format!("Failed to get element count: {}", e))?;
-
-        if debug {
-            eprintln!("[DEBUG uia::find_text] scanning {} elements", count);
-        }
-
-        let mut seen_centers: std::collections::HashSet<(i32, i32)> =
-            std::collections::HashSet::new();
-
-        for i in 0..count {
-            let elem = match elements.GetElement(i) {
-                Ok(e) => e,
-                Err(_) => continue,
-            };
-
-            // Get bounding rectangle first; skip zero-size elements.
-            let rect = match elem.CurrentBoundingRectangle() {
-                Ok(r) => r,
-                Err(_) => continue,
-            };
-
-            let width = (rect.right - rect.left) as f64;
-            let height = (rect.bottom - rect.top) as f64;
-            if width <= 0.0 || height <= 0.0 {
-                continue;
-            }
-
-            // Collect the three text properties.
-            let (name, value, help) = element_text_properties(&elem);
-
-            // Find the first property that matches the search string.
-            let matched_text = match_element_text(
-                name.as_deref(),
-                value.as_deref(),
-                help.as_deref(),
-                &search_lower,
-            );
-
-            let matched_text = match matched_text {
-                Some(t) => t,
-                None => continue,
-            };
-
-            let cx = rect.left as f64 + width / 2.0;
-            let cy = rect.top as f64 + height / 2.0;
-
-            // Deduplicate by center coordinates (quantized to 2px grid).
-            let key = ((cx / 2.0) as i32, (cy / 2.0) as i32);
-            if !seen_centers.insert(key) {
-                continue;
-            }
-
-            let role = elem
-                .CurrentControlType()
-                .ok()
-                .and_then(|ct| uia_control_type_name(ct.0));
-
-            let bounds = TextBounds {
-                x: rect.left as f64,
-                y: rect.top as f64,
-                width,
-                height,
-            };
-
-            matches.push(TextMatch {
-                text: matched_text,
-                x: cx,
-                y: cy,
-                confidence: 1.0,
-                bounds,
-                role,
-            });
-        }
-
-        if debug {
-            eprintln!(
-                "[DEBUG uia::find_text] found {} matches out of {} elements",
-                matches.len(),
-                count
-            );
-        }
-    }
-
-    Ok(matches)
-}
-
-/// Collect all unique non-empty element names from the UIA tree of the foreground window.
-/// Used to provide a list of available elements when a search returns no matches.
-pub fn list_element_names() -> Result<Vec<String>, String> {
-    let mut names = Vec::new();
-    let mut seen = std::collections::HashSet::new();
-
-    for_each_element_name(|name| {
-        let trimmed = name.trim();
-        if !trimmed.is_empty() && seen.insert(trimmed.to_string()) {
-            names.push(trimmed.to_string());
-        }
-    })?;
-
-    Ok(names)
-}
-
-/// Container control types that warrant a descendant search for a more specific element.
-const CONTAINER_TYPES: &[i32] = &[
-    50032, // Window
-    50033, // Pane
-    50026, // Group
-    50014, // ScrollBar
-];
-
-/// Get the UI Automation element at the given screen coordinates.
-///
-/// Uses `IUIAutomation::ElementFromPoint` to find the element at (x, y).
-/// When `app_name` is provided, verifies the element belongs to that app by PID;
-/// if not, walks descendants filtered by PID.
-/// When the result is a container type (Window, Pane, Group, ScrollBar), walks
-/// descendants to find the smallest-area element containing the point.
-/// Returns a JSON object with the element's attributes.
-pub fn element_at_point(
-    x: f64,
-    y: f64,
-    app_name: Option<&str>,
-) -> Result<serde_json::Value, String> {
-    unsafe {
-        let _ = CoInitializeEx(None, COINIT_MULTITHREADED);
-
-        let automation: IUIAutomation = CoCreateInstance(&CUIAutomation, None, CLSCTX_ALL)
-            .map_err(|e| format!("Failed to create IUIAutomation: {}", e))?;
-
-        let point = windows::Win32::Foundation::POINT {
-            x: x as i32,
-            y: y as i32,
-        };
-
-        let mut elem = automation
-            .ElementFromPoint(point)
-            .map_err(|e| format!("No accessibility element found at ({}, {}): {}", x, y, e))?;
-
-        // Step 1: App-name scoping — verify the element belongs to the target app.
-        if let Some(name) = app_name {
-            let target_pids = resolve_app_pids(name);
-            if !target_pids.is_empty() {
-                let elem_pid = elem.CurrentProcessId().unwrap_or(0);
-                if !target_pids.contains(&elem_pid) {
-                    // Element doesn't belong to target app — walk descendants to find one that does.
-                    if let Some(scoped) =
-                        find_smallest_element_at_point(&automation, &elem, x, y, Some(&target_pids))
-                    {
-                        elem = scoped;
-                    }
-                }
-            }
-        }
-
-        // Step 2: Container fallback — if the element is a container, find a more specific child.
-        let control_type = elem.CurrentControlType().map(|ct| ct.0).unwrap_or(0);
-        if CONTAINER_TYPES.contains(&control_type) {
-            if let Some(deeper) = find_smallest_element_at_point(&automation, &elem, x, y, None) {
-                elem = deeper;
-            }
-        }
-
-        build_element_json(&elem)
-    }
-}
-
 /// Resolve an app name to a list of PIDs by matching against running applications.
-fn resolve_app_pids(app_name: &str) -> Vec<i32> {
+pub(super) fn resolve_app_pids(app_name: &str) -> Vec<i32> {
     let needle = app_name.to_lowercase();
     crate::windows::app::list_apps()
         .into_iter()
@@ -307,7 +21,7 @@ fn resolve_app_pids(app_name: &str) -> Vec<i32> {
 
 /// Search descendants of `root` for the smallest-area element containing the point (x, y).
 /// When `pid_filter` is `Some`, only elements belonging to one of the listed PIDs are considered.
-unsafe fn find_smallest_element_at_point(
+pub(super) unsafe fn find_smallest_element_at_point(
     automation: &IUIAutomation,
     root: &IUIAutomationElement,
     x: f64,
@@ -371,7 +85,7 @@ unsafe fn check_element_contains_point(elem: &IUIAutomationElement, x: f64, y: f
 }
 
 /// Extract the three text properties (name, value, help) from a UIA element.
-unsafe fn element_text_properties(
+pub(super) unsafe fn element_text_properties(
     elem: &IUIAutomationElement,
 ) -> (Option<String>, Option<String>, Option<String>) {
     let name = elem
@@ -399,7 +113,7 @@ unsafe fn element_text_properties(
 }
 
 /// Build a JSON object from a UIA element's properties.
-unsafe fn build_element_json(elem: &IUIAutomationElement) -> Result<serde_json::Value, String> {
+pub(super) unsafe fn build_element_json(elem: &IUIAutomationElement) -> Result<serde_json::Value, String> {
     let (name, value_pattern, help) = element_text_properties(elem);
     let role = elem
         .CurrentControlType()
@@ -449,7 +163,7 @@ unsafe fn build_element_json(elem: &IUIAutomationElement) -> Result<serde_json::
 }
 
 /// Map a UIA_*ControlTypeId to a human-readable name.
-fn uia_control_type_name(id: i32) -> Option<String> {
+pub(super) fn uia_control_type_name(id: i32) -> Option<String> {
     let name = match id {
         50000 => "Button",
         50001 => "Calendar",
@@ -542,14 +256,14 @@ unsafe fn uia_root_element(
 ) -> Result<IUIAutomationElement, String> {
     let hwnd = match app_name {
         Some(name) => {
-            let windows = super::window::find_windows_by_app(name)?;
+            let windows = super::super::window::find_windows_by_app(name)?;
             let win = windows.first().ok_or_else(|| {
                 format!(
                     "No app found matching '{}'. Use list_apps to find the correct app name.",
                     name
                 )
             })?;
-            super::window::hwnd_from_id(win.id)
+            super::super::window::hwnd_from_id(win.id)
         }
         None => {
             let hwnd = GetForegroundWindow();
@@ -677,6 +391,8 @@ unsafe fn collect_uia_tree_recursive(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use super::super::element_at_point::element_at_point;
+    use super::super::find_text::{find_text, match_element_text};
 
     #[test]
     fn test_match_element_text_matches_name() {
