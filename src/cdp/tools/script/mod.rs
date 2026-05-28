@@ -3,6 +3,7 @@
 
 mod dom;
 mod evaluate;
+mod scope;
 mod summary;
 
 pub use evaluate::cdp_evaluate_script;
@@ -10,11 +11,8 @@ pub use summary::{
     cdp_find_elements, cdp_get_element_context, cdp_summarize_page, cdp_take_dom_snapshot,
 };
 
-use crate::cdp::{cdp_error, page_url, CdpClient};
-use chromiumoxide::cdp::browser_protocol::dom::{BackendNodeId, ResolveNodeParams};
-use chromiumoxide::cdp::js_protocol::runtime::{
-    CallArgument, CallFunctionOnParams, EvaluateParams, ReleaseObjectParams,
-};
+use crate::cdp::{cdp_error, CdpClient};
+use chromiumoxide::cdp::js_protocol::runtime::{CallFunctionOnParams, EvaluateParams};
 use chromiumoxide::page::Page;
 use rmcp::model::{CallToolResult, Content};
 use serde_json::Value;
@@ -325,52 +323,9 @@ async function(timeoutMs, stableMs, pollIntervalMs) {
 }
 "#;
 
-fn string_argument(value: impl Into<Value>) -> CallArgument {
-    CallArgument::builder().value(value.into()).build()
-}
-
-async fn resolve_scope_backend_node_id(
-    scope_uid: &str,
-    page: &Page,
-    cdp_client: Arc<RwLock<Option<CdpClient>>>,
-) -> Result<i64, CallToolResult> {
-    let current_url = page_url(page).await;
-    let guard = cdp_client.read().await;
-    let client = guard
-        .as_ref()
-        .ok_or_else(|| cdp_error("No CDP connection. Use cdp_connect first."))?;
-    let node = crate::cdp::resolve_uid_from_maps(
-        scope_uid,
-        client.last_dom_snapshot.as_ref(),
-        client.generation,
-        &current_url,
-    )
-    .map_err(cdp_error)?;
-
-    Ok(node.backend_node_id)
-}
-
-async fn resolve_scope_object_id(
-    scope_uid: &str,
-    backend_node_id: i64,
-    page: &Page,
-) -> Result<chromiumoxide::cdp::js_protocol::runtime::RemoteObjectId, CallToolResult> {
-    let resolve_params = ResolveNodeParams::builder()
-        .backend_node_id(BackendNodeId::new(backend_node_id))
-        .build();
-    let remote_object = page.execute(resolve_params).await.map_err(|e| {
-        cdp_error(format!(
-            "Scope uid={} could not be resolved to a DOM node: {}",
-            scope_uid, e
-        ))
-    })?;
-    remote_object.result.object.object_id.ok_or_else(|| {
-        cdp_error(format!(
-            "Scope uid={} could not be resolved to a DOM node.",
-            scope_uid
-        ))
-    })
-}
+use scope::{
+    json_value_arg, release_object, resolve_scope_backend_node_id, resolve_scope_object_id,
+};
 
 fn semantic_wait_value_from_evaluate(
     result: chromiumoxide::cdp::js_protocol::runtime::EvaluateReturns,
@@ -427,16 +382,16 @@ async fn wait_for_scoped_semantic_change(
         .function_declaration(PAGE_CHANGE_WAIT_JS)
         .object_id(object_id.clone())
         .arguments(vec![
-            string_argument(timeout_ms),
-            string_argument(stable_ms),
-            string_argument(poll_interval_ms),
+            json_value_arg(timeout_ms),
+            json_value_arg(stable_ms),
+            json_value_arg(poll_interval_ms),
         ])
         .return_by_value(true)
         .await_promise(true)
         .build()
         .map_err(|e| cdp_error(format!("Failed to build wait call params: {}", e)))?;
     let call_result = page.execute(call_params).await;
-    let _ = page.execute(ReleaseObjectParams::new(object_id)).await;
+    release_object(page, object_id).await;
     let resp =
         call_result.map_err(|e| cdp_error(format!("Failed to wait for page change: {}", e)))?;
     semantic_wait_value_from_call(resp.result)
