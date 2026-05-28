@@ -4,7 +4,7 @@
 //! - Text search: find UI elements by name (faster than OCR for standard controls)
 //! - Window raising: bring windows to front via AXRaise (works for bundle-less apps)
 //!
-//! Module layout (post-T4 split — currently being migrated):
+//! Module layout (T4 split — typed AX read seam):
 //! - `attr`: the sole owner of `AXUIElementCopyAttributeValue` (typed read seam).
 //! - `dispatch`: write-side classified errors (`AXDispatchError`, `press_element`,
 //!   `set_value_attribute`, `select_rows_attribute`).
@@ -12,6 +12,10 @@
 //! - `app`: PID resolution + window raising.
 //! - `find`: text search + element-at-point + element name listing.
 //! - `ffi`: extern "C" block + AX error/type constants + type aliases.
+//!
+//! This `mod.rs` only owns the `AXRef` retained handle (the type that
+//! ties together every typed-seam consumer); everything else is a
+//! re-export.
 
 mod app;
 mod attr;
@@ -24,21 +28,13 @@ mod tree;
 // `crate::macos::ax::*`; the module surface stays flat.
 pub use app::raise_windows;
 pub use dispatch::AXDispatchError;
-pub use find::{element_at_point, list_element_names};
+pub use find::{element_at_point, find_text, list_element_names};
 pub use tree::collect_ax_tree_indexed;
 pub(crate) use dispatch::{press_element, select_rows_attribute, set_value_attribute};
 pub(crate) use tree::{ancestor_role_chain, element_bbox};
 
-use super::ocr::{TextBounds, TextMatch};
-use core_foundation::base::{CFType, TCFType};
-use core_foundation::boolean::CFBoolean;
-use core_foundation::string::CFString;
-use core_graphics::geometry::{CGPoint, CGSize};
-use std::ffi::c_void;
-use std::ptr;
+use ffi::AXUIElementRef;
 use std::sync::Arc;
-
-use ffi::*;
 
 pub(super) const MAX_DEPTH: u32 = 50;
 pub(super) const MAX_ELEMENTS: usize = 10_000;
@@ -105,164 +101,6 @@ impl AXRef {
     /// borrow — the lifetime is bound to `&self`.
     pub(crate) fn as_raw(&self) -> AXUIElementRef {
         self.0 .0
-    }
-}
-
-/// Find text in UI elements of an app's accessibility tree.
-///
-/// Searches the accessibility tree for elements whose AXTitle, AXValue, or
-/// AXDescription contains the search string (case-insensitive).
-/// Returns matching elements with screen coordinates for clicking.
-pub fn find_text(search: &str, window_id: Option<u32>) -> Result<Vec<TextMatch>, String> {
-    let debug = std::env::var("NATIVE_DEVTOOLS_DEBUG").is_ok();
-
-    let pid = match window_id {
-        Some(wid) => app::pid_for_window(wid)?,
-        None => app::frontmost_pid()?,
-    };
-
-    if debug {
-        eprintln!(
-            "[DEBUG ax::find_text] search='{}', window_id={:?}, pid={}",
-            search, window_id, pid
-        );
-    }
-
-    let app_element = unsafe { AXUIElementCreateApplication(pid) };
-    if app_element.is_null() {
-        return Err(format!("Failed to create AXUIElement for pid {}", pid));
-    }
-
-    let search_lower = search.to_lowercase();
-    let mut matches = Vec::new();
-    let mut element_count: usize = 0;
-
-    unsafe {
-        tree::walk_ax_tree(app_element, &mut element_count, 0, &mut |element| {
-            // `.ok().flatten()` is the project-wide convention for re-conflating
-            // attr::* `Result<Option<T>, AxError>` into the legacy Option<T>
-            // shape — Err (FFI / Decode failure) collapses to None alongside
-            // legitimately-absent values, matching prior `get_string_attribute`
-            // behavior. See ax::attr module docs.
-            let matched_text = ["AXTitle", "AXValue", "AXDescription"]
-                .iter()
-                .filter_map(|attr| attr::string(element, attr).ok().flatten())
-                .find(|s| !s.is_empty() && s.to_lowercase().contains(search_lower.as_str()));
-
-            if let Some(text) = matched_text {
-                let position = attr::point(element, "AXPosition").ok().flatten();
-                let size = attr::size(element, "AXSize").ok().flatten();
-                if let (Some(position), Some(size)) = (position, size) {
-                    if size.width > 0.0 && size.height > 0.0 {
-                        let role = attr::string(element, "AXRole").ok().flatten();
-                        let bounds = TextBounds {
-                            x: position.x,
-                            y: position.y,
-                            width: size.width,
-                            height: size.height,
-                        };
-                        matches.push(TextMatch {
-                            text,
-                            x: bounds.x + bounds.width / 2.0,
-                            y: bounds.y + bounds.height / 2.0,
-                            confidence: 1.0,
-                            bounds,
-                            role,
-                        });
-                    }
-                }
-            }
-        });
-        core_foundation::base::CFRelease(app_element as core_foundation::base::CFTypeRef);
-    }
-
-    if debug {
-        eprintln!(
-            "[DEBUG ax::find_text] found {} matches out of {} elements",
-            matches.len(),
-            element_count
-        );
-    }
-
-    Ok(matches)
-}
-
-/// Get a string attribute from an AX element. Returns None if the attribute
-/// doesn't exist or isn't a string.
-///
-/// Dead at the call-site level after step 5; deleted in step 8 once
-/// `raise_windows`'s AXWindows read and `ax_parent` both route through
-/// the seam. `#[allow(dead_code)]` is intentional and bounded.
-#[allow(dead_code)]
-unsafe fn get_string_attribute(element: AXUIElementRef, attr_name: &str) -> Option<String> {
-    let attr = CFString::new(attr_name);
-    let mut value_ref: core_foundation::base::CFTypeRef = ptr::null();
-    let err = AXUIElementCopyAttributeValue(element, attr.as_concrete_TypeRef(), &mut value_ref);
-
-    if err != K_AX_ERROR_SUCCESS || value_ref.is_null() {
-        return None;
-    }
-
-    // value_ref is owned (create rule) — wrap it so it gets released.
-    // downcast_into consumes cf_value, avoiding an extra retain/release cycle.
-    let cf_string = CFType::wrap_under_create_rule(value_ref).downcast_into::<CFString>()?;
-    Some(cf_string.to_string())
-}
-
-/// Get a boolean attribute from an AX element. Returns None if the attribute
-/// doesn't exist or isn't a CFBoolean.
-#[allow(dead_code)]
-unsafe fn get_bool_attribute(element: AXUIElementRef, attr_name: &str) -> Option<bool> {
-    let attr = CFString::new(attr_name);
-    let mut value_ref: core_foundation::base::CFTypeRef = ptr::null();
-    let err = AXUIElementCopyAttributeValue(element, attr.as_concrete_TypeRef(), &mut value_ref);
-
-    if err != K_AX_ERROR_SUCCESS || value_ref.is_null() {
-        return None;
-    }
-
-    // value_ref is owned (create rule) — wrap it so it gets released.
-    let cf_bool = CFType::wrap_under_create_rule(value_ref).downcast_into::<CFBoolean>()?;
-    Some(bool::from(cf_bool))
-}
-
-/// Get position (CGPoint) and size (CGSize) of an AX element.
-/// Returns None if either attribute is missing.
-#[allow(dead_code)]
-unsafe fn get_position_and_size(element: AXUIElementRef) -> Option<(CGPoint, CGSize)> {
-    let position: CGPoint = get_ax_value(element, "AXPosition", K_AX_VALUE_TYPE_CGPOINT)?;
-    let size: CGSize = get_ax_value(element, "AXSize", K_AX_VALUE_TYPE_CGSIZE)?;
-    Some((position, size))
-}
-
-/// Extract a typed value (CGPoint or CGSize) from an AXValue attribute.
-#[allow(dead_code)]
-unsafe fn get_ax_value<T: Default>(
-    element: AXUIElementRef,
-    attr_name: &str,
-    ax_value_type: u32,
-) -> Option<T> {
-    let attr = CFString::new(attr_name);
-    let mut value_ref: core_foundation::base::CFTypeRef = ptr::null();
-    let err = AXUIElementCopyAttributeValue(element, attr.as_concrete_TypeRef(), &mut value_ref);
-
-    if err != K_AX_ERROR_SUCCESS || value_ref.is_null() {
-        return None;
-    }
-
-    let mut result = T::default();
-    let ok = AXValueGetValue(
-        value_ref as AXValueRef,
-        ax_value_type,
-        &mut result as *mut T as *mut c_void,
-    );
-
-    core_foundation::base::CFRelease(value_ref);
-
-    if ok {
-        Some(result)
-    } else {
-        None
     }
 }
 
@@ -376,43 +214,6 @@ mod tests {
         );
 
         assert!(result.get("role").is_some(), "Should have a role");
-    }
-
-    #[test]
-    fn ax_dispatch_error_from_press_code() {
-        // kAXErrorSuccess
-        assert!(AXDispatchError::from_press_code(0).is_none());
-        // kAXErrorActionUnsupported = -25206
-        assert!(matches!(
-            AXDispatchError::from_press_code(-25206),
-            Some(AXDispatchError::NotDispatchable)
-        ));
-        // Any other non-zero code is a generic AXError.
-        match AXDispatchError::from_press_code(-25204) {
-            Some(AXDispatchError::AxError(-25204)) => (),
-            other => panic!("expected AxError(-25204), got {:?}", other),
-        }
-    }
-
-    #[test]
-    fn ax_dispatch_error_from_set_value_code() {
-        // Success
-        assert!(AXDispatchError::from_set_value_code(0).is_none());
-        // kAXErrorAttributeUnsupported = -25205
-        assert!(matches!(
-            AXDispatchError::from_set_value_code(-25205),
-            Some(AXDispatchError::NotDispatchable)
-        ));
-        // kAXErrorIllegalArgument = -25204
-        assert!(matches!(
-            AXDispatchError::from_set_value_code(-25204),
-            Some(AXDispatchError::NotDispatchable)
-        ));
-        // Anything else is generic.
-        match AXDispatchError::from_set_value_code(-25212) {
-            Some(AXDispatchError::AxError(-25212)) => (),
-            other => panic!("expected AxError(-25212), got {:?}", other),
-        }
     }
 
     /// Calculator has well-known bbox attributes on its buttons. Smoke test that

@@ -11,7 +11,86 @@ use super::ffi::{
     AXUIElementRef, K_AX_ERROR_SUCCESS,
 };
 use super::tree::{hit_test_tree, walk_ax_tree};
+use crate::macos::ocr::{TextBounds, TextMatch};
 use std::ptr;
+
+/// Find text in UI elements of an app's accessibility tree.
+///
+/// Searches the accessibility tree for elements whose AXTitle, AXValue, or
+/// AXDescription contains the search string (case-insensitive).
+/// Returns matching elements with screen coordinates for clicking.
+pub fn find_text(search: &str, window_id: Option<u32>) -> Result<Vec<TextMatch>, String> {
+    let debug = std::env::var("NATIVE_DEVTOOLS_DEBUG").is_ok();
+
+    let pid = match window_id {
+        Some(wid) => pid_for_window(wid)?,
+        None => frontmost_pid()?,
+    };
+
+    if debug {
+        eprintln!(
+            "[DEBUG ax::find_text] search='{}', window_id={:?}, pid={}",
+            search, window_id, pid
+        );
+    }
+
+    let app_element = unsafe { AXUIElementCreateApplication(pid) };
+    if app_element.is_null() {
+        return Err(format!("Failed to create AXUIElement for pid {}", pid));
+    }
+
+    let search_lower = search.to_lowercase();
+    let mut matches = Vec::new();
+    let mut element_count: usize = 0;
+
+    unsafe {
+        walk_ax_tree(app_element, &mut element_count, 0, &mut |element| {
+            // `.ok().flatten()` is the project-wide convention for re-conflating
+            // attr::* `Result<Option<T>, AxError>` into the legacy Option<T>
+            // shape — Err (FFI / Decode failure) collapses to None alongside
+            // legitimately-absent values. See ax::attr module docs.
+            let matched_text = ["AXTitle", "AXValue", "AXDescription"]
+                .iter()
+                .filter_map(|key| attr::string(element, key).ok().flatten())
+                .find(|s| !s.is_empty() && s.to_lowercase().contains(search_lower.as_str()));
+
+            if let Some(text) = matched_text {
+                let position = attr::point(element, "AXPosition").ok().flatten();
+                let size = attr::size(element, "AXSize").ok().flatten();
+                if let (Some(position), Some(size)) = (position, size) {
+                    if size.width > 0.0 && size.height > 0.0 {
+                        let role = attr::string(element, "AXRole").ok().flatten();
+                        let bounds = TextBounds {
+                            x: position.x,
+                            y: position.y,
+                            width: size.width,
+                            height: size.height,
+                        };
+                        matches.push(TextMatch {
+                            text,
+                            x: bounds.x + bounds.width / 2.0,
+                            y: bounds.y + bounds.height / 2.0,
+                            confidence: 1.0,
+                            bounds,
+                            role,
+                        });
+                    }
+                }
+            }
+        });
+        core_foundation::base::CFRelease(app_element as core_foundation::base::CFTypeRef);
+    }
+
+    if debug {
+        eprintln!(
+            "[DEBUG ax::find_text] found {} matches out of {} elements",
+            matches.len(),
+            element_count
+        );
+    }
+
+    Ok(matches)
+}
 
 /// Container roles where `AXUIElementCopyElementAtPosition` may stop too
 /// early (e.g. Electron/Chromium web views). When the hit element has one of
