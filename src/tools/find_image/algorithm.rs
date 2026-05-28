@@ -10,7 +10,7 @@ use crate::tools::find_image::params::{
     normalize_rotation, validate_scale_range, BoundingBox, FindImageParams, FindImageResponse,
     MatchResult, ModeDefaults, Point, ScaleRange, SearchRegion,
 };
-use crate::tools::find_image::source::Caches;
+use crate::tools::find_image::source::{Caches, ImageSource, Miss, RawImageBytes};
 use crate::tools::find_image::transform::{
     decode_base64_to_gray, decode_png_to_gray, extract_region, resize_image, rotate_image,
 };
@@ -43,8 +43,11 @@ fn get_thread_pool() -> &'static rayon::ThreadPool {
 
 /// Input data for the blocking matching operation.
 pub(super) struct MatchingInput {
-    pub(super) screenshot_png_data: Option<Vec<u8>>,
-    pub(super) screenshot_b64: Option<String>,
+    /// Screenshot bytes after the source-seam resolve.
+    ///
+    /// `None` means neither `screenshot_id` was usable nor base64 was
+    /// provided — `run_matching` will then emit the hard error.
+    pub(super) screenshot_bytes: Option<RawImageBytes>,
     pub(super) template_png_data: Option<Vec<u8>>,
     pub(super) template_b64: Option<String>,
     pub(super) mask_png_data: Option<Vec<u8>>,
@@ -83,7 +86,8 @@ pub(super) enum MatchingResult {
 
 /// Execute the find_image tool.
 pub(super) async fn find_image(params: FindImageParams, caches: Caches) -> CallToolResult {
-    let screenshot_cache = &caches.screenshot;
+    // Template/mask paths still take the cache directly; step 3/4 move them
+    // to the seam. Screenshot already routes through `caches` via the seam.
     let image_cache = &caches.image;
     let defaults = ModeDefaults::for_mode(&params.mode);
     let mut warning: Option<String> = None;
@@ -140,22 +144,36 @@ pub(super) async fn find_image(params: FindImageParams, caches: Caches) -> CallT
         }
     }
 
-    // Resolve screenshot data from cache - clone bytes and release lock before decode
-    let (screenshot_png_data, screenshot_metadata) = {
-        if let Some(id) = &params.screenshot_id {
-            let cache_guard = screenshot_cache.read().await;
-            if let Some(cached) = cache_guard.peek(id) {
-                // Clone the data so we can release the lock
-                (Some(cached.png_data.clone()), Some(cached.metadata.clone()))
-            } else {
-                warning = Some(format!("Screenshot ID '{}' not found in cache", id));
+    // Resolve screenshot via the source seam. Lock release happens inside
+    // `fetch`, before we ever touch the template/mask caches.
+    //
+    // Screenshot policy is special: an id miss DOES NOT short-circuit
+    // here — it emits a warning and leaves `screenshot_bytes = None`,
+    // so the screenshot_image_base64 fallback (if any) gets tried, and
+    // if that's also absent `run_matching` produces the hard error
+    // "Either screenshot_id or screenshot_image_base64 must be provided".
+    let (screenshot_bytes, screenshot_metadata) = match params.screenshot_id.as_ref() {
+        Some(id) => match ImageSource::Screenshot(id.clone()).fetch(&caches).await {
+            Ok(resolved) => (Some(resolved.bytes), resolved.meta.screenshot),
+            Err(Miss::Error(warn_text)) => {
+                warning = Some(warn_text);
                 (None, None)
             }
-        } else {
-            (None, None)
-        }
+            Err(Miss::FallbackWithWarning(..)) => unreachable!(
+                "screenshot fetch never produces FallbackWithWarning at this call site"
+            ),
+        },
+        None => (None, None),
     };
-    // Lock is now released
+
+    // base64 fallback when the id slot didn't yield bytes — preserves
+    // priority of cache hit over inline base64.
+    let screenshot_bytes = screenshot_bytes.or_else(|| {
+        params
+            .screenshot_image_base64
+            .clone()
+            .map(RawImageBytes::Base64)
+    });
 
     // Resolve template data from image cache
     // Use write lock to update LRU access order via get()
@@ -216,8 +234,7 @@ pub(super) async fn find_image(params: FindImageParams, caches: Caches) -> CallT
     // Prepare input for blocking operation
     let is_fast_mode = params.mode != "accurate";
     let input = MatchingInput {
-        screenshot_png_data,
-        screenshot_b64: params.screenshot_image_base64.clone(),
+        screenshot_bytes,
         template_png_data,
         template_b64: params.template_image_base64.clone(),
         mask_png_data,
@@ -424,23 +441,25 @@ pub(super) fn process_work_item(
 
 /// CPU-intensive matching logic, runs on a blocking thread.
 pub(super) fn run_matching(input: MatchingInput) -> MatchingResult {
-    // Decode screenshot
-    let (screenshot_gray, screenshot_metadata) = if let Some(png_data) = input.screenshot_png_data {
-        match decode_png_to_gray(&png_data) {
+    // Decode screenshot via the seam. Error literals preserved byte-for-byte
+    // from the pre-seam paths: cache-derived bytes report "Failed to decode
+    // cached screenshot", inline base64 reports "Failed to decode screenshot".
+    let (screenshot_gray, screenshot_metadata) = match input.screenshot_bytes {
+        Some(RawImageBytes::Png(bytes)) => match RawImageBytes::Png(bytes).decode() {
             Ok(gray) => (gray, input.screenshot_metadata),
             Err(e) => {
                 return MatchingResult::Error(format!("Failed to decode cached screenshot: {}", e))
             }
-        }
-    } else if let Some(b64) = &input.screenshot_b64 {
-        match decode_base64_to_gray(b64) {
+        },
+        Some(RawImageBytes::Base64(b64)) => match RawImageBytes::Base64(b64).decode() {
             Ok(gray) => (gray, None),
             Err(e) => return MatchingResult::Error(format!("Failed to decode screenshot: {}", e)),
+        },
+        None => {
+            return MatchingResult::Error(
+                "Either screenshot_id or screenshot_image_base64 must be provided".to_string(),
+            );
         }
-    } else {
-        return MatchingResult::Error(
-            "Either screenshot_id or screenshot_image_base64 must be provided".to_string(),
-        );
     };
 
     // Decode template image (prefer cached PNG data over base64)
