@@ -39,26 +39,49 @@ pub async fn cdp_wait_for(
     let raw_timeout = timeout_ms.unwrap_or(10_000).min(MAX_WAIT_TIMEOUT_MS);
     let timeout = std::time::Duration::from_millis(raw_timeout);
     let poll_interval = std::time::Duration::from_millis(500);
-    let start = std::time::Instant::now();
-
-    // Build JS check: resolves true when any of the texts appear in the page body.
-    // serde_json::to_string on Vec<String> is infallible.
     let texts_json = serde_json::to_string(&texts).unwrap();
+
+    let header = match wait_page_text(&texts_json, timeout, poll_interval, &cdp_client).await {
+        Ok(header) => header,
+        Err(result) => return result,
+    };
+
+    if !include_snapshot {
+        return CallToolResult::success(vec![Content::text(header)]);
+    }
+    // Smaller cap than the user-facing default: cdp_wait_for is
+    // typically followed by a targeted cdp_find_elements, so a
+    // lightweight snapshot is enough to show what appeared.
+    let mut result = cdp_take_dom_snapshot(Some(100), cdp_client.clone()).await;
+    result.content.insert(0, Content::text(header));
+    result
+}
+
+/// Page-text polling. Re-acquires the CDP RwLock per iteration so
+/// concurrent CDP work can interleave between sleeps (load-bearing).
+/// Returns the canonical success line, or an error result.
+async fn wait_page_text(
+    texts_json: &str,
+    timeout: std::time::Duration,
+    poll_interval: std::time::Duration,
+    cdp_client: &Arc<RwLock<Option<CdpClient>>>,
+) -> Result<String, CallToolResult> {
     let check_js = format!(
         "document.body && {}.some(t => document.body.innerText.includes(t))",
         texts_json
     );
+    let start = std::time::Instant::now();
 
     loop {
         let found = {
             let guard = cdp_client.read().await;
             let client = match guard.as_ref() {
                 Some(c) => c,
-                None => return cdp_error("No CDP connection. Use cdp_connect first."),
+                None => return Err(cdp_error("No CDP connection. Use cdp_connect first.")),
             };
             let page = match client.require_page() {
                 Ok(p) => p,
-                Err(e) => return e,
+                Err(e) => return Err(e),
             };
 
             let mut eval_params = EvaluateParams::new(&check_js);
@@ -78,24 +101,15 @@ pub async fn cdp_wait_for(
 
         if found {
             let elapsed_ms = start.elapsed().as_millis();
-            let header = format!("Text appeared after {}ms: {}", elapsed_ms, texts_json);
-            if !include_snapshot {
-                return CallToolResult::success(vec![Content::text(header)]);
-            }
-            // Smaller cap than the user-facing default: cdp_wait_for is
-            // typically followed by a targeted cdp_find_elements, so a
-            // lightweight snapshot is enough to show what appeared.
-            let mut result = cdp_take_dom_snapshot(Some(100), cdp_client.clone()).await;
-            result.content.insert(0, Content::text(header));
-            return result;
+            return Ok(format!("Text appeared after {}ms: {}", elapsed_ms, texts_json));
         }
 
         if start.elapsed() >= timeout {
-            return cdp_error(format!(
+            return Err(cdp_error(format!(
                 "Timed out after {}ms waiting for text: {}",
                 timeout.as_millis(),
                 texts_json
-            ));
+            )));
         }
 
         tokio::time::sleep(poll_interval).await;
