@@ -94,6 +94,9 @@ pub struct ToolRegistry {
 
 impl ToolRegistry {
     /// Build the registry. `#[cfg]` guards mirror today's getters exactly.
+    // Sequential pushes (not a `vec![]` literal) so `#[cfg]` blocks can gate
+    // platform/feature-specific handlers inline.
+    #[allow(clippy::vec_init_then_push)]
     pub fn build() -> Self {
         #[allow(unused_mut)]
         let mut tools: Vec<Box<dyn ToolHandler>> = Vec::new();
