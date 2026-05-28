@@ -1,22 +1,19 @@
 //! CPU-bound matching algorithm for `find_image`.
 //!
-//! Hosts the orchestrator (`find_image`), the blocking `run_matching` loop,
-//! work-item construction, per-position NCC (scalar + optional SIMD), and the
-//! `MatchingInput` / `MatchingResult` structs that cross the
-//! `spawn_blocking` boundary.
+//! Owns the blocking `run_matching` pipeline (region crop → optional
+//! downscale → rotated templates → work items → NCC → NMS), the SIMD
+//! and scalar NCC kernels, and the `MatchRequest` / `MatchOutcome`
+//! contract that crosses the `spawn_blocking` boundary.
+//!
+//! Decode (PNG/Base64 → `GrayImage`) and the async resolve flow live
+//! in `handler::execute`; this file does not touch caches, params, or
+//! locks. The handler hands us already-decoded `GrayImage`s.
 
 use crate::tools::find_image::nms::non_maximum_suppression;
-use crate::tools::find_image::params::{
-    normalize_rotation, validate_scale_range, BoundingBox, FindImageParams, FindImageResponse,
-    MatchResult, ModeDefaults, Point, ScaleRange, SearchRegion,
-};
-use crate::tools::find_image::source::{
-    resolve_slot, Caches, ImageSource, Miss, RawImageBytes, SlotInput, SlotKind,
-};
+use crate::tools::find_image::params::{BoundingBox, MatchResult, Point, ScaleRange, SearchRegion};
 use crate::tools::find_image::transform::{extract_region, resize_image, rotate_image};
 use crate::tools::screenshot_cache::ScreenshotMetadata;
 use image::GrayImage;
-use rmcp::model::{CallToolResult, Content};
 use std::borrow::Cow;
 
 #[cfg(feature = "find_image_parallel")]
@@ -41,21 +38,17 @@ fn get_thread_pool() -> &'static rayon::ThreadPool {
     })
 }
 
-/// Input data for the blocking matching operation.
-pub(super) struct MatchingInput {
-    /// Screenshot bytes after the source-seam resolve.
-    ///
-    /// `None` means neither `screenshot_id` was usable nor base64 was
-    /// provided — `run_matching` will then emit the hard error.
-    pub(super) screenshot_bytes: Option<RawImageBytes>,
-    /// Template bytes after the source-seam resolve. `None` is invalid
-    /// — the resolve site rejects empty template requests before we
-    /// build this struct.
-    pub(super) template_bytes: Option<RawImageBytes>,
-    /// Mask bytes after the source-seam resolve. `None` means no mask
-    /// requested; `Some` means the resolver produced bytes from cache
-    /// or base64 fallback.
-    pub(super) mask_bytes: Option<RawImageBytes>,
+/// Already-decoded inputs `run_matching` needs to do its work.
+///
+/// The handler resolves cache lookups and decodes PNG/Base64 to
+/// `GrayImage` BEFORE constructing this — the algorithm is decoupled
+/// from `Caches`, `ImageSource`, and `RawImageBytes`, which means it
+/// can be exercised in unit tests with hand-built gradient images.
+pub(super) struct MatchRequest {
+    pub(super) screenshot: GrayImage,
+    pub(super) template: GrayImage,
+    pub(super) mask: Option<GrayImage>,
+    pub(super) screenshot_meta: Option<ScreenshotMetadata>,
     pub(super) search_region: Option<SearchRegion>,
     pub(super) threshold: f64,
     pub(super) max_results: usize,
@@ -63,7 +56,6 @@ pub(super) struct MatchingInput {
     pub(super) stride: u32,
     pub(super) rotations: Vec<f64>,
     pub(super) return_screen_coords: bool,
-    pub(super) screenshot_metadata: Option<ScreenshotMetadata>,
     /// Whether this is "fast" mode (enables downscaling and early exit).
     pub(super) is_fast_mode: bool,
 }
@@ -82,187 +74,12 @@ pub(super) struct RotatedTemplates {
     pub(super) mask: Option<GrayImage>,
 }
 
-/// Result from the blocking matching operation.
-pub(super) enum MatchingResult {
+/// Outcome of `run_matching`. `Error` carries a user-facing message
+/// (e.g. the mask-dimension-mismatch literal); `Success` carries the
+/// final NMS-filtered match list.
+pub(super) enum MatchOutcome {
     Success(Vec<MatchResult>),
     Error(String),
-}
-
-/// Execute the find_image tool.
-pub(super) async fn find_image(params: FindImageParams, caches: Caches) -> CallToolResult {
-    // All three slots (screenshot / template / mask) now resolve through
-    // the source seam; `caches` is consumed by ImageSource::fetch and
-    // resolve_slot, never touched directly here.
-    let defaults = ModeDefaults::for_mode(&params.mode);
-    let mut warning: Option<String> = None;
-
-    // Get parameters with mode defaults (cheap, keep on async thread)
-    let threshold = params.threshold.unwrap_or(defaults.threshold);
-    let max_results = params.max_results.unwrap_or(defaults.max_results);
-    let scales = params.scales.clone().unwrap_or(defaults.scales);
-    let stride = params.stride.unwrap_or(defaults.stride);
-    let rotations = params.rotations.clone().unwrap_or_else(|| vec![0.0]);
-
-    // Validate scale range to prevent infinite loops and degenerate cases
-    if let Err(e) = validate_scale_range(&scales) {
-        return CallToolResult::error(vec![Content::text(e)]);
-    }
-
-    // Validate, filter, and normalize rotations to exact {0, 90, 180, 270}
-    let mut normalized_rotations = Vec::new();
-    let mut invalid_rotations = Vec::new();
-
-    for r in rotations {
-        match normalize_rotation(r) {
-            Some(exact) => {
-                if !normalized_rotations.contains(&exact) {
-                    normalized_rotations.push(exact);
-                }
-            }
-            None => invalid_rotations.push(r),
-        }
-    }
-
-    // Treat empty rotations as [0]
-    let rotations = if normalized_rotations.is_empty() {
-        vec![0.0]
-    } else {
-        normalized_rotations
-    };
-
-    // Warn about unsupported rotations
-    if !invalid_rotations.is_empty() {
-        let msg = format!(
-            "Unsupported rotation angles ignored (only 0, 90, 180, 270 supported): {:?}",
-            invalid_rotations
-        );
-        warning = Some(warning.map_or(msg.clone(), |w| format!("{}; {}", w, msg)));
-    }
-
-    // Validate search_region dimensions
-    if let Some(region) = &params.search_region {
-        if region.w == 0 || region.h == 0 {
-            return CallToolResult::error(vec![Content::text(
-                "search_region width and height must be positive",
-            )]);
-        }
-    }
-
-    // Resolve screenshot via the source seam. Lock release happens inside
-    // `fetch`, before we ever touch the template/mask caches.
-    //
-    // Screenshot policy is special: an id miss DOES NOT short-circuit
-    // here — it emits a warning and leaves `screenshot_bytes = None`,
-    // so the screenshot_image_base64 fallback (if any) gets tried, and
-    // if that's also absent `run_matching` produces the hard error
-    // "Either screenshot_id or screenshot_image_base64 must be provided".
-    let (screenshot_bytes, screenshot_metadata) = match params.screenshot_id.as_ref() {
-        Some(id) => match ImageSource::Screenshot(id.clone()).fetch(&caches).await {
-            Ok(resolved) => (Some(resolved.bytes), resolved.meta.screenshot),
-            Err(Miss::Error(warn_text)) => {
-                warning = Some(warn_text);
-                (None, None)
-            }
-            Err(Miss::FallbackWithWarning(..)) => unreachable!(
-                "screenshot fetch never produces FallbackWithWarning at this call site"
-            ),
-        },
-        None => (None, None),
-    };
-
-    // base64 fallback when the id slot didn't yield bytes — preserves
-    // priority of cache hit over inline base64.
-    let screenshot_bytes = screenshot_bytes.or_else(|| {
-        params
-            .screenshot_image_base64
-            .clone()
-            .map(RawImageBytes::Base64)
-    });
-
-    // Resolve template via the source seam. Image cache uses a WRITE
-    // lock + get() inside Image::fetch so LRU access order still bumps
-    // exactly when a stored template is consumed.
-    let template_slot = SlotInput {
-        primary: params.template_id.clone().map(ImageSource::Image),
-        fallback_b64: params
-            .template_image_base64
-            .clone()
-            .map(ImageSource::Base64),
-    };
-    let template_bytes = match resolve_slot(template_slot, SlotKind::Template, &caches).await {
-        Ok((resolved, warn_msg)) => {
-            if let Some(msg) = warn_msg {
-                warning = Some(warning.map_or(msg.clone(), |w| format!("{}; {}", w, msg)));
-            }
-            resolved.map(|r| r.bytes)
-        }
-        Err(hard_error) => {
-            return CallToolResult::error(vec![Content::text(hard_error)]);
-        }
-    };
-
-    // Resolve mask via the source seam. Same WRITE-lock + LRU-bump
-    // semantics as the template slot; resolve_slot enforces the
-    // identical 'primary id → fallback b64 with warning → hard error'
-    // policy with the literals reformatted for the Mask label.
-    let mask_slot = SlotInput {
-        primary: params.mask_id.clone().map(ImageSource::Image),
-        fallback_b64: params.mask_image_base64.clone().map(ImageSource::Base64),
-    };
-    let mask_bytes = match resolve_slot(mask_slot, SlotKind::Mask, &caches).await {
-        Ok((resolved, warn_msg)) => {
-            if let Some(msg) = warn_msg {
-                warning = Some(warning.map_or(msg.clone(), |w| format!("{}; {}", w, msg)));
-            }
-            resolved.map(|r| r.bytes)
-        }
-        Err(hard_error) => {
-            return CallToolResult::error(vec![Content::text(hard_error)]);
-        }
-    };
-
-    // Validate that we have a template source
-    if params.template_id.is_none() && params.template_image_base64.is_none() {
-        return CallToolResult::error(vec![Content::text(
-            "Either template_id or template_image_base64 must be provided",
-        )]);
-    }
-
-    // Prepare input for blocking operation
-    let is_fast_mode = params.mode != "accurate";
-    let input = MatchingInput {
-        screenshot_bytes,
-        template_bytes,
-        mask_bytes,
-        search_region: params.search_region.clone(),
-        threshold,
-        max_results,
-        scales,
-        stride,
-        rotations,
-        return_screen_coords: params.return_screen_coords,
-        screenshot_metadata,
-        is_fast_mode,
-    };
-
-    // Move heavy CPU work to a blocking thread
-    let result = tokio::task::spawn_blocking(move || run_matching(input))
-        .await
-        .unwrap_or_else(|e| MatchingResult::Error(format!("Task panicked: {}", e)));
-
-    match result {
-        MatchingResult::Success(matches) => {
-            let response = FindImageResponse { matches, warning };
-            match serde_json::to_string_pretty(&response) {
-                Ok(json) => CallToolResult::success(vec![Content::text(json)]),
-                Err(e) => CallToolResult::error(vec![Content::text(format!(
-                    "Failed to serialize response: {}",
-                    e
-                ))]),
-            }
-        }
-        MatchingResult::Error(e) => CallToolResult::error(vec![Content::text(e)]),
-    }
 }
 
 /// Compute the downscale factor for fast mode.
@@ -434,76 +251,32 @@ pub(super) fn process_work_item(
     Some(results)
 }
 
-/// CPU-intensive matching logic, runs on a blocking thread.
-pub(super) fn run_matching(input: MatchingInput) -> MatchingResult {
-    // Decode screenshot via the seam. Error literals preserved byte-for-byte
-    // from the pre-seam paths: cache-derived bytes report "Failed to decode
-    // cached screenshot", inline base64 reports "Failed to decode screenshot".
-    let (screenshot_gray, screenshot_metadata) = match input.screenshot_bytes {
-        Some(RawImageBytes::Png(bytes)) => match RawImageBytes::Png(bytes).decode() {
-            Ok(gray) => (gray, input.screenshot_metadata),
-            Err(e) => {
-                return MatchingResult::Error(format!("Failed to decode cached screenshot: {}", e))
-            }
-        },
-        Some(RawImageBytes::Base64(b64)) => match RawImageBytes::Base64(b64).decode() {
-            Ok(gray) => (gray, None),
-            Err(e) => return MatchingResult::Error(format!("Failed to decode screenshot: {}", e)),
-        },
-        None => {
-            return MatchingResult::Error(
-                "Either screenshot_id or screenshot_image_base64 must be provided".to_string(),
-            );
-        }
-    };
-
-    // Decode template via the seam. Failure literals preserved:
-    // cache-derived bytes → "Failed to decode cached template";
-    // inline base64 → "Failed to decode template image". The hard
-    // error "Either template_id or template_image_base64 must be
-    // provided" still fires here — the resolve site validates that
-    // shape before reaching run_matching, but we keep the guard for
-    // defence in depth.
-    let template_gray = match input.template_bytes {
-        Some(RawImageBytes::Png(bytes)) => match RawImageBytes::Png(bytes).decode() {
-            Ok(img) => img,
-            Err(e) => {
-                return MatchingResult::Error(format!("Failed to decode cached template: {}", e))
-            }
-        },
-        Some(RawImageBytes::Base64(b64)) => match RawImageBytes::Base64(b64).decode() {
-            Ok(img) => img,
-            Err(e) => {
-                return MatchingResult::Error(format!("Failed to decode template image: {}", e))
-            }
-        },
-        None => {
-            return MatchingResult::Error(
-                "Either template_id or template_image_base64 must be provided".to_string(),
-            );
-        }
-    };
-
-    // Decode mask via the seam. Failure literals preserved:
-    // cache-derived → 'Failed to decode cached mask';
-    // inline base64 → 'Failed to decode mask image'.
-    let mask = match input.mask_bytes {
-        Some(RawImageBytes::Png(bytes)) => match RawImageBytes::Png(bytes).decode() {
-            Ok(img) => Some(img),
-            Err(e) => return MatchingResult::Error(format!("Failed to decode cached mask: {}", e)),
-        },
-        Some(RawImageBytes::Base64(b64)) => match RawImageBytes::Base64(b64).decode() {
-            Ok(img) => Some(img),
-            Err(e) => return MatchingResult::Error(format!("Failed to decode mask image: {}", e)),
-        },
-        None => None,
-    };
+/// CPU-intensive matching pipeline, runs on a blocking thread.
+///
+/// The handler decodes images and resolves caches before calling this;
+/// the only error this path emits today is the mask-dimension-mismatch
+/// literal — preserved verbatim from the pre-split code.
+pub(super) fn run_matching(req: MatchRequest) -> MatchOutcome {
+    let MatchRequest {
+        screenshot: screenshot_gray,
+        template: template_gray,
+        mask,
+        screenshot_meta: screenshot_metadata,
+        search_region,
+        threshold,
+        max_results,
+        scales,
+        stride,
+        rotations,
+        return_screen_coords,
+        is_fast_mode,
+    } = req;
 
     // Validate mask dimensions match template
     if let Some(mask_img) = &mask {
         if mask_img.width() != template_gray.width() || mask_img.height() != template_gray.height()
         {
-            return MatchingResult::Error(format!(
+            return MatchOutcome::Error(format!(
                 "Mask dimensions ({}x{}) must match template dimensions ({}x{})",
                 mask_img.width(),
                 mask_img.height(),
@@ -514,7 +287,7 @@ pub(super) fn run_matching(input: MatchingInput) -> MatchingResult {
     }
 
     // Extract search region if specified (use Cow to avoid cloning large screenshot)
-    let (search_img_region, region_offset) = if let Some(region) = &input.search_region {
+    let (search_img_region, region_offset) = if let Some(region) = &search_region {
         (
             Cow::Owned(extract_region(&screenshot_gray, region)),
             (region.x, region.y),
@@ -524,7 +297,7 @@ pub(super) fn run_matching(input: MatchingInput) -> MatchingResult {
     };
 
     // Apply dynamic downscale in fast mode
-    let downscale_factor = if input.is_fast_mode {
+    let downscale_factor = if is_fast_mode {
         compute_downscale_factor(&search_img_region, &template_gray)
     } else {
         1.0
@@ -549,14 +322,9 @@ pub(super) fn run_matching(input: MatchingInput) -> MatchingResult {
     let rotated_templates = build_rotated_templates(
         &template_for_matching,
         mask_for_matching.as_ref(),
-        &input.rotations,
+        &rotations,
     );
-    let work_items = build_work_items(
-        &input.rotations,
-        &input.scales,
-        &rotated_templates,
-        &search_img,
-    );
+    let work_items = build_work_items(&rotations, &scales, &rotated_templates, &search_img);
 
     // Process work items (parallel or sequential based on feature flag)
     #[cfg(feature = "find_image_parallel")]
@@ -571,12 +339,12 @@ pub(super) fn run_matching(input: MatchingInput) -> MatchingResult {
                         &search_img,
                         &rotated.template,
                         rotated.mask.as_ref(),
-                        input.threshold,
-                        input.stride,
+                        threshold,
+                        stride,
                         region_offset,
                         downscale_factor,
                         screenshot_metadata.as_ref(),
-                        input.return_screen_coords,
+                        return_screen_coords,
                     )?;
 
                     Some(matches)
@@ -593,8 +361,8 @@ pub(super) fn run_matching(input: MatchingInput) -> MatchingResult {
         let mut high_conf_matches: Vec<MatchResult> = Vec::new();
 
         // Early exit threshold: stop when we have enough unique high-confidence matches
-        let early_exit_threshold = if input.is_fast_mode {
-            input.threshold.max(0.95)
+        let early_exit_threshold = if is_fast_mode {
+            threshold.max(0.95)
         } else {
             1.1 // Effectively disabled in accurate mode
         };
@@ -606,28 +374,28 @@ pub(super) fn run_matching(input: MatchingInput) -> MatchingResult {
                 &search_img,
                 &rotated.template,
                 rotated.mask.as_ref(),
-                input.threshold,
-                input.stride,
+                threshold,
+                stride,
                 region_offset,
                 downscale_factor,
                 screenshot_metadata.as_ref(),
-                input.return_screen_coords,
+                return_screen_coords,
             ) {
                 Some(item_matches) => {
                     // Track high-confidence matches for early-exit (after NMS)
-                    if input.is_fast_mode {
+                    if is_fast_mode {
                         for m in &item_matches {
                             if m.score >= early_exit_threshold {
                                 high_conf_matches.push(m.clone());
                             }
                         }
-                        if high_conf_matches.len() >= input.max_results {
+                        if high_conf_matches.len() >= max_results {
                             let nms = non_maximum_suppression(
                                 high_conf_matches.clone(),
                                 0.3,
-                                input.max_results,
+                                max_results,
                             );
-                            if nms.len() >= input.max_results {
+                            if nms.len() >= max_results {
                                 break;
                             }
                         }
@@ -650,9 +418,9 @@ pub(super) fn run_matching(input: MatchingInput) -> MatchingResult {
     });
 
     // Apply Non-Maximum Suppression
-    let final_matches = non_maximum_suppression(sorted_matches, 0.3, input.max_results);
+    let final_matches = non_maximum_suppression(sorted_matches, 0.3, max_results);
 
-    MatchingResult::Success(final_matches)
+    MatchOutcome::Success(final_matches)
 }
 
 /// Normalized Cross-Correlation template matching.
@@ -958,14 +726,8 @@ fn compute_ncc_at_simd(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::tools::find_image::params::{FindImageResponse, ScaleRange};
-    use crate::tools::image_cache::{ImageCache, ImageMetadata};
-    use crate::tools::screenshot_cache::ScreenshotCache;
-    use base64::Engine;
-    use image::{GenericImage, Luma};
-    use std::io::Cursor;
-    use std::sync::Arc;
-    use tokio::sync::RwLock;
+    use crate::tools::find_image::params::ScaleRange;
+    use image::Luma;
 
     #[test]
     fn test_ncc_matching_finds_exact_template() {
@@ -1234,453 +996,64 @@ mod tests {
         );
     }
 
-    // ============ Integration tests for template_id / mask_id ============
-
-    /// Create a test PNG in memory and return bytes
-    fn create_test_png_bytes(width: u32, height: u32) -> Vec<u8> {
-        let img = image::DynamicImage::new_rgb8(width, height);
-        let mut cursor = Cursor::new(Vec::new());
-        img.write_to(&mut cursor, image::ImageFormat::Png).unwrap();
-        cursor.into_inner()
-    }
-
-    fn make_image_metadata(width: u32, height: u32) -> ImageMetadata {
-        ImageMetadata {
-            source_path: None,
-            width,
-            height,
-            channels: 3,
-            mime: "image/png".to_string(),
-            sha256: None,
-            is_mask: false,
-        }
-    }
-
-    #[tokio::test]
-    async fn test_find_image_missing_template_id_errors() {
-        let screenshot_cache = Arc::new(RwLock::new(ScreenshotCache::default()));
-        let image_cache = Arc::new(RwLock::new(ImageCache::default()));
-
-        let params = FindImageParams {
-            screenshot_id: None,
-            screenshot_image_base64: Some(
-                base64::engine::general_purpose::STANDARD.encode(create_test_png_bytes(100, 100)),
-            ),
-            template_id: Some("nonexistent-id".to_string()),
-            template_image_base64: None,
-            mask_id: None,
-            mask_image_base64: None,
-            mode: "fast".to_string(),
-            threshold: None,
-            max_results: None,
-            scales: None,
-            rotations: None,
-            search_region: None,
-            stride: None,
-            return_screen_coords: false,
-        };
-
-        let result = find_image(
-            params,
-            Caches {
-                screenshot: screenshot_cache,
-                image: image_cache,
-            },
-        )
-        .await;
-        assert!(result.is_error.unwrap_or(false));
-        // Check error message mentions template ID
-        if let rmcp::model::RawContent::Text(rmcp::model::RawTextContent { text }) =
-            &result.content[0].raw
-        {
-            assert!(text.contains("Template ID") && text.contains("not found"));
-        }
-    }
-
-    #[tokio::test]
-    async fn test_find_image_missing_mask_id_errors() {
-        let screenshot_cache = Arc::new(RwLock::new(ScreenshotCache::default()));
-        let image_cache = Arc::new(RwLock::new(ImageCache::default()));
-
-        // Add a template to the cache
-        {
-            let mut cache = image_cache.write().await;
-            cache.store(
-                create_test_png_bytes(32, 32),
-                make_image_metadata(32, 32),
-                Some("template"),
-            );
-        }
-
-        let params = FindImageParams {
-            screenshot_id: None,
-            screenshot_image_base64: Some(
-                base64::engine::general_purpose::STANDARD.encode(create_test_png_bytes(100, 100)),
-            ),
-            template_id: None,
-            template_image_base64: Some(
-                base64::engine::general_purpose::STANDARD.encode(create_test_png_bytes(16, 16)),
-            ),
-            mask_id: Some("nonexistent-mask".to_string()),
-            mask_image_base64: None,
-            mode: "fast".to_string(),
-            threshold: None,
-            max_results: None,
-            scales: None,
-            rotations: None,
-            search_region: None,
-            stride: None,
-            return_screen_coords: false,
-        };
-
-        let result = find_image(
-            params,
-            Caches {
-                screenshot: screenshot_cache,
-                image: image_cache,
-            },
-        )
-        .await;
-        assert!(result.is_error.unwrap_or(false));
-        // Check error message mentions mask ID
-        if let rmcp::model::RawContent::Text(rmcp::model::RawTextContent { text }) =
-            &result.content[0].raw
-        {
-            assert!(text.contains("Mask ID") && text.contains("not found"));
-        }
-    }
-
-    #[tokio::test]
-    async fn test_find_image_requires_template_source() {
-        let screenshot_cache = Arc::new(RwLock::new(ScreenshotCache::default()));
-        let image_cache = Arc::new(RwLock::new(ImageCache::default()));
-
-        let params = FindImageParams {
-            screenshot_id: None,
-            screenshot_image_base64: Some(
-                base64::engine::general_purpose::STANDARD.encode(create_test_png_bytes(100, 100)),
-            ),
-            template_id: None,
-            template_image_base64: None, // Neither template_id nor template_image_base64
-            mask_id: None,
-            mask_image_base64: None,
-            mode: "fast".to_string(),
-            threshold: None,
-            max_results: None,
-            scales: None,
-            rotations: None,
-            search_region: None,
-            stride: None,
-            return_screen_coords: false,
-        };
-
-        let result = find_image(
-            params,
-            Caches {
-                screenshot: screenshot_cache,
-                image: image_cache,
-            },
-        )
-        .await;
-        assert!(result.is_error.unwrap_or(false));
-        if let rmcp::model::RawContent::Text(rmcp::model::RawTextContent { text }) =
-            &result.content[0].raw
-        {
-            assert!(text.contains("template_id") || text.contains("template_image_base64"));
-        }
-    }
-
-    #[tokio::test]
-    async fn test_find_image_with_template_id_from_cache() {
-        let screenshot_cache = Arc::new(RwLock::new(ScreenshotCache::default()));
-        let image_cache = Arc::new(RwLock::new(ImageCache::default()));
-
-        // Create a pattern with variation (gradient) that NCC can match
-        let mut screenshot_img = image::DynamicImage::new_rgb8(100, 100);
-        // Fill with gray background
-        for y in 0..100u32 {
-            for x in 0..100u32 {
-                screenshot_img.put_pixel(x, y, image::Rgba([128, 128, 128, 255]));
-            }
-        }
-        // Draw a diagonal gradient pattern at (30, 40)
+    /// New for T3: exercise `run_matching` directly with hand-built
+    /// `GrayImage`s. Before the source seam, the algorithm could only be
+    /// driven through `find_image()` with PNG-encoded base64 strings and
+    /// a `spawn_blocking` boundary; this test would have been
+    /// structurally impossible.
+    #[test]
+    fn test_run_matching_with_inline_grayimage() {
+        // 100x100 search image: gray field with a distinct gradient patch at (40, 50)
+        let mut screenshot = GrayImage::from_fn(100, 100, |_, _| Luma([128]));
         for y in 0..10u32 {
             for x in 0..10u32 {
                 let val = ((x + y) * 12 + 50) as u8;
-                screenshot_img.put_pixel(30 + x, 40 + y, image::Rgba([val, val, val, 255]));
+                screenshot.put_pixel(40 + x, 50 + y, Luma([val]));
             }
         }
-        let mut screenshot_bytes = Cursor::new(Vec::new());
-        screenshot_img
-            .write_to(&mut screenshot_bytes, image::ImageFormat::Png)
-            .unwrap();
 
-        // Create template matching the gradient pattern
-        let mut template_img = image::DynamicImage::new_rgb8(10, 10);
-        for y in 0..10u32 {
-            for x in 0..10u32 {
-                let val = ((x + y) * 12 + 50) as u8;
-                template_img.put_pixel(x, y, image::Rgba([val, val, val, 255]));
+        // Template that matches that patch exactly
+        let template = GrayImage::from_fn(10, 10, |x, y| {
+            let val = ((x + y) * 12 + 50) as u8;
+            Luma([val])
+        });
+
+        let req = MatchRequest {
+            screenshot,
+            template,
+            mask: None,
+            screenshot_meta: None,
+            search_region: None,
+            threshold: 0.9,
+            max_results: 3,
+            scales: ScaleRange {
+                min: 1.0,
+                max: 1.0,
+                step: 0.1,
+            },
+            stride: 1,
+            rotations: vec![0.0],
+            return_screen_coords: false,
+            is_fast_mode: false,
+        };
+
+        let outcome = run_matching(req);
+        match outcome {
+            MatchOutcome::Success(matches) => {
+                assert!(!matches.is_empty(), "Should find at least one match");
+                let best = &matches[0];
+                assert!(
+                    (best.bbox.x as i32 - 40).abs() <= 2,
+                    "x should be near 40, got {}",
+                    best.bbox.x
+                );
+                assert!(
+                    (best.bbox.y as i32 - 50).abs() <= 2,
+                    "y should be near 50, got {}",
+                    best.bbox.y
+                );
             }
-        }
-        let mut template_bytes = Cursor::new(Vec::new());
-        template_img
-            .write_to(&mut template_bytes, image::ImageFormat::Png)
-            .unwrap();
-
-        // Add template to cache
-        let template_id = {
-            let mut cache = image_cache.write().await;
-            cache.store(
-                template_bytes.into_inner(),
-                make_image_metadata(10, 10),
-                Some("template"),
-            )
-        };
-
-        let params = FindImageParams {
-            screenshot_id: None,
-            screenshot_image_base64: Some(
-                base64::engine::general_purpose::STANDARD.encode(screenshot_bytes.into_inner()),
-            ),
-            template_id: Some(template_id),
-            template_image_base64: None,
-            mask_id: None,
-            mask_image_base64: None,
-            mode: "fast".to_string(),
-            threshold: Some(0.9),
-            max_results: None,
-            scales: Some(ScaleRange {
-                min: 1.0,
-                max: 1.0,
-                step: 0.1,
-            }), // Exact scale only
-            rotations: None,
-            search_region: None,
-            stride: Some(1),
-            return_screen_coords: false,
-        };
-
-        let result = find_image(
-            params,
-            Caches {
-                screenshot: screenshot_cache,
-                image: image_cache,
-            },
-        )
-        .await;
-        assert!(
-            !result.is_error.unwrap_or(true),
-            "find_image should succeed"
-        );
-
-        // Parse response and verify we got a match
-        if let rmcp::model::RawContent::Text(rmcp::model::RawTextContent { text }) =
-            &result.content[0].raw
-        {
-            let response: FindImageResponse = serde_json::from_str(text).unwrap();
-            assert!(
-                !response.matches.is_empty(),
-                "Should find at least one match"
-            );
-            // The match should be near (30, 40)
-            let best = &response.matches[0];
-            assert!(
-                best.bbox.x >= 28 && best.bbox.x <= 32,
-                "x should be near 30, got {}",
-                best.bbox.x
-            );
-            assert!(
-                best.bbox.y >= 38 && best.bbox.y <= 42,
-                "y should be near 40, got {}",
-                best.bbox.y
-            );
-        }
-    }
-
-    #[tokio::test]
-    async fn test_find_image_stale_template_id_falls_back_to_base64() {
-        let screenshot_cache = Arc::new(RwLock::new(ScreenshotCache::default()));
-        let image_cache = Arc::new(RwLock::new(ImageCache::default()));
-
-        // Provide a stale template_id but valid base64 fallback
-        let params = FindImageParams {
-            screenshot_id: None,
-            screenshot_image_base64: Some(
-                base64::engine::general_purpose::STANDARD.encode(create_test_png_bytes(50, 50)),
-            ),
-            template_id: Some("stale-id-not-in-cache".to_string()),
-            template_image_base64: Some(
-                base64::engine::general_purpose::STANDARD.encode(create_test_png_bytes(8, 8)),
-            ),
-            mask_id: None,
-            mask_image_base64: None,
-            mode: "fast".to_string(),
-            threshold: Some(0.5),
-            max_results: None,
-            scales: Some(ScaleRange {
-                min: 1.0,
-                max: 1.0,
-                step: 0.1,
-            }),
-            rotations: None,
-            search_region: None,
-            stride: None,
-            return_screen_coords: false,
-        };
-
-        // Should succeed using base64 fallback with a warning
-        let result = find_image(
-            params,
-            Caches {
-                screenshot: screenshot_cache,
-                image: image_cache,
-            },
-        )
-        .await;
-        assert!(
-            !result.is_error.unwrap_or(true),
-            "Should succeed using base64 fallback"
-        );
-
-        // Verify warning is present
-        if let rmcp::model::RawContent::Text(rmcp::model::RawTextContent { text }) =
-            &result.content[0].raw
-        {
-            let response: FindImageResponse = serde_json::from_str(text).unwrap();
-            assert!(
-                response.warning.is_some(),
-                "Should have warning about stale ID"
-            );
-            assert!(
-                response
-                    .warning
-                    .as_ref()
-                    .unwrap()
-                    .contains("not found in cache"),
-                "Warning should mention cache miss"
-            );
-        }
-    }
-
-    #[tokio::test]
-    async fn test_find_image_stale_mask_id_falls_back_to_base64() {
-        let screenshot_cache = Arc::new(RwLock::new(ScreenshotCache::default()));
-        let image_cache = Arc::new(RwLock::new(ImageCache::default()));
-
-        // Provide valid template but stale mask_id with base64 fallback
-        let params = FindImageParams {
-            screenshot_id: None,
-            screenshot_image_base64: Some(
-                base64::engine::general_purpose::STANDARD.encode(create_test_png_bytes(50, 50)),
-            ),
-            template_id: None,
-            template_image_base64: Some(
-                base64::engine::general_purpose::STANDARD.encode(create_test_png_bytes(8, 8)),
-            ),
-            mask_id: Some("stale-mask-id".to_string()),
-            mask_image_base64: Some(
-                base64::engine::general_purpose::STANDARD.encode(create_test_png_bytes(8, 8)),
-            ),
-            mode: "fast".to_string(),
-            threshold: Some(0.5),
-            max_results: None,
-            scales: Some(ScaleRange {
-                min: 1.0,
-                max: 1.0,
-                step: 0.1,
-            }),
-            rotations: None,
-            search_region: None,
-            stride: None,
-            return_screen_coords: false,
-        };
-
-        // Should succeed using base64 fallback
-        let result = find_image(
-            params,
-            Caches {
-                screenshot: screenshot_cache,
-                image: image_cache,
-            },
-        )
-        .await;
-        assert!(
-            !result.is_error.unwrap_or(true),
-            "Should succeed using mask base64 fallback"
-        );
-
-        // Verify warning is present
-        if let rmcp::model::RawContent::Text(rmcp::model::RawTextContent { text }) =
-            &result.content[0].raw
-        {
-            let response: FindImageResponse = serde_json::from_str(text).unwrap();
-            assert!(
-                response.warning.is_some(),
-                "Should have warning about stale mask ID"
-            );
-            assert!(
-                response.warning.as_ref().unwrap().contains("Mask ID"),
-                "Warning should mention mask"
-            );
-        }
-    }
-
-    #[tokio::test]
-    async fn test_find_image_mask_dimension_mismatch_errors() {
-        let screenshot_cache = Arc::new(RwLock::new(ScreenshotCache::default()));
-        let image_cache = Arc::new(RwLock::new(ImageCache::default()));
-
-        // Template is 10x10, mask is 8x8 - dimension mismatch
-        let params = FindImageParams {
-            screenshot_id: None,
-            screenshot_image_base64: Some(
-                base64::engine::general_purpose::STANDARD.encode(create_test_png_bytes(50, 50)),
-            ),
-            template_id: None,
-            template_image_base64: Some(
-                base64::engine::general_purpose::STANDARD.encode(create_test_png_bytes(10, 10)),
-            ),
-            mask_id: None,
-            mask_image_base64: Some(
-                base64::engine::general_purpose::STANDARD.encode(create_test_png_bytes(8, 8)),
-            ),
-            mode: "fast".to_string(),
-            threshold: None,
-            max_results: None,
-            scales: Some(ScaleRange {
-                min: 1.0,
-                max: 1.0,
-                step: 0.1,
-            }),
-            rotations: None,
-            search_region: None,
-            stride: None,
-            return_screen_coords: false,
-        };
-
-        let result = find_image(
-            params,
-            Caches {
-                screenshot: screenshot_cache,
-                image: image_cache,
-            },
-        )
-        .await;
-        assert!(
-            result.is_error.unwrap_or(false),
-            "Should error on mask dimension mismatch"
-        );
-
-        // Verify error message mentions dimension mismatch
-        if let rmcp::model::RawContent::Text(rmcp::model::RawTextContent { text }) =
-            &result.content[0].raw
-        {
-            assert!(
-                text.contains("Mask dimensions") && text.contains("must match"),
-                "Error should mention mask dimension mismatch, got: {}",
-                text
-            );
+            MatchOutcome::Error(e) => panic!("run_matching errored unexpectedly: {}", e),
         }
     }
 }
