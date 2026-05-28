@@ -28,9 +28,10 @@ mod ffi;
 // resolving through `crate::macos::ax::*`. Phasing: as each step relocates
 // more, this list grows; the module surface to external callers stays flat.
 pub use find::{element_at_point, list_element_names};
+pub use tree::collect_ax_tree_indexed;
+pub(crate) use tree::{ancestor_role_chain, element_bbox};
 
 use super::ocr::{TextBounds, TextMatch};
-use crate::tools::ax_snapshot::{map_ax_role, AXSnapshotNode};
 use core_foundation::array::{kCFTypeArrayCallBacks, CFArray, CFArrayCreate};
 use core_foundation::base::{kCFAllocatorDefault, CFType, TCFType};
 use core_foundation::boolean::CFBoolean;
@@ -191,26 +192,13 @@ pub fn find_text(search: &str, window_id: Option<u32>) -> Result<Vec<TextMatch>,
     Ok(matches)
 }
 
-/// Get the children of an AX element as a CFArray.
-/// Returns `None` if the element has no children or the attribute is unavailable.
-///
-/// Temporarily kept alive while `collect_ax_tree_recursive` lives in
-/// `mod.rs`; deleted in step 5 alongside the snapshot collector's move into
-/// `tree.rs` (where the walker uses `attr::array` directly).
-unsafe fn get_ax_children(element: AXUIElementRef) -> Option<CFArray<*const c_void>> {
-    let attr = CFString::new("AXChildren");
-    let mut children_ref: core_foundation::base::CFTypeRef = ptr::null();
-    let err = AXUIElementCopyAttributeValue(element, attr.as_concrete_TypeRef(), &mut children_ref);
-
-    if err != K_AX_ERROR_SUCCESS || children_ref.is_null() {
-        return None;
-    }
-
-    Some(CFArray::wrap_under_create_rule(children_ref as _))
-}
-
 /// Get a string attribute from an AX element. Returns None if the attribute
 /// doesn't exist or isn't a string.
+///
+/// Dead at the call-site level after step 5; deleted in step 8 once
+/// `raise_windows`'s AXWindows read and `ax_parent` both route through
+/// the seam. `#[allow(dead_code)]` is intentional and bounded.
+#[allow(dead_code)]
 unsafe fn get_string_attribute(element: AXUIElementRef, attr_name: &str) -> Option<String> {
     let attr = CFString::new(attr_name);
     let mut value_ref: core_foundation::base::CFTypeRef = ptr::null();
@@ -228,6 +216,7 @@ unsafe fn get_string_attribute(element: AXUIElementRef, attr_name: &str) -> Opti
 
 /// Get a boolean attribute from an AX element. Returns None if the attribute
 /// doesn't exist or isn't a CFBoolean.
+#[allow(dead_code)]
 unsafe fn get_bool_attribute(element: AXUIElementRef, attr_name: &str) -> Option<bool> {
     let attr = CFString::new(attr_name);
     let mut value_ref: core_foundation::base::CFTypeRef = ptr::null();
@@ -244,25 +233,11 @@ unsafe fn get_bool_attribute(element: AXUIElementRef, attr_name: &str) -> Option
 
 /// Get position (CGPoint) and size (CGSize) of an AX element.
 /// Returns None if either attribute is missing.
+#[allow(dead_code)]
 unsafe fn get_position_and_size(element: AXUIElementRef) -> Option<(CGPoint, CGSize)> {
     let position: CGPoint = get_ax_value(element, "AXPosition", K_AX_VALUE_TYPE_CGPOINT)?;
     let size: CGSize = get_ax_value(element, "AXSize", K_AX_VALUE_TYPE_CGSIZE)?;
     Some((position, size))
-}
-
-/// Read position + size from an AX element and return a `Rect`. Returns
-/// `None` when either attribute is unreadable. The raw pointer must refer to
-/// a live, retained `AXUIElement`.
-pub(crate) unsafe fn element_bbox(
-    element: AXUIElementRef,
-) -> Option<crate::tools::ax_snapshot::Rect> {
-    let (pos, size) = get_position_and_size(element)?;
-    Some(crate::tools::ax_snapshot::Rect {
-        x: pos.x,
-        y: pos.y,
-        w: size.width,
-        h: size.height,
-    })
 }
 
 /// Outcome of an `AXUIElementPerformAction` / `AXUIElementSetAttributeValue`
@@ -347,7 +322,9 @@ pub(crate) fn set_value_attribute(element: &AXRef, text: &str) -> Result<(), AXD
 ///
 /// Private — walking ancestors outside `AxSession::dispatch`'s read lock
 /// reopens the lookup-then-dispatch race `dispatch` exists to close.
-fn ax_parent(element: &AXRef) -> Option<AXRef> {
+/// Visible to submodules so `tree::ancestor_role_chain` can call it; step
+/// 6 inlines this through `attr::element` and deletes it.
+pub(super) fn ax_parent(element: &AXRef) -> Option<AXRef> {
     let attr = CFString::new("AXParent");
     let mut value_ref: core_foundation::base::CFTypeRef = ptr::null();
     let err = unsafe {
@@ -359,34 +336,6 @@ fn ax_parent(element: &AXRef) -> Option<AXRef> {
     // `AXUIElementCopyAttributeValue` returns under the create rule, so
     // `from_create` takes that +1 directly — no CFRetain/CFRelease pair.
     Some(unsafe { AXRef::from_create(value_ref as AXUIElementRef) })
-}
-
-/// Number of parent links to traverse when hunting for an enclosing role.
-/// Deep-enough to absorb the intermediate cells/groups native sidebars wrap
-/// their rows in, shallow enough to bail cleanly on a pathological cycle.
-const AX_ANCESTOR_WALK_LIMIT: u32 = 32;
-
-/// Walk up the `AXParent` chain starting from `start` (inclusive) and
-/// return a leaf-to-root vector of `(AXRef, Option<role>)` pairs.
-///
-/// The walk stops when `AXParent` becomes unreadable or when
-/// `AX_ANCESTOR_WALK_LIMIT` is reached — either way a bounded vector is
-/// returned rather than an error. Downstream logic (`ax_select`) inspects
-/// the chain to pick out the enclosing `AXRow` and `AXOutline`/`AXTable`;
-/// splitting the walk from the decision lets the decision logic be unit
-/// tested without live `AXUIElement` handles.
-pub(crate) fn ancestor_role_chain(start: &AXRef) -> Vec<(AXRef, Option<String>)> {
-    let mut chain: Vec<(AXRef, Option<String>)> = Vec::new();
-    let mut current = start.clone();
-    for _ in 0..AX_ANCESTOR_WALK_LIMIT {
-        let role = unsafe { get_string_attribute(current.as_raw(), "AXRole") };
-        chain.push((current.clone(), role));
-        match ax_parent(&current) {
-            Some(p) => current = p,
-            None => break,
-        }
-    }
-    chain
 }
 
 /// Write `rows` into the `AXSelectedRows` attribute of an outline/table.
@@ -435,6 +384,7 @@ pub(crate) fn select_rows_attribute(
 }
 
 /// Extract a typed value (CGPoint or CGSize) from an AXValue attribute.
+#[allow(dead_code)]
 unsafe fn get_ax_value<T: Default>(
     element: AXUIElementRef,
     attr_name: &str,
@@ -623,110 +573,6 @@ pub fn raise_windows(pid: i32) -> bool {
         core_foundation::base::CFRelease(app_element as core_foundation::base::CFTypeRef);
         raised
     }
-}
-
-/// Recursively walk the AX element tree and collect [`AXSnapshotNode`] entries
-/// plus a `HashMap<uid, AXRef>` of retained handles.
-///
-/// UIDs are assigned sequentially via `next_uid` (starts at 1).
-/// Traversal order is depth-first, matching `walk_ax_tree`.
-unsafe fn collect_ax_tree_recursive(
-    element: AXUIElementRef,
-    element_count: &mut usize,
-    depth: u32,
-    next_uid: &mut u32,
-    nodes: &mut Vec<AXSnapshotNode>,
-    refs: &mut std::collections::HashMap<u32, AXRef>,
-) {
-    if depth > MAX_DEPTH || *element_count >= MAX_ELEMENTS {
-        return;
-    }
-
-    *element_count += 1;
-
-    let uid = *next_uid;
-    *next_uid += 1;
-
-    let role = get_string_attribute(element, "AXRole")
-        .as_deref()
-        .map(map_ax_role)
-        .unwrap_or_else(|| "unknown".to_string());
-
-    let name = get_string_attribute(element, "AXTitle");
-    let value = get_string_attribute(element, "AXValue");
-    let focused = get_bool_attribute(element, "AXFocused").unwrap_or(false);
-    let disabled = get_bool_attribute(element, "AXEnabled")
-        .map(|enabled| !enabled)
-        .unwrap_or(false);
-    let expanded = get_bool_attribute(element, "AXExpanded");
-    let selected = get_bool_attribute(element, "AXSelected");
-    let bbox = element_bbox(element);
-
-    nodes.push(AXSnapshotNode {
-        uid,
-        role,
-        name,
-        value,
-        focused,
-        disabled,
-        expanded,
-        selected,
-        depth,
-        bbox,
-    });
-
-    // Retain under get-rule: the current `element` was obtained either from
-    // `AXUIElementCreateApplication` (owned, passed to us) or from the
-    // CFArray iteration below (which retains around recursion). Either way,
-    // `from_get` is the correct rule here since the caller still holds the
-    // owning reference for the duration of this visitor.
-    refs.insert(uid, AXRef::from_get(element));
-
-    if let Some(children) = get_ax_children(element) {
-        for i in 0..children.len() {
-            let child = *children.get_unchecked(i) as AXUIElementRef;
-            core_foundation::base::CFRetain(child as core_foundation::base::CFTypeRef);
-            collect_ax_tree_recursive(child, element_count, depth + 1, next_uid, nodes, refs);
-            core_foundation::base::CFRelease(child as core_foundation::base::CFTypeRef);
-        }
-    }
-}
-
-/// Walk an application's AX tree and return flat nodes + a `HashMap<uid, AXRef>`.
-///
-/// The `AXRef` map is the source of truth for `AxSession` — each entry is a
-/// retained handle that stays live until the session swaps in a new snapshot.
-pub fn collect_ax_tree_indexed(
-    app_name: Option<&str>,
-) -> Result<(Vec<AXSnapshotNode>, std::collections::HashMap<u32, AXRef>), String> {
-    let pid = match app_name {
-        Some(name) => pid_for_app_name(name)?,
-        None => frontmost_pid()?,
-    };
-
-    let app_element = unsafe { AXUIElementCreateApplication(pid) };
-    if app_element.is_null() {
-        return Err(format!("Failed to create AXUIElement for pid {}", pid));
-    }
-
-    let mut nodes = Vec::new();
-    let mut element_count: usize = 0;
-    let mut next_uid: u32 = 1;
-    let mut refs = std::collections::HashMap::new();
-
-    unsafe {
-        collect_ax_tree_recursive(
-            app_element,
-            &mut element_count,
-            0,
-            &mut next_uid,
-            &mut nodes,
-            &mut refs,
-        );
-        core_foundation::base::CFRelease(app_element as core_foundation::base::CFTypeRef);
-    }
-
-    Ok((nodes, refs))
 }
 
 #[cfg(test)]

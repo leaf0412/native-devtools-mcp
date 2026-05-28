@@ -227,4 +227,61 @@ mod tests {
         let out = decode_as_boolean(cf, "AXFocused").expect("decode should succeed");
         assert_eq!(out, Some(true));
     }
+
+    /// Mirror the `attr::element` ownership transfer sequence —
+    /// `std::mem::forget(cf); AXRef::from_create(raw)` — against a
+    /// heap-allocated CFData (CFString can be tagged-pointer with
+    /// `retain_count = i64::MAX`, which makes refcount arithmetic
+    /// meaningless). The seam owns this pattern in two places
+    /// (`attr::element`, `attr::array`); test the more leak-prone
+    /// element variant directly.
+    ///
+    /// Invariants:
+    /// - retain count unchanged across the transfer (the +1 from the
+    ///   simulated copy_raw return moves into AXRef without an extra
+    ///   CFRetain),
+    /// - drops by exactly 1 when the AXRef is dropped (no leak, no
+    ///   double-CFRelease).
+    #[test]
+    fn attr_element_transfers_create_rule_without_leak_or_double_free() {
+        use core_foundation::base::{CFGetRetainCount, CFRetain, CFTypeRef};
+
+        let d = CFData::from_buffer(&[42u8; 32]);
+        let raw: CFTypeRef = d.as_concrete_TypeRef() as CFTypeRef;
+
+        // Bump to +2 so we can observe the transfer and the AXRef::Drop
+        // releasing the +1 we simulate-handed-over.
+        unsafe {
+            CFRetain(raw);
+        }
+        let before = unsafe { CFGetRetainCount(raw) };
+        assert!(
+            (2..isize::MAX).contains(&before),
+            "expected a finite retain count >= 2, got {before} — CFData should be heap-allocated"
+        );
+
+        // Stage what `attr::element` does after copy_raw returns a CFType:
+        // wrap the raw under create rule (same as copy_raw), then transfer
+        // via mem::forget into AXRef::from_create.
+        let cf = unsafe { CFType::wrap_under_create_rule(raw) };
+        let raw_for_axref = cf.as_CFTypeRef() as super::super::ffi::AXUIElementRef;
+        std::mem::forget(cf);
+        let aref = unsafe { super::super::AXRef::from_create(raw_for_axref) };
+
+        let during = unsafe { CFGetRetainCount(raw) };
+        assert_eq!(
+            during, before,
+            "attr::element transfer must not CFRetain — the copy_raw +1 \
+             moves into AXRef without adding a second retain"
+        );
+
+        drop(aref);
+        let after = unsafe { CFGetRetainCount(raw) };
+        assert_eq!(
+            after,
+            before - 1,
+            "AXRef::Drop after attr::element transfer must CFRelease exactly \
+             once (count {before} -> {after})"
+        );
+    }
 }
