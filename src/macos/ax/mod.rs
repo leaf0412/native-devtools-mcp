@@ -39,52 +39,10 @@ use std::ffi::c_void;
 use std::ptr;
 use std::sync::Arc;
 
-// AXUIElement opaque type
-type AXUIElementRef = *mut c_void;
-// AXValue opaque type
-type AXValueRef = *mut c_void;
-
-// AXValueType constants
-const K_AX_VALUE_TYPE_CGPOINT: u32 = 1;
-const K_AX_VALUE_TYPE_CGSIZE: u32 = 2;
-
-// AX error codes. Values from Apple's
-// `<ApplicationServices/HIServices/AXError.h>`.
-const K_AX_ERROR_SUCCESS: i32 = 0;
-const K_AX_ERROR_ILLEGAL_ARGUMENT: i32 = -25204;
-const K_AX_ERROR_ATTRIBUTE_UNSUPPORTED: i32 = -25205;
-const K_AX_ERROR_ACTION_UNSUPPORTED: i32 = -25206;
+use ffi::*;
 
 const MAX_DEPTH: u32 = 50;
 const MAX_ELEMENTS: usize = 10_000;
-
-#[link(name = "ApplicationServices", kind = "framework")]
-extern "C" {
-    fn AXUIElementCreateApplication(pid: i32) -> AXUIElementRef;
-    fn AXUIElementCopyAttributeValue(
-        element: AXUIElementRef,
-        attribute: core_foundation::string::CFStringRef,
-        value: *mut core_foundation::base::CFTypeRef,
-    ) -> i32;
-    fn AXValueGetValue(value: AXValueRef, value_type: u32, value_ptr: *mut c_void) -> bool;
-    fn AXUIElementPerformAction(
-        element: AXUIElementRef,
-        action: core_foundation::string::CFStringRef,
-    ) -> i32;
-    fn AXUIElementSetAttributeValue(
-        element: AXUIElementRef,
-        attribute: core_foundation::string::CFStringRef,
-        value: core_foundation::base::CFTypeRef,
-    ) -> i32;
-    fn AXUIElementCreateSystemWide() -> AXUIElementRef;
-    fn AXUIElementCopyElementAtPosition(
-        application: AXUIElementRef,
-        x: f32,
-        y: f32,
-        element: *mut AXUIElementRef,
-    ) -> i32;
-    fn AXUIElementGetPid(element: AXUIElementRef, pid: *mut i32) -> i32;
-}
 
 /// Retained, thread-safe handle to an `AXUIElement`.
 ///
