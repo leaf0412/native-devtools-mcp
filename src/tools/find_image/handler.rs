@@ -5,6 +5,7 @@
 
 use crate::tools::find_image::algorithm::find_image;
 use crate::tools::find_image::params::FindImageParams;
+use crate::tools::find_image::source::Caches;
 use crate::tools::registry::{json_to_object, ToolContext, ToolHandler};
 use rmcp::model::{CallToolResult, Tool};
 use rmcp::Error as McpError;
@@ -109,6 +110,10 @@ impl ToolHandler for FindImage {
     ) -> Result<CallToolResult, McpError> {
         let params: FindImageParams = serde_json::from_value(args)
             .map_err(|e| McpError::invalid_params(e.to_string(), None))?;
-        Ok(find_image(params, ctx.screenshot_cache.clone(), ctx.image_cache.clone()).await)
+        let caches = Caches {
+            screenshot: ctx.screenshot_cache.clone(),
+            image: ctx.image_cache.clone(),
+        };
+        Ok(find_image(params, caches).await)
     }
 }

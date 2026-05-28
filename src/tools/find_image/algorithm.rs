@@ -10,16 +10,14 @@ use crate::tools::find_image::params::{
     normalize_rotation, validate_scale_range, BoundingBox, FindImageParams, FindImageResponse,
     MatchResult, ModeDefaults, Point, ScaleRange, SearchRegion,
 };
+use crate::tools::find_image::source::Caches;
 use crate::tools::find_image::transform::{
     decode_base64_to_gray, decode_png_to_gray, extract_region, resize_image, rotate_image,
 };
-use crate::tools::image_cache::ImageCache;
-use crate::tools::screenshot_cache::{ScreenshotCache, ScreenshotMetadata};
+use crate::tools::screenshot_cache::ScreenshotMetadata;
 use image::GrayImage;
 use rmcp::model::{CallToolResult, Content};
 use std::borrow::Cow;
-use std::sync::Arc;
-use tokio::sync::RwLock;
 
 #[cfg(feature = "find_image_parallel")]
 use rayon::prelude::*;
@@ -84,11 +82,9 @@ pub(super) enum MatchingResult {
 }
 
 /// Execute the find_image tool.
-pub(super) async fn find_image(
-    params: FindImageParams,
-    screenshot_cache: Arc<RwLock<ScreenshotCache>>,
-    image_cache: Arc<RwLock<ImageCache>>,
-) -> CallToolResult {
+pub(super) async fn find_image(params: FindImageParams, caches: Caches) -> CallToolResult {
+    let screenshot_cache = &caches.screenshot;
+    let image_cache = &caches.image;
     let defaults = ModeDefaults::for_mode(&params.mode);
     let mut warning: Option<String> = None;
 
@@ -948,6 +944,8 @@ mod tests {
     use base64::Engine;
     use image::{GenericImage, Luma};
     use std::io::Cursor;
+    use std::sync::Arc;
+    use tokio::sync::RwLock;
 
     #[test]
     fn test_ncc_matching_finds_exact_template() {
@@ -1262,7 +1260,14 @@ mod tests {
             return_screen_coords: false,
         };
 
-        let result = find_image(params, screenshot_cache, image_cache).await;
+        let result = find_image(
+            params,
+            Caches {
+                screenshot: screenshot_cache,
+                image: image_cache,
+            },
+        )
+        .await;
         assert!(result.is_error.unwrap_or(false));
         // Check error message mentions template ID
         if let rmcp::model::RawContent::Text(rmcp::model::RawTextContent { text }) =
@@ -1308,7 +1313,14 @@ mod tests {
             return_screen_coords: false,
         };
 
-        let result = find_image(params, screenshot_cache, image_cache).await;
+        let result = find_image(
+            params,
+            Caches {
+                screenshot: screenshot_cache,
+                image: image_cache,
+            },
+        )
+        .await;
         assert!(result.is_error.unwrap_or(false));
         // Check error message mentions mask ID
         if let rmcp::model::RawContent::Text(rmcp::model::RawTextContent { text }) =
@@ -1342,7 +1354,14 @@ mod tests {
             return_screen_coords: false,
         };
 
-        let result = find_image(params, screenshot_cache, image_cache).await;
+        let result = find_image(
+            params,
+            Caches {
+                screenshot: screenshot_cache,
+                image: image_cache,
+            },
+        )
+        .await;
         assert!(result.is_error.unwrap_or(false));
         if let rmcp::model::RawContent::Text(rmcp::model::RawTextContent { text }) =
             &result.content[0].raw
@@ -1422,7 +1441,14 @@ mod tests {
             return_screen_coords: false,
         };
 
-        let result = find_image(params, screenshot_cache, image_cache).await;
+        let result = find_image(
+            params,
+            Caches {
+                screenshot: screenshot_cache,
+                image: image_cache,
+            },
+        )
+        .await;
         assert!(
             !result.is_error.unwrap_or(true),
             "find_image should succeed"
@@ -1484,7 +1510,14 @@ mod tests {
         };
 
         // Should succeed using base64 fallback with a warning
-        let result = find_image(params, screenshot_cache, image_cache).await;
+        let result = find_image(
+            params,
+            Caches {
+                screenshot: screenshot_cache,
+                image: image_cache,
+            },
+        )
+        .await;
         assert!(
             !result.is_error.unwrap_or(true),
             "Should succeed using base64 fallback"
@@ -1544,7 +1577,14 @@ mod tests {
         };
 
         // Should succeed using base64 fallback
-        let result = find_image(params, screenshot_cache, image_cache).await;
+        let result = find_image(
+            params,
+            Caches {
+                screenshot: screenshot_cache,
+                image: image_cache,
+            },
+        )
+        .await;
         assert!(
             !result.is_error.unwrap_or(true),
             "Should succeed using mask base64 fallback"
@@ -1599,7 +1639,14 @@ mod tests {
             return_screen_coords: false,
         };
 
-        let result = find_image(params, screenshot_cache, image_cache).await;
+        let result = find_image(
+            params,
+            Caches {
+                screenshot: screenshot_cache,
+                image: image_cache,
+            },
+        )
+        .await;
         assert!(
             result.is_error.unwrap_or(false),
             "Should error on mask dimension mismatch"
