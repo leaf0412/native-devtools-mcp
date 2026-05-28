@@ -318,26 +318,6 @@ pub(crate) fn set_value_attribute(element: &AXRef, text: &str) -> Result<(), AXD
     }
 }
 
-/// Return the AX parent of `element` if the attribute is readable.
-///
-/// Private — walking ancestors outside `AxSession::dispatch`'s read lock
-/// reopens the lookup-then-dispatch race `dispatch` exists to close.
-/// Visible to submodules so `tree::ancestor_role_chain` can call it; step
-/// 6 inlines this through `attr::element` and deletes it.
-pub(super) fn ax_parent(element: &AXRef) -> Option<AXRef> {
-    let attr = CFString::new("AXParent");
-    let mut value_ref: core_foundation::base::CFTypeRef = ptr::null();
-    let err = unsafe {
-        AXUIElementCopyAttributeValue(element.as_raw(), attr.as_concrete_TypeRef(), &mut value_ref)
-    };
-    if err != K_AX_ERROR_SUCCESS || value_ref.is_null() {
-        return None;
-    }
-    // `AXUIElementCopyAttributeValue` returns under the create rule, so
-    // `from_create` takes that +1 directly — no CFRetain/CFRelease pair.
-    Some(unsafe { AXRef::from_create(value_ref as AXUIElementRef) })
-}
-
 /// Write `rows` into the `AXSelectedRows` attribute of an outline/table.
 /// Returns `Ok(())` on success.
 ///

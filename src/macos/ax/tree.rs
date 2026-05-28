@@ -150,9 +150,10 @@ pub(crate) fn ancestor_role_chain(start: &AXRef) -> Vec<(AXRef, Option<String>)>
     for _ in 0..AX_ANCESTOR_WALK_LIMIT {
         let role = attr::string(current.as_raw(), "AXRole").ok().flatten();
         chain.push((current.clone(), role));
-        // ax_parent collapses Err(Ffi)/Err(Decode) into None alongside the
-        // legitimately-absent root case — same shape as the legacy wrapper.
-        match super::ax_parent(&current) {
+        // attr::element collapses Err(Ffi)/Err(Decode) into None alongside
+        // the legitimately-absent root case via .ok().flatten() — same
+        // shape as the prior ax_parent wrapper, now inlined.
+        match attr::element(current.as_raw(), "AXParent").ok().flatten() {
             Some(p) => current = p,
             None => break,
         }
