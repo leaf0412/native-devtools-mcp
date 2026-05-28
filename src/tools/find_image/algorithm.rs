@@ -13,9 +13,7 @@ use crate::tools::find_image::params::{
 use crate::tools::find_image::source::{
     resolve_slot, Caches, ImageSource, Miss, RawImageBytes, SlotInput, SlotKind,
 };
-use crate::tools::find_image::transform::{
-    decode_base64_to_gray, decode_png_to_gray, extract_region, resize_image, rotate_image,
-};
+use crate::tools::find_image::transform::{extract_region, resize_image, rotate_image};
 use crate::tools::screenshot_cache::ScreenshotMetadata;
 use image::GrayImage;
 use rmcp::model::{CallToolResult, Content};
@@ -54,8 +52,10 @@ pub(super) struct MatchingInput {
     /// — the resolve site rejects empty template requests before we
     /// build this struct.
     pub(super) template_bytes: Option<RawImageBytes>,
-    pub(super) mask_png_data: Option<Vec<u8>>,
-    pub(super) mask_b64: Option<String>,
+    /// Mask bytes after the source-seam resolve. `None` means no mask
+    /// requested; `Some` means the resolver produced bytes from cache
+    /// or base64 fallback.
+    pub(super) mask_bytes: Option<RawImageBytes>,
     pub(super) search_region: Option<SearchRegion>,
     pub(super) threshold: f64,
     pub(super) max_results: usize,
@@ -90,9 +90,9 @@ pub(super) enum MatchingResult {
 
 /// Execute the find_image tool.
 pub(super) async fn find_image(params: FindImageParams, caches: Caches) -> CallToolResult {
-    // Template/mask paths still take the cache directly; step 3/4 move them
-    // to the seam. Screenshot already routes through `caches` via the seam.
-    let image_cache = &caches.image;
+    // All three slots (screenshot / template / mask) now resolve through
+    // the source seam; `caches` is consumed by ImageSource::fetch and
+    // resolve_slot, never touched directly here.
     let defaults = ModeDefaults::for_mode(&params.mode);
     let mut warning: Option<String> = None;
 
@@ -201,26 +201,23 @@ pub(super) async fn find_image(params: FindImageParams, caches: Caches) -> CallT
         }
     };
 
-    // Resolve mask data from image cache
-    // Use write lock to update LRU access order via get()
-    let mask_png_data = {
-        if let Some(id) = &params.mask_id {
-            let mut cache_guard = image_cache.write().await;
-            if let Some(cached) = cache_guard.get(id) {
-                Some(cached.png_data.clone())
-            } else if params.mask_image_base64.is_some() {
-                // ID not found but base64 fallback available - warn and continue
-                let msg = format!("Mask ID '{}' not found in cache, using base64 fallback", id);
+    // Resolve mask via the source seam. Same WRITE-lock + LRU-bump
+    // semantics as the template slot; resolve_slot enforces the
+    // identical 'primary id → fallback b64 with warning → hard error'
+    // policy with the literals reformatted for the Mask label.
+    let mask_slot = SlotInput {
+        primary: params.mask_id.clone().map(ImageSource::Image),
+        fallback_b64: params.mask_image_base64.clone().map(ImageSource::Base64),
+    };
+    let mask_bytes = match resolve_slot(mask_slot, SlotKind::Mask, &caches).await {
+        Ok((resolved, warn_msg)) => {
+            if let Some(msg) = warn_msg {
                 warning = Some(warning.map_or(msg.clone(), |w| format!("{}; {}", w, msg)));
-                None
-            } else {
-                return CallToolResult::error(vec![Content::text(format!(
-                    "Mask ID '{}' not found in image cache",
-                    id
-                ))]);
             }
-        } else {
-            None
+            resolved.map(|r| r.bytes)
+        }
+        Err(hard_error) => {
+            return CallToolResult::error(vec![Content::text(hard_error)]);
         }
     };
 
@@ -236,8 +233,7 @@ pub(super) async fn find_image(params: FindImageParams, caches: Caches) -> CallT
     let input = MatchingInput {
         screenshot_bytes,
         template_bytes,
-        mask_png_data,
-        mask_b64: params.mask_image_base64.clone(),
+        mask_bytes,
         search_region: params.search_region.clone(),
         threshold,
         max_results,
@@ -488,19 +484,19 @@ pub(super) fn run_matching(input: MatchingInput) -> MatchingResult {
         }
     };
 
-    // Decode mask if provided (prefer cached PNG data over base64)
-    let mask = if let Some(png_data) = input.mask_png_data {
-        match decode_png_to_gray(&png_data) {
+    // Decode mask via the seam. Failure literals preserved:
+    // cache-derived → 'Failed to decode cached mask';
+    // inline base64 → 'Failed to decode mask image'.
+    let mask = match input.mask_bytes {
+        Some(RawImageBytes::Png(bytes)) => match RawImageBytes::Png(bytes).decode() {
             Ok(img) => Some(img),
             Err(e) => return MatchingResult::Error(format!("Failed to decode cached mask: {}", e)),
-        }
-    } else if let Some(mask_b64) = &input.mask_b64 {
-        match decode_base64_to_gray(mask_b64) {
+        },
+        Some(RawImageBytes::Base64(b64)) => match RawImageBytes::Base64(b64).decode() {
             Ok(img) => Some(img),
             Err(e) => return MatchingResult::Error(format!("Failed to decode mask image: {}", e)),
-        }
-    } else {
-        None
+        },
+        None => None,
     };
 
     // Validate mask dimensions match template

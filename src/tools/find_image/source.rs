@@ -92,7 +92,6 @@ pub(super) struct SlotInput {
 ///   warn:  "{Label} ID '{id}' not found in cache, using base64 fallback"
 ///   error: "{Label} ID '{id}' not found in image cache"
 #[derive(Clone, Copy)]
-#[allow(dead_code)] // Mask variant lights up in step 4
 pub(super) enum SlotKind {
     Template,
     Mask,
