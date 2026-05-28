@@ -200,12 +200,6 @@ impl ToolRegistry {
             .map(|t| t.as_ref())
     }
 
-    /// Names of every registered tool — used by the legacy-getter union to
-    /// drop already-migrated tools and avoid double emission.
-    pub fn names(&self) -> Vec<&'static str> {
-        self.tools.iter().map(|t| t.name()).collect()
-    }
-
     /// Schemas of tools visible for the given connection state.
     pub fn schemas(&self, state: &ConnectionState) -> Vec<Tool> {
         self.tools

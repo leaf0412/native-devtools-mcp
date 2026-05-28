@@ -17,26 +17,6 @@ use tokio::sync::RwLock;
 
 use crate::android::AndroidDevice;
 
-/// Serialize a value to pretty-printed JSON, returning a formatted error on failure.
-fn to_json_pretty(value: &impl serde::Serialize) -> String {
-    serde_json::to_string_pretty(value).unwrap_or_else(|e| format!("Failed to serialize: {}", e))
-}
-
-/// Extract a required string field from a JSON value.
-fn parse_string_field(args: &Value, field: &str) -> Result<String, McpError> {
-    args.get(field)
-        .and_then(|v| v.as_str())
-        .map(String::from)
-        .ok_or_else(|| McpError::invalid_params(format!("missing required param: {}", field), None))
-}
-
-fn json_to_object(value: Value) -> rmcp::model::JsonObject {
-    match value {
-        Value::Object(map) => map,
-        _ => Default::default(),
-    }
-}
-
 // ============================================================================
 // Tool safety-hint annotations
 //
@@ -104,112 +84,6 @@ fn annotate_tools(tools: &mut [Tool], names: &[&str], annotation: ToolAnnotation
         }
     }
 }
-
-/// Tool names that have been migrated to the [`ToolRegistry`]. The legacy
-/// schema getters and `call_tool` match still contain entries that are being
-/// moved batch by batch; this list is the coexistence seam — schemas and
-/// dispatch for these names come from the registry, and the legacy paths are
-/// filtered/short-circuited so the net tool set is invariant.
-const MIGRATED: &[&str] = &[
-    "take_screenshot",
-    "list_windows",
-    "list_apps",
-    "focus_window",
-    "launch_app",
-    "quit_app",
-    "probe_app",
-    "click",
-    "move_mouse",
-    "drag",
-    "scroll",
-    "type_text",
-    "press_key",
-    "get_displays",
-    "find_text",
-    "element_at_point",
-    "find_image",
-    "load_image",
-    "take_ax_snapshot",
-    #[cfg(target_os = "macos")]
-    "ax_click",
-    #[cfg(target_os = "macos")]
-    "ax_set_value",
-    #[cfg(target_os = "macos")]
-    "ax_select",
-    "app_connect",
-    "app_disconnect",
-    "app_get_info",
-    "app_get_tree",
-    "app_get_element",
-    "app_list_windows",
-    "app_focus_window",
-    "app_query",
-    "app_click",
-    "app_type",
-    "app_press_key",
-    "app_focus",
-    "app_screenshot",
-    #[cfg(feature = "cdp")]
-    "cdp_connect",
-    #[cfg(feature = "cdp")]
-    "cdp_disconnect",
-    #[cfg(feature = "cdp")]
-    "cdp_navigate",
-    #[cfg(feature = "cdp")]
-    "cdp_new_page",
-    #[cfg(feature = "cdp")]
-    "cdp_list_pages",
-    #[cfg(feature = "cdp")]
-    "cdp_select_page",
-    #[cfg(feature = "cdp")]
-    "cdp_close_page",
-    #[cfg(feature = "cdp")]
-    "cdp_click",
-    #[cfg(feature = "cdp")]
-    "cdp_fill",
-    #[cfg(feature = "cdp")]
-    "cdp_type_text",
-    #[cfg(feature = "cdp")]
-    "cdp_press_key",
-    #[cfg(feature = "cdp")]
-    "cdp_hover",
-    #[cfg(feature = "cdp")]
-    "cdp_handle_dialog",
-    #[cfg(feature = "cdp")]
-    "cdp_element_at_point",
-    #[cfg(feature = "cdp")]
-    "cdp_take_dom_snapshot",
-    #[cfg(feature = "cdp")]
-    "cdp_summarize_page",
-    #[cfg(feature = "cdp")]
-    "cdp_find_elements",
-    #[cfg(feature = "cdp")]
-    "cdp_get_element_context",
-    #[cfg(feature = "cdp")]
-    "cdp_evaluate_script",
-    #[cfg(feature = "cdp")]
-    "cdp_wait_for",
-    #[cfg(feature = "cdp")]
-    "cdp_wait_for_page_change",
-    "android_list_devices",
-    "android_connect",
-    "android_disconnect",
-    "android_screenshot",
-    "android_click",
-    "android_type_text",
-    "android_press_key",
-    "android_swipe",
-    "android_find_text",
-    "android_list_apps",
-    "android_launch_app",
-    "android_get_display_info",
-    "android_get_current_activity",
-    "start_hover_tracking",
-    "get_hover_events",
-    "stop_hover_tracking",
-    "start_recording",
-    "stop_recording",
-];
 
 #[derive(Clone)]
 pub struct MacOSDevToolsServer {
@@ -310,45 +184,8 @@ impl MacOSDevToolsServer {
             hover_tracking,
             recording,
         };
-        let registry = ToolRegistry::build();
-
-        // Registry-owned tools, filtered by availability.
-        let mut tools = registry.schemas(&state);
-
-        // Legacy getters minus already-migrated names — the coexistence seam.
-        // As tools move to the registry their name lands in MIGRATED and is
-        // dropped here, keeping the net set invariant.
-        let mut legacy =
-            Self::get_legacy_tools(app_connected, android_connected, hover_tracking, recording);
-        legacy.retain(|t| !MIGRATED.contains(&t.name.as_ref()));
-        tools.append(&mut legacy);
-
+        let mut tools = ToolRegistry::build().schemas(&state);
         Self::apply_tool_annotations(&mut tools);
-        tools
-    }
-
-    /// Hand-written schema getters that have not yet been migrated to the
-    /// registry. Shrinks one batch at a time until step 8 deletes it.
-    fn get_legacy_tools(
-        app_connected: bool,
-        android_connected: bool,
-        hover_tracking: bool,
-        recording: bool,
-    ) -> Vec<Tool> {
-        let mut tools = Self::get_base_tools();
-        if app_connected {
-            tools.extend(Self::get_app_tools());
-        }
-        tools.extend(Self::get_android_base_tools());
-        if android_connected {
-            tools.extend(Self::get_android_tools());
-        }
-        #[cfg(feature = "cdp")]
-        {
-            tools.extend(Self::get_cdp_tools());
-        }
-        tools.extend(Self::get_hover_tracking_tools(hover_tracking));
-        tools.extend(Self::get_recording_tools(recording));
         tools
     }
 
@@ -485,60 +322,6 @@ impl MacOSDevToolsServer {
             annotate_tools(tools, &["cdp_close_page"], annotate_destructive());
         }
     }
-
-    /// Tools that are always available (system tools, CGEvent tools, etc.).
-    ///
-    /// `take_ax_snapshot` and the macOS `ax_*` tools now live on the
-    /// [`ToolRegistry`]; this getter holds the remaining legacy base tools
-    /// (currently none) and stays as the seam the legacy union appends to.
-    fn get_base_tools() -> Vec<Tool> {
-        Vec::new()
-    }
-
-    /// App debug tools — all now live on the [`ToolRegistry`] (gated
-    /// `WhenAppConnected`); this getter stays as the seam the legacy union
-    /// appends to and currently emits nothing.
-    fn get_app_tools() -> Vec<Tool> {
-        Vec::new()
-    }
-
-    /// Android tools that are always available (device discovery and connection)
-    fn get_android_base_tools() -> Vec<Tool> {
-        // Migrated to the registry (android_list_devices, android_connect);
-        // empty seam like get_base_tools / get_app_tools until step 8.
-        Vec::new()
-    }
-
-    /// Android tools available only when a device is connected — all now live
-    /// on the [`ToolRegistry`] (gated `WhenAndroidConnected`); this getter stays
-    /// as the seam the legacy union appends to and currently emits nothing.
-    fn get_android_tools() -> Vec<Tool> {
-        Vec::new()
-    }
-
-    /// Hover tracking tools — all now live on the [`ToolRegistry`]
-    /// (`start_hover_tracking` is `Always`; `get_hover_events` /
-    /// `stop_hover_tracking` are gated `WhenHoverTracking`). This getter stays
-    /// as the seam the legacy union appends to and currently emits nothing.
-    fn get_hover_tracking_tools(_tracking_active: bool) -> Vec<Tool> {
-        Vec::new()
-    }
-
-    /// Screen recording tools — all now live on the [`ToolRegistry`]
-    /// (`start_recording` is `Always`; `stop_recording` is gated
-    /// `WhenRecording`). This getter stays as the seam the legacy union appends
-    /// to and currently emits nothing.
-    fn get_recording_tools(_recording_active: bool) -> Vec<Tool> {
-        Vec::new()
-    }
-
-    /// All CDP tools have migrated to the `ToolHandler` registry. This getter
-    /// is retained as the empty legacy-union seam: `list_tools` still unions
-    /// its result with the registry, and a future change can remove the seam
-    /// entirely. Returns an empty Vec.
-    fn get_cdp_tools() -> Vec<Tool> {
-        Vec::new()
-    }
 }
 
 impl ServerHandler for MacOSDevToolsServer {
@@ -657,16 +440,13 @@ impl ServerHandler for MacOSDevToolsServer {
             .map(Value::Object)
             .unwrap_or(Value::Object(Default::default()));
 
-        // Try the registry first; fall through to the legacy match for tools
-        // not yet migrated. Migrated arms are deleted as they move.
         let registry = ToolRegistry::build();
-        if let Some(handler) = registry.get(request.name.as_ref()) {
-            let ctx = self.tool_context(context.peer);
-            return handler.call(args, &ctx).await;
-        }
-
-        match request.name.as_ref() {
-            _ => Err(McpError::invalid_params(
+        match registry.get(request.name.as_ref()) {
+            Some(handler) => {
+                let ctx = self.tool_context(context.peer);
+                handler.call(args, &ctx).await
+            }
+            None => Err(McpError::invalid_params(
                 format!("Unknown tool: {}", request.name),
                 None,
             )),
