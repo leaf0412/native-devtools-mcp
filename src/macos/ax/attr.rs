@@ -8,12 +8,12 @@
 //!
 //! ## Error model — `Err(AxError)` vs `Ok(None)`
 //! - `Ok(Some(v))` — attribute present and decoded as the requested type.
-//! - `Ok(None)`   — attribute legitimately absent
-//!                  (`kAXErrorNoValue` / `kAXErrorAttributeUnsupported`,
-//!                  or `value_ref == nullptr` after a "success" code).
-//! - `Err(Ffi)`   — unexpected non-success AX status code.
+//! - `Ok(None)` — attribute legitimately absent
+//!   (`kAXErrorNoValue` / `kAXErrorAttributeUnsupported`,
+//!   or `value_ref == nullptr` after a "success" code).
+//! - `Err(Ffi)` — unexpected non-success AX status code.
 //! - `Err(Decode)` — value present, but downcast to the requested CF type
-//!                   failed (programmer error: wrong wrapper for the key).
+//!   failed (programmer error: wrong wrapper for the key).
 //!
 //! Call sites that historically returned `Option<T>` re-conflate Err + None
 //! via `.ok().flatten()` — this is the explicit, grep-visible degradation
