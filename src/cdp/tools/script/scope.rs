@@ -58,15 +58,15 @@ pub(super) async fn borrow_page(
 }
 
 /// Resolve a scope UID end-to-end: snapshot lookup -> `backendNodeId` ->
-/// `DOM.resolveNode` -> live `objectId`. Returns one struct instead of the
-/// two-step pair the old code used.
+/// `DOM.resolveNode` -> live `objectId`. Single entry; the per-step
+/// helpers were deleted now that no caller needs the intermediates.
 pub(super) async fn resolve_element_scope(
     uid: &str,
     page: &Page,
     cdp_client: &Arc<RwLock<Option<CdpClient>>>,
 ) -> Result<ResolvedScope, CallToolResult> {
-    let backend_node_id = resolve_scope_backend_node_id(uid, page, cdp_client.clone()).await?;
-    let object_id = resolve_scope_object_id(uid, backend_node_id, page).await?;
+    let backend_node_id = lookup_backend_node_id(uid, page, cdp_client).await?;
+    let object_id = resolve_to_object_id(uid, backend_node_id, page).await?;
     Ok(ResolvedScope {
         uid: uid.to_string(),
         backend_node_id,
@@ -74,12 +74,10 @@ pub(super) async fn resolve_element_scope(
     })
 }
 
-/// Step-1 helper retained as a thin wrapper so existing wait code in
-/// `mod.rs` still compiles unchanged until step 4 moves to `wait.rs`.
-pub(super) async fn resolve_scope_backend_node_id(
+async fn lookup_backend_node_id(
     scope_uid: &str,
     page: &Page,
-    cdp_client: Arc<RwLock<Option<CdpClient>>>,
+    cdp_client: &Arc<RwLock<Option<CdpClient>>>,
 ) -> Result<i64, CallToolResult> {
     let current_url = page_url(page).await;
     let guard = cdp_client.read().await;
@@ -97,9 +95,7 @@ pub(super) async fn resolve_scope_backend_node_id(
     Ok(node.backend_node_id)
 }
 
-/// Step-2 helper retained as a thin wrapper so existing wait code in
-/// `mod.rs` still compiles unchanged until step 4 moves to `wait.rs`.
-pub(super) async fn resolve_scope_object_id(
+async fn resolve_to_object_id(
     scope_uid: &str,
     backend_node_id: i64,
     page: &Page,
