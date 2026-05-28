@@ -3,6 +3,28 @@
 //! Uses the macOS Accessibility tree for:
 //! - Text search: find UI elements by name (faster than OCR for standard controls)
 //! - Window raising: bring windows to front via AXRaise (works for bundle-less apps)
+//!
+//! Module layout (post-T4 split — currently being migrated):
+//! - `attr`: the sole owner of `AXUIElementCopyAttributeValue` (typed read seam).
+//! - `dispatch`: write-side classified errors (`AXDispatchError`, `press_element`,
+//!   `set_value_attribute`, `select_rows_attribute`).
+//! - `tree`: tree walks (snapshot, hit-test, ancestor chain, bbox).
+//! - `app`: PID resolution + window raising.
+//! - `find`: text search + element-at-point + element name listing.
+//! - `ffi`: extern "C" block + AX error/type constants + type aliases.
+
+#[allow(dead_code, unused_imports)]
+mod attr;
+#[allow(dead_code, unused_imports)]
+mod dispatch;
+#[allow(dead_code, unused_imports)]
+mod tree;
+#[allow(dead_code, unused_imports)]
+mod app;
+#[allow(dead_code, unused_imports)]
+mod find;
+#[allow(dead_code, unused_imports)]
+mod ffi;
 
 use super::ocr::{TextBounds, TextMatch};
 use crate::tools::ax_snapshot::{map_ax_role, AXSnapshotNode};
