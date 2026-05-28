@@ -9,6 +9,7 @@ pub mod handlers;
 mod input;
 mod pages;
 mod script;
+pub mod script_handlers;
 
 pub use element_at_point::cdp_element_at_point;
 pub use input::{cdp_click, cdp_fill, cdp_hover, cdp_press_key, cdp_type_text};
