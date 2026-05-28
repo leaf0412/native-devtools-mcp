@@ -144,6 +144,13 @@ impl ToolRegistry {
             tools.push(Box::new(crate::cdp::tools::handlers::CdpListPages));
             tools.push(Box::new(crate::cdp::tools::handlers::CdpSelectPage));
             tools.push(Box::new(crate::cdp::tools::handlers::CdpClosePage));
+            tools.push(Box::new(crate::cdp::tools::handlers::CdpClick));
+            tools.push(Box::new(crate::cdp::tools::handlers::CdpFill));
+            tools.push(Box::new(crate::cdp::tools::handlers::CdpTypeText));
+            tools.push(Box::new(crate::cdp::tools::handlers::CdpPressKey));
+            tools.push(Box::new(crate::cdp::tools::handlers::CdpHover));
+            tools.push(Box::new(crate::cdp::tools::handlers::CdpHandleDialog));
+            tools.push(Box::new(crate::cdp::tools::handlers::CdpElementAtPoint));
         }
         tools.push(Box::new(crate::android::tools::AndroidListDevices));
         tools.push(Box::new(crate::android::tools::AndroidConnect));

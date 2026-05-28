@@ -9,7 +9,9 @@
 //! stable. The whole module is gated `#[cfg(feature = "cdp")]` at its `mod`
 //! declaration, so no per-item `cfg` is needed here.
 
-use crate::tools::registry::{json_to_object, parse_string_field, ToolContext, ToolHandler};
+use crate::tools::registry::{
+    json_to_object, parse_string_field, parse_xy, ToolContext, ToolHandler,
+};
 use rmcp::model::{CallToolResult, Content, Tool};
 use rmcp::Error as McpError;
 use serde_json::Value;
@@ -283,5 +285,303 @@ impl ToolHandler for CdpClosePage {
             .map(|p| p as usize)
             .ok_or_else(|| McpError::invalid_params("missing required param: page_idx", None))?;
         Ok(crate::cdp::tools::cdp_close_page(page_idx, ctx.cdp_client.clone()).await)
+    }
+}
+
+/// `cdp_click` — click a DOM element by its UID.
+pub struct CdpClick;
+
+#[async_trait::async_trait]
+impl ToolHandler for CdpClick {
+    fn name(&self) -> &'static str {
+        "cdp_click"
+    }
+
+    fn schema(&self) -> Tool {
+        Tool::new(
+            "cdp_click",
+            "Click a DOM element by its UID from a cdp_take_dom_snapshot or cdp_find_elements result. Scrolls the element into view automatically and clicks its center. More reliable than coordinate-based clicking for web content.",
+            Arc::new(json_to_object(serde_json::json!({
+                "type": "object",
+                "required": ["uid"],
+                "properties": {
+                    "uid": {
+                        "type": "string",
+                        "description": "Element UID from cdp_take_dom_snapshot or cdp_find_elements (d-prefixed)"
+                    },
+                    "dbl_click": {
+                        "type": "boolean",
+                        "description": "Double-click instead of single click (default: false)"
+                    },
+                    "include_snapshot": {
+                        "type": "boolean",
+                        "description": "Appends a DOM snapshot (d-prefixed UIDs) to the response (default: false)"
+                    }
+                }
+            }))),
+        )
+    }
+
+    async fn call(&self, args: Value, ctx: &ToolContext) -> Result<CallToolResult, McpError> {
+        let uid = parse_string_field(&args, "uid")?;
+        let dbl_click = args
+            .get("dbl_click")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
+        let include_snapshot = args
+            .get("include_snapshot")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
+        Ok(
+            crate::cdp::tools::cdp_click(uid, dbl_click, include_snapshot, ctx.cdp_client.clone())
+                .await,
+        )
+    }
+}
+
+/// `cdp_hover` — hover over the provided element.
+pub struct CdpHover;
+
+#[async_trait::async_trait]
+impl ToolHandler for CdpHover {
+    fn name(&self) -> &'static str {
+        "cdp_hover"
+    }
+
+    fn schema(&self) -> Tool {
+        Tool::new(
+            "cdp_hover",
+            "Hover over the provided element.",
+            Arc::new(json_to_object(serde_json::json!({
+                "type": "object",
+                "required": ["uid"],
+                "properties": {
+                    "uid": {
+                        "type": "string",
+                        "description": "Element UID from cdp_take_dom_snapshot or cdp_find_elements (d-prefixed)"
+                    },
+                    "include_snapshot": {
+                        "type": "boolean",
+                        "description": "Appends a DOM snapshot (d-prefixed UIDs) to the response (default: false)"
+                    }
+                }
+            }))),
+        )
+    }
+
+    async fn call(&self, args: Value, ctx: &ToolContext) -> Result<CallToolResult, McpError> {
+        let uid = parse_string_field(&args, "uid")?;
+        let include_snapshot = args
+            .get("include_snapshot")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
+        Ok(crate::cdp::tools::cdp_hover(uid, include_snapshot, ctx.cdp_client.clone()).await)
+    }
+}
+
+/// `cdp_fill` — type into an input/textarea/contenteditable, or pick a select option.
+pub struct CdpFill;
+
+#[async_trait::async_trait]
+impl ToolHandler for CdpFill {
+    fn name(&self) -> &'static str {
+        "cdp_fill"
+    }
+
+    fn schema(&self) -> Tool {
+        Tool::new(
+            "cdp_fill",
+            "Type text into an input, text area, rich contenteditable editor, or select an option from a <select> element. Rich editors are focused inside the page and receive CDP keyboard insertion so framework state updates.",
+            Arc::new(json_to_object(serde_json::json!({
+                "type": "object",
+                "required": ["uid", "value"],
+                "properties": {
+                    "uid": {
+                        "type": "string",
+                        "description": "Element UID from cdp_take_dom_snapshot or cdp_find_elements (d-prefixed)"
+                    },
+                    "value": {
+                        "type": "string",
+                        "description": "The value to fill in"
+                    },
+                    "include_snapshot": {
+                        "type": "boolean",
+                        "description": "Appends a DOM snapshot (d-prefixed UIDs) to the response (default: false)"
+                    }
+                }
+            }))),
+        )
+    }
+
+    async fn call(&self, args: Value, ctx: &ToolContext) -> Result<CallToolResult, McpError> {
+        let uid = parse_string_field(&args, "uid")?;
+        let value = parse_string_field(&args, "value")?;
+        let include_snapshot = args
+            .get("include_snapshot")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
+        Ok(crate::cdp::tools::cdp_fill(uid, value, include_snapshot, ctx.cdp_client.clone()).await)
+    }
+}
+
+/// `cdp_press_key` — press a key or key combination.
+pub struct CdpPressKey;
+
+#[async_trait::async_trait]
+impl ToolHandler for CdpPressKey {
+    fn name(&self) -> &'static str {
+        "cdp_press_key"
+    }
+
+    fn schema(&self) -> Tool {
+        Tool::new(
+            "cdp_press_key",
+            "Press a key or key combination. Use this when other input methods like cdp_fill cannot be used (e.g., keyboard shortcuts, navigation keys, or special key combinations).",
+            Arc::new(json_to_object(serde_json::json!({
+                "type": "object",
+                "required": ["key"],
+                "properties": {
+                    "key": {
+                        "type": "string",
+                        "description": "A key or combination (e.g., 'Enter', 'Control+A', 'Control++', 'Control+Shift+R'). Modifiers: Control, Shift, Alt, Meta"
+                    },
+                    "include_snapshot": {
+                        "type": "boolean",
+                        "description": "Appends a DOM snapshot (d-prefixed UIDs) to the response (default: false)"
+                    }
+                }
+            }))),
+        )
+    }
+
+    async fn call(&self, args: Value, ctx: &ToolContext) -> Result<CallToolResult, McpError> {
+        let key = parse_string_field(&args, "key")?;
+        let include_snapshot = args
+            .get("include_snapshot")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
+        Ok(crate::cdp::tools::cdp_press_key(key, include_snapshot, ctx.cdp_client.clone()).await)
+    }
+}
+
+/// `cdp_handle_dialog` — accept or dismiss a browser dialog.
+pub struct CdpHandleDialog;
+
+#[async_trait::async_trait]
+impl ToolHandler for CdpHandleDialog {
+    fn name(&self) -> &'static str {
+        "cdp_handle_dialog"
+    }
+
+    fn schema(&self) -> Tool {
+        Tool::new(
+            "cdp_handle_dialog",
+            "If a browser dialog was opened, use this command to handle it.",
+            Arc::new(json_to_object(serde_json::json!({
+                "type": "object",
+                "required": ["action"],
+                "properties": {
+                    "action": {
+                        "type": "string",
+                        "enum": ["accept", "dismiss"],
+                        "description": "Whether to accept or dismiss the dialog"
+                    },
+                    "prompt_text": {
+                        "type": "string",
+                        "description": "Optional text to enter into a prompt dialog before accepting"
+                    }
+                }
+            }))),
+        )
+    }
+
+    async fn call(&self, args: Value, ctx: &ToolContext) -> Result<CallToolResult, McpError> {
+        let action = parse_string_field(&args, "action")?;
+        let prompt_text = args
+            .get("prompt_text")
+            .and_then(|v| v.as_str())
+            .map(String::from);
+        Ok(crate::cdp::tools::cdp_handle_dialog(action, prompt_text, ctx.cdp_client.clone()).await)
+    }
+}
+
+/// `cdp_type_text` — type text via keyboard into a previously focused input.
+pub struct CdpTypeText;
+
+#[async_trait::async_trait]
+impl ToolHandler for CdpTypeText {
+    fn name(&self) -> &'static str {
+        "cdp_type_text"
+    }
+
+    fn schema(&self) -> Tool {
+        Tool::new(
+            "cdp_type_text",
+            "Type text using keyboard into a previously focused input. Use cdp_fill for form fields; use this for character-by-character keyboard input.",
+            Arc::new(json_to_object(serde_json::json!({
+                "type": "object",
+                "required": ["text"],
+                "properties": {
+                    "text": {
+                        "type": "string",
+                        "description": "The text to type"
+                    },
+                    "submit_key": {
+                        "type": "string",
+                        "description": "Optional key to press after typing (e.g., 'Enter', 'Tab', 'Escape')"
+                    }
+                }
+            }))),
+        )
+    }
+
+    async fn call(&self, args: Value, ctx: &ToolContext) -> Result<CallToolResult, McpError> {
+        let text = parse_string_field(&args, "text")?;
+        let submit_key = args
+            .get("submit_key")
+            .and_then(|v| v.as_str())
+            .map(String::from);
+        Ok(crate::cdp::tools::cdp_type_text(text, submit_key, ctx.cdp_client.clone()).await)
+    }
+}
+
+/// `cdp_element_at_point` — hit-test the DOM element at screen coordinates.
+pub struct CdpElementAtPoint;
+
+#[async_trait::async_trait]
+impl ToolHandler for CdpElementAtPoint {
+    fn name(&self) -> &'static str {
+        "cdp_element_at_point"
+    }
+
+    fn schema(&self) -> Tool {
+        Tool::new(
+            "cdp_element_at_point",
+            "Given screen coordinates (x, y) in points, hit-test the DOM element at that \
+             position. Always returns the element's backend_node_id. If a current DOM \
+             snapshot already contains that node, the response also includes its d-prefixed \
+             UID, role, and name; otherwise uid is null and a note points at \
+             cdp_take_dom_snapshot / cdp_find_elements. Requires an active CDP connection. \
+             Coordinates use the same screen-point system as element_at_point and click.",
+            Arc::new(json_to_object(serde_json::json!({
+                "type": "object",
+                "required": ["x", "y"],
+                "properties": {
+                    "x": {
+                        "type": "number",
+                        "description": "Screen X coordinate in points"
+                    },
+                    "y": {
+                        "type": "number",
+                        "description": "Screen Y coordinate in points"
+                    }
+                }
+            }))),
+        )
+    }
+
+    async fn call(&self, args: Value, ctx: &ToolContext) -> Result<CallToolResult, McpError> {
+        let (x, y) = parse_xy(&args)?;
+        Ok(crate::cdp::tools::cdp_element_at_point(x, y, ctx.cdp_client.clone()).await)
     }
 }
