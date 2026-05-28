@@ -140,15 +140,22 @@ pub fn find_text(search: &str, window_id: Option<u32>) -> Result<Vec<TextMatch>,
 
     unsafe {
         walk_ax_tree(app_element, &mut element_count, 0, &mut |element| {
+            // `.ok().flatten()` is the project-wide convention for re-conflating
+            // attr::* `Result<Option<T>, AxError>` into the legacy Option<T>
+            // shape — Err (FFI / Decode failure) collapses to None alongside
+            // legitimately-absent values, matching prior `get_string_attribute`
+            // behavior. See ax::attr module docs.
             let matched_text = ["AXTitle", "AXValue", "AXDescription"]
                 .iter()
-                .filter_map(|attr| get_string_attribute(element, attr))
+                .filter_map(|attr| attr::string(element, attr).ok().flatten())
                 .find(|s| !s.is_empty() && s.to_lowercase().contains(search_lower.as_str()));
 
             if let Some(text) = matched_text {
-                if let Some((position, size)) = get_position_and_size(element) {
+                let position = attr::point(element, "AXPosition").ok().flatten();
+                let size = attr::size(element, "AXSize").ok().flatten();
+                if let (Some(position), Some(size)) = (position, size) {
                     if size.width > 0.0 && size.height > 0.0 {
-                        let role = get_string_attribute(element, "AXRole");
+                        let role = attr::string(element, "AXRole").ok().flatten();
                         let bounds = TextBounds {
                             x: position.x,
                             y: position.y,
