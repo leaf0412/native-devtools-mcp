@@ -39,8 +39,8 @@ Status as of the last run. ✅ verified end-to-end · ⚠️ partial · ❌ not 
 | Text path | `find_text`, `element_at_point` | ✅ | AX-first, OCR fallback; returns screen coords |
 | Coordinate input | `click`, `press_key` | ✅ | effect-verified via OCR (55 / 73) |
 | Pointer | `move_mouse`, `scroll`, `drag` | ⚠️ | calls succeed; **effect not verified** |
-| **AX dispatch** | `ax_click`, `ax_set_value`, `ax_select` | ❌ | **the preferred macOS path — UNVERIFIED.** Calculator's keypad is AX-opaque (`generic`), no named buttons. Needs an app with real AX buttons (System Settings / Notes / Mail). |
-| `type_text` | | ⚠️ | runs, but text didn't land in TextEdit (focus); **no landing check**; 13.4ms/char; byte-count-as-char bug |
+| **AX dispatch** | `ax_click`, `ax_set_value`, `ax_select` | ✅ | `ax_click`/`ax_select` dispatch (System Settings button/row); `ax_set_value` **lands** on AXValue-honoring fields (System Settings search → "bluetooth", confirmed via readback). ⚠️ a multi-line `NSTextView` (TextEdit doc) ignores `AXValue` set yet still returns ok — "ok" = AX call succeeded, not effect observed. |
+| `type_text` | | ✅ | char count fixed (was UTF-8 bytes). Lands when a text field is focused. ~13ms/char is inherent CGEvent cost (sleep-independent; batching breaks correctness) — **for bulk text into a field use `ax_set_value`** (sets the value at once). IME-active typing still untested. |
 | find_image | `find_image`, `load_image` | ✅ | crop self-match score 1.0 |
 | CDP | full `cdp_*` flow | ✅ | launch/navigate/snapshot/find/evaluate/disconnect |
 | Background | `start/stop_hover_tracking`, `start/stop_recording` | ✅ | recording writes real JPEG frames |
@@ -50,16 +50,13 @@ Status as of the last run. ✅ verified end-to-end · ⚠️ partial · ❌ not 
 ## Scenario backlog (prioritized for responsiveness — "跟手")
 
 **P0 — core path unverified or latency-critical**
-- AX dispatch end-to-end (`ax_click`/`ax_set_value`/`ax_select`) on an app with
-  real named AX buttons. This is the documented *preferred* macOS path and is
-  currently unverified.
-- `type_text`: (a) verify text actually lands (focus a real text field, OCR it);
-  (b) latency — 13.4ms/char means a 500-char paste ≈ 6.7s; (c) char count is
-  reported as UTF-8 **bytes** not chars ("你好世界MCP" → "15", should be 7).
 - `type_text` with a **Chinese IME active** — the flagged IME-safe feature.
-  Latin must land as latin (not pinyin), CJK must land correctly.
+  Latin must land as latin (not pinyin), CJK must land correctly. (Done: char
+  count, landing, batching/latency investigation, ax_set_value bulk path.)
 - Coordinate round-trip on Retina: `find_image` → `click` returned screen coords
   → verify the hit. The full visual loop a multimodal model relies on.
+- `ax_set_value` should report when the value did NOT take (e.g. NSTextView): an
+  ok that means "AX call succeeded" but "effect didn't happen" is a silent trap.
 
 **P1 — correctness across environments**
 - Multi-window app (`find_windows_by_app` main-first sort — the WeChat gotcha).
@@ -110,10 +107,14 @@ Status as of the last run. ✅ verified end-to-end · ⚠️ partial · ❌ not 
 - ✅ fixed: app_name only matched localized name (broke English/bundle-id targeting).
 - ✅ fixed: `focus_window` re-activated even when already frontmost (~1s → ~50ms).
 - ✅ fixed: CDP lock held across page RPCs; blocking platform calls on the executor.
-- ⬜ open: `type_text` reports byte count as char count.
-- ⬜ open: `type_text` ~13ms/char; long strings slow.
+- ✅ fixed: `type_text` reported byte count as char count.
+- ℹ️ inherent: `type_text` ~13ms/char is CGEvent post cost, NOT the sleep
+  (verified: latency identical at 5/2/1/0ms delay). Batching chars into one
+  event truncates to a short prefix, so it's not a safe speedup. Use
+  `ax_set_value` for bulk text into a field.
+- ⬜ open: `ax_set_value` returns ok even when the control ignores `AXValue`
+  (multi-line NSTextView) — should surface "value did not take".
 - ⬜ open: `AXScrollArea` mapped to `"scrollbar"` in snapshots (should be a container).
-- ⬜ open: AX dispatch path has no end-to-end verification yet.
 - ⬜ open: `find_image` default downscaling can drop a *literal* crop self-match
   below a 0.9 threshold on low-detail regions — 0.9 matching is less reliable
   than it looks. Worth documenting the threshold/downscale interaction.

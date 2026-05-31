@@ -107,6 +107,13 @@ def main():
     print(f"      -> after press_key 7,3, OCR reads '73': {ok}")
     results.append(("EFFECT: press_key -> display 73", ok))
 
+    print("=== E2. type_text reports CHARACTER count, not UTF-8 bytes ===")
+    # "你好A" is 3 chars / 7 bytes. Regression guard for the byte-count bug.
+    # (Typed into the focused Calculator — a harmless no-op; we only assert the
+    # response's reported count.)
+    show("type_text char count", m.call("type_text", {"text": "你好A"}),
+         verify=lambda r: "Typed 3 characters" in r["text"])
+
     print("=== F. find_image (real crop self-match via PIL) ===")
     try:
         from PIL import Image
