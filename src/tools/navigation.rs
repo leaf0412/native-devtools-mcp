@@ -71,24 +71,59 @@ pub struct LaunchAppParams {
     pub background: Option<bool>,
 }
 
+/// What `launch_app` should do given the current state of the target app.
+///
+/// Decided purely from "are args present" and "is the app already running",
+/// so the routing is unit-testable without a live app.
+#[derive(Debug, PartialEq, Eq)]
+enum LaunchAction {
+    /// Already running, no args: bring it to the front instead of launching.
+    Activate,
+    /// Already running but args were supplied — args only apply on a fresh launch.
+    RejectArgsWhileRunning,
+    /// Not running (or first launch): perform the actual launch.
+    Launch,
+}
+
+fn decide_launch_action(args_empty: bool, is_running: bool) -> LaunchAction {
+    match (is_running, args_empty) {
+        (true, true) => LaunchAction::Activate,
+        (true, false) => LaunchAction::RejectArgsWhileRunning,
+        (false, _) => LaunchAction::Launch,
+    }
+}
+
 pub fn launch_app(params: LaunchAppParams) -> CallToolResult {
     let args = params.args.as_deref().unwrap_or(&[]);
     let background = params.background.unwrap_or(false);
 
-    // If args are provided, check if the app is already running — args only apply on fresh launch
-    if !args.is_empty() && platform::is_app_running(&params.app_name) {
-        return CallToolResult::error(vec![Content::text(format!(
+    match decide_launch_action(args.is_empty(), platform::is_app_running(&params.app_name)) {
+        LaunchAction::Activate => activate_running_app(&params.app_name),
+        LaunchAction::RejectArgsWhileRunning => CallToolResult::error(vec![Content::text(format!(
             "'{}' is already running. CLI args only apply on fresh launch. Use quit_app to quit it first, then retry.",
             params.app_name
-        ))]);
-    }
-
-    match platform::launch_app(&params.app_name, args, background) {
-        Ok(()) => CallToolResult::success(vec![Content::text(format!(
-            "Launched '{}'",
-            params.app_name
         ))]),
-        Err(e) => CallToolResult::error(vec![Content::text(e)]),
+        LaunchAction::Launch => match platform::launch_app(&params.app_name, args, background) {
+            Ok(()) => CallToolResult::success(vec![Content::text(format!(
+                "Launched '{}'",
+                params.app_name
+            ))]),
+            Err(e) => CallToolResult::error(vec![Content::text(e)]),
+        },
+    }
+}
+
+/// Bring an already-running app to the front. Matches on the localized name
+/// (consistent with `list_apps`/`is_app_running`), avoiding the Launch Services
+/// `open -a` failure for localized app names.
+fn activate_running_app(app_name: &str) -> CallToolResult {
+    if platform::activate_app(app_name) {
+        CallToolResult::success(vec![Content::text(format!("Brought '{}' to front", app_name))])
+    } else {
+        CallToolResult::error(vec![Content::text(format!(
+            "'{}' is running but could not be brought to the front",
+            app_name
+        ))])
     }
 }
 
@@ -523,5 +558,36 @@ mod focus_window_tests {
         let json: serde_json::Value = serde_json::to_value(&result).unwrap();
         assert!(!json.as_object().unwrap().contains_key("bundle_id"));
         assert_eq!(json["kind"], "Native");
+    }
+}
+
+#[cfg(test)]
+mod launch_action_tests {
+    use super::*;
+
+    // Running + no args must activate, not re-launch: `open -a` fails on localized
+    // names (e.g. "微信"), but activate_app matches the localized name like list_apps.
+    #[test]
+    fn running_without_args_activates() {
+        assert_eq!(
+            decide_launch_action(true, true),
+            LaunchAction::Activate
+        );
+    }
+
+    // Args only apply on a fresh launch, so a running app + args is rejected, not activated.
+    #[test]
+    fn running_with_args_is_rejected() {
+        assert_eq!(
+            decide_launch_action(false, true),
+            LaunchAction::RejectArgsWhileRunning
+        );
+    }
+
+    // Not running always launches, regardless of whether args were supplied.
+    #[test]
+    fn not_running_launches_with_or_without_args() {
+        assert_eq!(decide_launch_action(true, false), LaunchAction::Launch);
+        assert_eq!(decide_launch_action(false, false), LaunchAction::Launch);
     }
 }
