@@ -384,7 +384,7 @@ impl ToolHandler for GetDisplays {
     ) -> Result<CallToolResult, McpError> {
         let params: GetDisplaysParams = serde_json::from_value(args)
             .map_err(|e| McpError::invalid_params(e.to_string(), None))?;
-        Ok(get_displays(params))
+        Ok(super::run_blocking_query(move || get_displays(params)).await)
     }
 }
 
@@ -437,7 +437,7 @@ impl ToolHandler for FindText {
     ) -> Result<CallToolResult, McpError> {
         let params: FindTextParams = serde_json::from_value(args)
             .map_err(|e| McpError::invalid_params(e.to_string(), None))?;
-        Ok(find_text(params))
+        Ok(super::run_blocking_query(move || find_text(params)).await)
     }
 }
 
@@ -482,7 +482,7 @@ impl ToolHandler for ElementAtPoint {
     ) -> Result<CallToolResult, McpError> {
         let params: ElementAtPointParams = serde_json::from_value(args)
             .map_err(|e| McpError::invalid_params(e.to_string(), None))?;
-        Ok(element_at_point(params))
+        Ok(super::run_blocking_query(move || element_at_point(params)).await)
     }
 }
 

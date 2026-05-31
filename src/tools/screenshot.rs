@@ -85,8 +85,17 @@ pub async fn take_screenshot(
     // Track resolved window_id for metadata (important when using app_name)
     let mut resolved_window_id: Option<u32> = None;
 
+    // Capture is blocking (screencapture subprocess on macOS, BitBlt on
+    // Windows); run it off the executor so it doesn't pin a tokio worker.
     let result = match params.mode.as_str() {
-        "screen" => platform::capture_screen(),
+        "screen" => tokio::task::spawn_blocking(platform::capture_screen)
+            .await
+            .unwrap_or_else(|e| {
+                Err(platform::ScreenshotError::CaptureError(format!(
+                    "Screenshot task failed: {}",
+                    e
+                )))
+            }),
         "window" => {
             let window_id = match (params.window_id, &params.app_name) {
                 (Some(id), _) => id,
@@ -113,7 +122,14 @@ pub async fn take_screenshot(
             };
             // Store the resolved window_id for metadata
             resolved_window_id = Some(window_id);
-            platform::capture_window(window_id)
+            tokio::task::spawn_blocking(move || platform::capture_window(window_id))
+                .await
+                .unwrap_or_else(|e| {
+                Err(platform::ScreenshotError::CaptureError(format!(
+                    "Screenshot task failed: {}",
+                    e
+                )))
+            })
         }
         "region" => {
             let (x, y, w, h) = match (params.x, params.y, params.width, params.height) {
@@ -124,7 +140,14 @@ pub async fn take_screenshot(
                     )]);
                 }
             };
-            platform::capture_region(x, y, w, h)
+            tokio::task::spawn_blocking(move || platform::capture_region(x, y, w, h))
+                .await
+                .unwrap_or_else(|e| {
+                Err(platform::ScreenshotError::CaptureError(format!(
+                    "Screenshot task failed: {}",
+                    e
+                )))
+            })
         }
         _ => {
             return CallToolResult::error(vec![Content::text(format!(
@@ -180,14 +203,26 @@ pub async fn take_screenshot(
                 contents.push(Content::text(json));
             }
 
-            // Run OCR if requested
+            // Run OCR if requested. OCR is blocking (Vision on macOS, a
+            // WinRT `IAsyncOperation::get()` on Windows); move the PNG into a
+            // blocking task so it doesn't pin a tokio worker. `png_data` is no
+            // longer needed after the JPEG conversion above, so it's moved, not
+            // cloned.
             if params.include_ocr {
-                #[cfg(target_os = "macos")]
-                let ocr_result =
-                    platform::ocr_image(&screenshot.png_data, Some(screenshot.scale_factor), false);
-                #[cfg(target_os = "windows")]
-                let ocr_result =
-                    platform::ocr_image(&screenshot.png_data, Some(screenshot.scale_factor));
+                let scale = screenshot.scale_factor;
+                let png = screenshot.png_data;
+                let ocr_result = tokio::task::spawn_blocking(move || {
+                    #[cfg(target_os = "macos")]
+                    {
+                        platform::ocr_image(&png, Some(scale), false)
+                    }
+                    #[cfg(target_os = "windows")]
+                    {
+                        platform::ocr_image(&png, Some(scale))
+                    }
+                })
+                .await
+                .unwrap_or_else(|e| Err(format!("OCR task failed: {}", e)));
                 match ocr_result {
                     Ok(mut matches) => {
                         apply_ocr_offset(&mut matches, screenshot.origin_x, screenshot.origin_y);

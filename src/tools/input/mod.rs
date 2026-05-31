@@ -40,6 +40,19 @@ pub(crate) fn check_permission() -> Option<CallToolResult> {
     None
 }
 
+/// Run a blocking platform query that already produces a `CallToolResult`
+/// (e.g. `find_text`, `element_at_point`, `get_displays`) off the async
+/// executor via `spawn_blocking`, so a slow accessibility/UIA/OCR call doesn't
+/// pin a tokio worker thread and stall every other tool.
+pub(super) async fn run_blocking_query<F>(op: F) -> CallToolResult
+where
+    F: FnOnce() -> CallToolResult + Send + 'static,
+{
+    tokio::task::spawn_blocking(op)
+        .await
+        .unwrap_or_else(|e| CallToolResult::error(vec![Content::text(format!("Task failed: {}", e))]))
+}
+
 /// Run a blocking input operation and convert the result to CallToolResult.
 pub(super) async fn run_input<F>(op: F, success_msg: String, error_prefix: &str) -> CallToolResult
 where
