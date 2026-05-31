@@ -26,6 +26,13 @@ find_image check.
 The script verifies the **effect** of each action (after clicking "5" twice, OCR
 must read "55"), never just "the tool returned success".
 
+**For CI**, use `ci_runner.py` instead — it produces a pass/fail report
+(`report.html`/`report.json`), a screen-recorded video (`run.mp4`), and the
+exact reproduction call-log per scenario, and exits non-zero on failure. See
+**[CI.md](./CI.md)** for the GitLab setup and the (critical) self-hosted-runner
+requirements. `macos_smoke.py` here is the interactive dev smoke; `ci_runner.py`
+is the gated CI entrypoint.
+
 ## Coverage map (macOS)
 
 Status as of the last run. ✅ verified end-to-end · ⚠️ partial · ❌ not yet tested.
