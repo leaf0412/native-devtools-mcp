@@ -9,6 +9,8 @@
 
 `native-devtools-mcp` gives AI agents and MCP clients direct control over native desktop apps, Chrome/Electron browsers, and Android devices — screenshots, OCR, accessibility-first element lookup, input simulation, window management, Chrome DevTools Protocol (CDP), and ADB — all in one local server. Works with [Claude Desktop](https://claude.ai/download), [Claude Code](https://docs.anthropic.com/en/docs/claude-code), [Cursor](https://cursor.com), and other MCP-compatible clients.
 
+> **ℹ️ This is a personal fork.** This repository is maintained by [@leaf0412](https://github.com/leaf0412) for independent development, built on and referencing the original [`sh3ll3x3c/native-devtools-mcp`](https://github.com/sh3ll3x3c/native-devtools-mcp). All credit for the upstream project belongs to its original author; changes here are not contributed back upstream.
+
 ## Quickstart
 
 ```bash
