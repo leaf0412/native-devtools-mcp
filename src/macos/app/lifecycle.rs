@@ -167,17 +167,8 @@ pub fn list_apps() -> Vec<AppInfo> {
     apps
 }
 
-/// Return PIDs of running apps whose **bundle identifier** or **English bundle
-/// name** matches `needle` (case-insensitive substring).
-///
-/// `find_windows_by_app` matches the window owner name, which the OS reports in
-/// the user's locale (e.g. "计算器" for Calculator on a Chinese system). A model
-/// driving this server naturally passes the English name it launched the app
-/// with ("Calculator") or its bundle id ("com.apple.calculator"); neither
-/// matches the localized owner name. This resolves those via
-/// NSRunningApplication, which exposes both, so app targeting works regardless
-/// of system locale. The localized name is intentionally NOT matched here —
-/// callers already get that from the owner-name path.
+/// Return PIDs of running apps matching `needle` (case-insensitive) by
+/// localized name, bundle id, or English bundle name — see [`app_matches_name`].
 pub fn pids_matching_app_name(needle: &str) -> HashSet<i32> {
     let needle = needle.to_lowercase();
     let mut pids = HashSet::new();
@@ -186,29 +177,39 @@ pub fn pids_matching_app_name(needle: &str) -> HashSet<i32> {
     }
     unsafe {
         for app in get_running_apps() {
-            if !is_app_alive(app) {
-                continue;
-            }
-            let pid: i32 = msg_send![app, processIdentifier];
-
-            let bundle_id_ns: id = msg_send![app, bundleIdentifier];
-            if bundle_id_ns != nil
-                && nsstring_to_string(bundle_id_ns)
-                    .to_lowercase()
-                    .contains(&needle)
-            {
+            if is_app_alive(app) && app_matches_name(app, &needle) {
+                let pid: i32 = msg_send![app, processIdentifier];
                 pids.insert(pid);
-                continue;
-            }
-
-            if let Some(eng) = english_name_for_app(app) {
-                if eng.to_lowercase().contains(&needle) {
-                    pids.insert(pid);
-                }
             }
         }
     }
     pids
+}
+
+/// True if an NSRunningApplication matches `needle` (already lowercased) by
+/// **localized name**, **bundle identifier**, or **English bundle name**.
+///
+/// Single source of truth for locale-robust app-name matching. The OS reports
+/// the localized name in the user's locale (e.g. "计算器" for Calculator on a
+/// Chinese system), but a client naturally passes the English name it launched
+/// the app with ("Calculator") or the bundle id ("com.apple.calculator"). Every
+/// app-name lookup (activate / quit / is_running / pid resolution) routes
+/// through this so they behave identically regardless of system locale.
+unsafe fn app_matches_name(app: id, needle: &str) -> bool {
+    let name_ns: id = msg_send![app, localizedName];
+    if name_ns != nil && nsstring_to_string(name_ns).to_lowercase().contains(needle) {
+        return true;
+    }
+    let bundle_id_ns: id = msg_send![app, bundleIdentifier];
+    if bundle_id_ns != nil && nsstring_to_string(bundle_id_ns).to_lowercase().contains(needle) {
+        return true;
+    }
+    if let Some(eng) = english_name_for_app(app) {
+        if eng.to_lowercase().contains(needle) {
+            return true;
+        }
+    }
+    false
 }
 
 /// English app name from an NSRunningApplication's bundle URL
@@ -228,16 +229,12 @@ unsafe fn english_name_for_app(app: id) -> Option<String> {
 
 /// Activate (focus) an application by name
 pub fn activate_app(app_name: &str) -> bool {
+    let needle = app_name.to_lowercase();
     unsafe {
         for app in get_running_apps() {
-            let name_ns: id = msg_send![app, localizedName];
-
-            if name_ns != nil {
-                let name = nsstring_to_string(name_ns);
-                if name.to_lowercase().contains(&app_name.to_lowercase()) {
-                    let _: bool = msg_send![app, activateWithOptions: 1u64]; // NSApplicationActivateIgnoringOtherApps
-                    return true;
-                }
+            if app_matches_name(app, &needle) {
+                let _: bool = msg_send![app, activateWithOptions: 1u64]; // NSApplicationActivateIgnoringOtherApps
+                return true;
             }
         }
     }
@@ -299,12 +296,8 @@ pub fn is_app_running(app_name: &str) -> bool {
                 continue;
             }
 
-            let name_ns: id = msg_send![app, localizedName];
-            if name_ns != nil {
-                let name = nsstring_to_string(name_ns);
-                if name.to_lowercase().contains(&needle) {
-                    return true;
-                }
+            if app_matches_name(app, &needle) {
+                return true;
             }
         }
     }
@@ -381,18 +374,14 @@ pub fn quit_app(app_name: &str, force: bool) -> Result<u32, String> {
                 continue;
             }
 
-            let name_ns: id = msg_send![app, localizedName];
-            if name_ns != nil {
-                let name = nsstring_to_string(name_ns);
-                if name.to_lowercase().contains(&needle) {
-                    let success: bool = if force {
-                        msg_send![app, forceTerminate]
-                    } else {
-                        msg_send![app, terminate]
-                    };
-                    if success {
-                        terminated += 1;
-                    }
+            if app_matches_name(app, &needle) {
+                let success: bool = if force {
+                    msg_send![app, forceTerminate]
+                } else {
+                    msg_send![app, terminate]
+                };
+                if success {
+                    terminated += 1;
                 }
             }
         }
