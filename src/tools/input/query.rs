@@ -193,6 +193,12 @@ const MAX_HINT_ELEMENTS: usize = 200;
 
 /// Build a "no matches found" hint JSON string with available element names.
 /// Shared between desktop `find_text` and `android_find_text`.
+///
+/// `available_elements` are real accessibility nodes, but for accessibility-opaque
+/// apps (custom-drawn UIs that expose only the menu bar to the AX tree) they do
+/// NOT represent the on-screen content. We surface that uncertainty explicitly so
+/// the caller doesn't mistake the menu items for "everything that's available",
+/// and point them at the OCR/coordinate path that can actually see custom content.
 pub fn build_no_matches_hint(search: &str, available_elements: &[String]) -> String {
     let capped: Vec<&str> = available_elements
         .iter()
@@ -200,7 +206,13 @@ pub fn build_no_matches_hint(search: &str, available_elements: &[String]) -> Str
         .map(|s| s.as_str())
         .collect();
     let hint = serde_json::json!({
-        "message": format!("No matches found for \"{}\"", search),
+        "message": format!(
+            "No matches found for \"{}\" in the accessibility tree or via OCR. \
+             The app may render content outside the accessibility tree (custom-drawn UI), \
+             so `available_elements` below may only list the menu bar and miss the real content. \
+             Retry with take_screenshot(include_ocr=true) and click by the returned coordinates.",
+            search
+        ),
         "available_elements": capped,
     });
     hint.to_string()
@@ -493,6 +505,33 @@ mod tests {
             },
             role: role.map(|s| s.to_string()),
         }
+    }
+
+    #[test]
+    fn test_no_matches_hint_guides_to_ocr_for_opaque_apps() {
+        // For accessibility-opaque apps the listed elements (e.g. menu bar) are
+        // misleading on their own; the hint must steer the caller to the OCR +
+        // coordinate path instead of treating the menu items as the full UI.
+        let hint = build_no_matches_hint("发送", &["File".to_string(), "Edit".to_string()]);
+        let parsed: serde_json::Value =
+            serde_json::from_str(&hint).expect("hint should be valid JSON");
+        let message = parsed["message"].as_str().expect("message should be a string");
+
+        assert!(message.contains("发送"), "message should echo the search term");
+        assert!(
+            message.contains("take_screenshot(include_ocr=true)"),
+            "message must point to the OCR screenshot path: {message}"
+        );
+        assert!(
+            message.contains("coordinates"),
+            "message must mention clicking by coordinates: {message}"
+        );
+        assert!(
+            message.contains("outside the accessibility tree"),
+            "message must explain custom-drawn content is invisible to AX: {message}"
+        );
+        // Real elements are still preserved, just no longer presented as authoritative.
+        assert_eq!(parsed["available_elements"], serde_json::json!(["File", "Edit"]));
     }
 
     #[test]
