@@ -131,6 +131,9 @@ unsafe fn run_vision_ocr(
     let _: () = msg_send![request, setRecognitionLevel: 0isize];
     let _: () = msg_send![request, setUsesLanguageCorrection: uses_language_correction as i8];
 
+    // Recognize across common scripts instead of English-only default.
+    configure_languages(request);
+
     // Execute request
     let requests: *mut Object = msg_send![array_class, arrayWithObject: request];
     let mut error: *mut Object = ptr::null_mut();
@@ -196,6 +199,62 @@ unsafe fn run_vision_ocr(
     let _: () = msg_send![pool, drain];
 
     Ok(matches)
+}
+
+/// Configure the recognition request to handle text in multiple scripts.
+///
+/// By default `VNRecognizeTextRequest` recognizes English only. Without setting
+/// languages, non-Latin text (Chinese, Japanese, Korean, etc.) is missed or
+/// garbled. This does NOT assume the user's language: it casts a wide net.
+///
+/// - `setRecognitionLanguages:` provides a broad multilingual list. This is the
+///   effective path on macOS < 13 (which lack automatic detection).
+/// - `setAutomaticallyDetectsLanguage:` (macOS 13+) lets Vision pick languages
+///   itself; the explicit list above then acts as a prioritized hint.
+///
+/// Both selectors are guarded with `respondsToSelector:` so the call is a safe
+/// no-op on systems that predate them (never crashes on older macOS).
+///
+/// # Safety
+/// `request` must be a live `VNRecognizeTextRequest`. Must run inside an active
+/// autorelease pool (the NSStrings/NSArray built here are autoreleased).
+unsafe fn configure_languages(request: *mut Object) {
+    let array_class = match Class::get("NSArray") {
+        Some(class) => class,
+        None => return,
+    };
+    let string_class = match Class::get("NSString") {
+        Some(class) => class,
+        None => return,
+    };
+
+    // Broad multilingual net covering common scripts. NOT user-language biased.
+    let codes = ["en-US", "zh-Hans", "zh-Hant", "ja-JP", "ko-KR"];
+    let mut language_objects: Vec<*mut Object> = Vec::with_capacity(codes.len());
+    for code in codes {
+        let c_code = std::ffi::CString::new(code).expect("language code has no interior NUL");
+        // Autoreleased NSString; the caller's autorelease pool owns it.
+        let ns_code: *mut Object = msg_send![string_class, stringWithUTF8String: c_code.as_ptr()];
+        language_objects.push(ns_code);
+    }
+    // Autoreleased NSArray; owned by the caller's autorelease pool.
+    let languages: *mut Object = msg_send![
+        array_class,
+        arrayWithObjects: language_objects.as_ptr()
+        count: language_objects.len()
+    ];
+
+    let responds_languages: bool =
+        msg_send![request, respondsToSelector: sel!(setRecognitionLanguages:)];
+    if responds_languages {
+        let _: () = msg_send![request, setRecognitionLanguages: languages];
+    }
+
+    let responds_auto: bool =
+        msg_send![request, respondsToSelector: sel!(setAutomaticallyDetectsLanguage:)];
+    if responds_auto {
+        let _: () = msg_send![request, setAutomaticallyDetectsLanguage: true as i8];
+    }
 }
 
 unsafe fn nsstring_to_string(nsstring: *mut Object) -> String {
