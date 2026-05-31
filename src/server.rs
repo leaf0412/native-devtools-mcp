@@ -311,7 +311,7 @@ impl MacOSDevToolsServer {
             );
             annotate_tools(
                 tools,
-                &["cdp_navigate", "cdp_new_page"],
+                &["cdp_launch", "cdp_navigate", "cdp_new_page"],
                 annotate_open_world_state_change(),
             );
             annotate_tools(
