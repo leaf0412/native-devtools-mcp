@@ -19,6 +19,8 @@ class MCP:
         self.q = queue.Queue()
         threading.Thread(target=self._reader, daemon=True).start()
         self._id = 0
+        # Ordered log of every tool call — the reproduction trail for the report.
+        self.calllog = []
 
     def _reader(self):
         for line in self.proc.stdout:
@@ -76,16 +78,26 @@ class MCP:
                     "params": {"name": name, "arguments": args}})
         r, dt = self._wait(rid, timeout)
         if r is None:
-            return {"ok": False, "err": "timeout", "text": "", "ms": dt * 1000, "img": 0, "img_b64": ""}
+            out = {"ok": False, "err": "timeout", "text": "", "ms": dt * 1000, "img": 0, "img_b64": ""}
+            self.calllog.append({"seq": len(self.calllog) + 1, "tool": name, "args": args,
+                                 "ms": round(out["ms"]), "ok": False, "result": "TIMEOUT"})
+            return out
         # A JSON-RPC error has no "result" — do NOT treat missing result as success.
         if "error" in r:
-            return {"ok": False, "err": r["error"].get("message", ""), "text": "",
-                    "ms": dt * 1000, "img": 0, "img_b64": ""}
+            out = {"ok": False, "err": r["error"].get("message", ""), "text": "",
+                   "ms": dt * 1000, "img": 0, "img_b64": ""}
+            self.calllog.append({"seq": len(self.calllog) + 1, "tool": name, "args": args,
+                                 "ms": round(out["ms"]), "ok": False, "result": "RPC-ERROR: " + out["err"][:150]})
+            return out
         res = r.get("result", {})
         text = "".join(c.get("text", "") for c in res.get("content", []) if c.get("type") == "text")
         imgs = [c.get("data", "") for c in res.get("content", []) if c.get("type") == "image"]
-        return {"ok": not res.get("isError", False), "err": "", "text": text,
-                "ms": dt * 1000, "img": sum(len(d) for d in imgs), "img_b64": imgs[0] if imgs else ""}
+        out = {"ok": not res.get("isError", False), "err": "", "text": text,
+               "ms": dt * 1000, "img": sum(len(d) for d in imgs), "img_b64": imgs[0] if imgs else ""}
+        self.calllog.append({"seq": len(self.calllog) + 1, "tool": name, "args": args,
+                             "ms": round(out["ms"]), "ok": out["ok"],
+                             "result": (out["text"] or out["err"])[:200]})
+        return out
 
     def close(self):
         try:
