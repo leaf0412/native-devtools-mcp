@@ -32,8 +32,8 @@ npx -y native-devtools-mcp
 
 ## 🚀 Features
 
-- **👀 Computer Vision:** Screenshots of screens, windows, or regions with built-in OCR (Vision on macOS, Windows Media OCR on Windows).
-- **🖱️ Input Simulation:** Click, drag, scroll, type — global coordinates, window-relative, and screenshot-relative targeting.
+- **👀 Computer Vision:** Screenshots of screens, windows, or regions with built-in multilingual OCR — Latin + CJK (Chinese/Japanese/Korean) — via Vision on macOS and Windows Media OCR on Windows.
+- **🖱️ Input Simulation:** Click, drag, scroll, type — global coordinates, window-relative, and screenshot-relative targeting. `type_text` inserts literal text even when a Chinese/Japanese IME is active (it neutralizes the active input source for the keystrokes, then restores it).
 - **🎯 Element-Precise AX Dispatch (macOS):** `take_ax_snapshot` → `ax_click` / `ax_set_value` / `ax_select` — dispatch against Accessibility-tree elements without moving the mouse or stealing focus. The preferred path for native macOS apps.
 - **🌐 Browser Automation (CDP):** Chrome DevTools Protocol for Chrome and Electron apps (Signal, Discord, VS Code, Slack) — DOM-level click, fill, navigate, and JS evaluation without a separate Node.js server.
 - **📱 Android (ADB):** Screenshots, uiautomator-based text lookup, input, and app management over USB or Wi-Fi.
@@ -50,7 +50,7 @@ Pick the approach that matches your target app.
 |-----------------------|--------------------------------------------------------------------------|-------------------------------------------------------------------------|
 | **Visual** (universal)| Any app — games, Qt, custom renderers, anything without an AX tree       | `take_screenshot`, `find_text`, `click`, `type_text`, `find_image`      |
 | **AX Dispatch** (macOS — *preferred for native macOS apps*) | AppKit / SwiftUI apps — System Settings, Finder, Mail, Xcode, Notes | `take_ax_snapshot`, `ax_click`, `ax_set_value`, `ax_select`             |
-| **CDP** (Chrome / Electron) | Web content, Electron apps with `--remote-debugging-port`          | `cdp_connect`, `cdp_find_elements`, `cdp_take_dom_snapshot`, `cdp_click`, `cdp_fill` |
+| **CDP** (Chrome / Electron) | Web content, Electron apps with `--remote-debugging-port`          | `cdp_launch`, `cdp_connect`, `cdp_find_elements`, `cdp_take_dom_snapshot`, `cdp_click`, `cdp_fill` |
 
 > For macOS native apps, **AX Dispatch is the preferred path** — it's element-precise, doesn't move the mouse, and doesn't steal focus. See the [Native App AX Dispatch recipe](./examples/native-app-ax-dispatch-flow.md).
 
@@ -120,6 +120,8 @@ cd native-devtools-mcp
 cargo build --release
 # Binary: ./target/release/native-devtools-mcp
 ```
+
+Requires **Rust 1.91+** (the `adb_client` dependency needs it). The repo pins this via `.tool-versions`, so [asdf](https://asdf-vm.com) users get the right toolchain automatically; otherwise `rustup update stable`.
 
 </details>
 
@@ -212,12 +214,10 @@ Then restart your MCP client and you're ready to go.
 
 Connect to Chrome or Electron apps via the Chrome DevTools Protocol for DOM-level automation — more reliable than coordinate-based clicking for web content.
 
-```bash
-# Launch Chrome with remote debugging
-launch_app(app_name="Google Chrome", args=["--remote-debugging-port=9222", "--user-data-dir=/tmp/chrome-profile"])
+**Recommended: `cdp_launch`** starts Chrome with remote debugging on a stable, dedicated profile and connects in one step. Because the profile persists across runs, you log into a site once and stay logged in on every later launch:
 
-# Connect and automate
-cdp_connect(port=9222)
+```bash
+cdp_launch(port=9222)                # launches (or reuses) a managed debug Chrome, then connects
 cdp_navigate(url="https://example.com")
 cdp_find_elements(query="search")    # DOM walker with element UIDs (d1, d2, ...)
 cdp_fill(uid="d1", value="search query")
@@ -225,9 +225,13 @@ cdp_press_key(key="Enter")
 cdp_wait_for(text=["Results"])
 ```
 
-**18 CDP tools** — DOM snapshot, find elements, click, hover, fill, type, press key, navigate, handle dialogs, manage tabs, evaluate JS, element inspection, and more. Works with Chrome 136+, Chromium, and Electron apps (Signal, Discord, VS Code, Slack). See [`AGENTS.md`](./AGENTS.md) for the full tool reference.
+If a debug browser is already running on the port, `cdp_launch` reuses it (keeping its session). To attach to a browser you launched yourself, use `cdp_connect(port=...)` instead.
 
-> **Chrome 136+ note:** requires `--user-data-dir=<path>` alongside `--remote-debugging-port` — Chrome silently ignores the debug port with the default profile. Electron apps only need `--remote-debugging-port`.
+**19 CDP tools** — launch, connect, DOM snapshot, find elements, click, hover, fill, type, press key, navigate, handle dialogs, manage tabs, evaluate JS, element inspection, and more. Works with Chrome 136+, Chromium, and Electron apps (Signal, Discord, VS Code, Slack). See [`AGENTS.md`](./AGENTS.md) for the full tool reference.
+
+> **Logged-in sessions:** the server cannot attach to your normal default-profile Chrome — Chrome 136+ blocks the debug port on the default profile, and an already-running browser cannot enable it retroactively. `cdp_launch` sidesteps this with a dedicated profile under `~/.native-devtools-mcp/`: sign in once on first launch and the session is reused thereafter.
+
+> **Chrome 136+ note:** the debug port requires a non-default `--user-data-dir`; `cdp_launch` sets this for you. If you launch Chrome manually for `cdp_connect`, pass both `--remote-debugging-port` and `--user-data-dir=<path>`. Electron apps only need `--remote-debugging-port`.
 
 ## 📱 Android Support
 
