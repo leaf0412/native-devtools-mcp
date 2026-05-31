@@ -8,7 +8,13 @@ use chromiumoxide::cdp::js_protocol::runtime::{
     CallArgument, CallFunctionOnParams, EvaluateParams, ReleaseObjectParams,
 };
 use chromiumoxide::page::Page;
+use futures_util::stream::StreamExt;
 use rmcp::model::CallToolResult;
+
+/// Max number of candidate-resolution chains (3 RPCs each) kept in flight at
+/// once over the single CDP WebSocket. Bounds the burst — at `max_nodes=500`
+/// an unbounded fan-out would queue ~1500 messages simultaneously.
+const DOM_RESOLVE_CONCURRENCY: usize = 16;
 
 /// Shared DOM walker + single-pass resolution logic used by both
 /// `cdp_find_elements` and `cdp_take_dom_snapshot`.
@@ -76,16 +82,20 @@ pub(super) async fn resolve_dom_candidates(
             Err(_) => Vec::new(),
         };
 
-    // Step 4: Resolve backendNodeIds in parallel. Each element requires three
-    // RPCs (get ref, DOM.describeNode, releaseObject) — running them in
-    // parallel pipelines them over the single CDP WebSocket instead of
-    // paying round-trip latency per element.
+    // Step 4: Resolve backendNodeIds with bounded parallelism. Each element
+    // requires three RPCs (get ref, DOM.describeNode, releaseObject); pipelining
+    // them over the single CDP WebSocket hides round-trip latency, but the
+    // fan-out is capped at DOM_RESOLVE_CONCURRENCY so a large page doesn't queue
+    // ~1500 messages at once. `buffered` (not `buffer_unordered`) preserves
+    // candidate order, which downstream UID assignment (d1, d2, …) depends on.
     let describe_futures = all_metadata.into_iter().enumerate().map(|(i, candidate)| {
         let result_object_id = result_object_id.clone();
         async move { resolve_candidate(page, &result_object_id, i, candidate).await }
     });
     let candidates: Vec<crate::cdp::dom_discovery::DomCandidate> =
-        futures_util::future::join_all(describe_futures)
+        futures_util::stream::iter(describe_futures)
+            .buffered(DOM_RESOLVE_CONCURRENCY)
+            .collect::<Vec<_>>()
             .await
             .into_iter()
             .flatten()

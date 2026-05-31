@@ -57,21 +57,17 @@ pub async fn cdp_wait_for(
     result
 }
 
-/// One probe of the page-text predicate. Re-acquires the CDP RwLock so
-/// concurrent CDP work can interleave between polls (load-bearing — do
-/// NOT hoist the lock above the loop). A failed `page.execute` is
-/// silently treated as "not found yet" to match the pre-extraction
-/// behaviour; only a missing CDP connection bubbles up as a hard error.
+/// One probe of the page-text predicate. Checks out the page per probe so the
+/// CDP lock is released before the eval RPC and concurrent CDP work can
+/// interleave between polls (load-bearing — do NOT hoist the checkout above the
+/// loop). A failed `page.execute` is silently treated as "not found yet" to
+/// match the pre-extraction behaviour; only a missing CDP connection bubbles up
+/// as a hard error.
 async fn poll_text_once(
     check_js: &str,
     cdp_client: &Arc<RwLock<Option<CdpClient>>>,
 ) -> Result<bool, CallToolResult> {
-    let guard = cdp_client.read().await;
-    let client = match guard.as_ref() {
-        Some(c) => c,
-        None => return Err(cdp_error("No CDP connection. Use cdp_connect first.")),
-    };
-    let page = client.require_page()?;
+    let (page, _generation) = crate::cdp::checkout_page(cdp_client).await?;
 
     let mut eval_params = EvaluateParams::new(check_js);
     eval_params.return_by_value = Some(true);

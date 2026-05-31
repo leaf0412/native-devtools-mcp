@@ -12,9 +12,14 @@ use chromiumoxide::page::Page;
 use futures_util::StreamExt;
 use rmcp::model::{CallToolResult, Content};
 use std::collections::HashMap;
+use std::sync::Arc;
+use tokio::sync::RwLock;
 use tokio::task::JoinHandle;
 
 pub const DOM_UID_PREFIX: &str = "d";
+
+/// Shared, optionally-connected CDP client owned by the MCP server.
+pub type SharedCdp = Arc<RwLock<Option<CdpClient>>>;
 
 /// CDP client state, owned by the MCP server.
 pub struct CdpClient {
@@ -87,6 +92,40 @@ impl CdpClient {
         self.selected_page.clone().ok_or_else(|| {
             cdp_error("No page selected. Use cdp_list_pages and cdp_select_page first.")
         })
+    }
+}
+
+/// Check out the selected [`Page`] and the current generation under a brief
+/// read lock, releasing the lock *before returning*.
+///
+/// This is the entry point for the project's concurrency rule: **never hold
+/// the CDP lock across a `page.execute().await`**. Callers get an owned `Page`
+/// clone (chromiumoxide pages are cheap `Arc` handles) plus the generation
+/// stamp, then do all async CDP work lock-free. Mutations are written back via
+/// [`commit_cdp`].
+///
+/// Returns a ready-to-return tool error if there is no connection or no
+/// selected page.
+pub async fn checkout_page(client: &SharedCdp) -> Result<(Page, u64), CallToolResult> {
+    let guard = client.read().await;
+    let c = guard
+        .as_ref()
+        .ok_or_else(|| cdp_error("No CDP connection. Use cdp_connect first."))?;
+    let page = c.require_page()?;
+    Ok((page, c.generation))
+}
+
+/// Re-acquire the write lock *briefly* to commit mutations back onto the
+/// `CdpClient` after lock-free async work has completed.
+///
+/// If the client was disconnected while the lock was released, `f` is not
+/// called (the mutation is silently dropped — there is nothing left to mutate).
+pub async fn commit_cdp<F>(client: &SharedCdp, f: F)
+where
+    F: FnOnce(&mut CdpClient),
+{
+    if let Some(c) = client.write().await.as_mut() {
+        f(c);
     }
 }
 

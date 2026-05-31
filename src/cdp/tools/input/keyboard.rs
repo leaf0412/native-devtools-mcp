@@ -228,18 +228,10 @@ pub async fn cdp_press_key(
     include_snapshot: bool,
     cdp_client: Arc<RwLock<Option<CdpClient>>>,
 ) -> CallToolResult {
-    let guard = cdp_client.read().await;
-    let client = match guard.as_ref() {
-        Some(c) => c,
-        None => return cdp_error("No CDP connection. Use cdp_connect first."),
-    };
-
-    let page = match client.require_page() {
-        Ok(p) => p,
+    let (page, _generation) = match crate::cdp::checkout_page(&cdp_client).await {
+        Ok(v) => v,
         Err(e) => return e,
     };
-
-    drop(guard);
 
     let combo = match parse_key_combo(&key) {
         Ok(c) => c,
@@ -296,14 +288,8 @@ pub async fn cdp_type_text(
     submit_key: Option<String>,
     cdp_client: Arc<RwLock<Option<CdpClient>>>,
 ) -> CallToolResult {
-    let guard = cdp_client.read().await;
-    let client = match guard.as_ref() {
-        Some(c) => c,
-        None => return cdp_error("No CDP connection. Use cdp_connect first."),
-    };
-
-    let page = match client.require_page() {
-        Ok(p) => p,
+    let (page, _generation) = match crate::cdp::checkout_page(&cdp_client).await {
+        Ok(v) => v,
         Err(e) => return e,
     };
 
@@ -321,8 +307,6 @@ pub async fn cdp_type_text(
     } else {
         None
     };
-
-    drop(guard);
 
     for ch in text.chars() {
         if let Err(e) = dispatch_char(&page, ch, 0).await {

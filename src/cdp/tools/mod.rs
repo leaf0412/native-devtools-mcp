@@ -55,6 +55,23 @@ fn resolve_node(
     ))
 }
 
+/// Resolve a UID against the current snapshot under a *brief* read lock,
+/// returning owned data so the lock is released before any RPCs.
+///
+/// This is the lock-acquiring wrapper around the sync [`resolve_node`]; tools
+/// use it so they never hold the CDP lock across a `page.execute().await`.
+async fn resolve_node_checkout(
+    uid: &str,
+    cdp_client: &crate::cdp::SharedCdp,
+    current_url: &str,
+) -> Result<(BackendNodeId, String, String), CallToolResult> {
+    let guard = cdp_client.read().await;
+    let client = guard
+        .as_ref()
+        .ok_or_else(|| cdp_error("No CDP connection. Use cdp_connect first."))?;
+    resolve_node(uid, client, current_url)
+}
+
 /// Resolve a UID to a remote object ID for use with `callFunctionOn`.
 async fn resolve_to_object_id(
     uid: &str,
@@ -83,11 +100,12 @@ async fn resolve_to_object_id(
 /// Resolve a UID to element center coordinates (scrolls into view).
 async fn resolve_element_center(
     uid: &str,
-    client: &CdpClient,
+    cdp_client: &crate::cdp::SharedCdp,
     page: &Page,
 ) -> Result<(String, String, f64, f64), CallToolResult> {
     let current_url = crate::cdp::page_url(page).await;
-    let (backend_node_id, node_role, node_name) = resolve_node(uid, client, &current_url)?;
+    let (backend_node_id, node_role, node_name) =
+        resolve_node_checkout(uid, cdp_client, &current_url).await?;
 
     let scroll_params = ScrollIntoViewIfNeededParams::builder()
         .backend_node_id(backend_node_id)

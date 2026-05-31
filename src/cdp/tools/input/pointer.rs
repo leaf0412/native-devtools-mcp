@@ -1,6 +1,6 @@
 //! CDP pointer tools: click, hover, fill.
 
-use super::super::{resolve_element_center, resolve_node, resolve_to_object_id};
+use super::super::{resolve_element_center, resolve_node_checkout, resolve_to_object_id};
 use crate::cdp::{cdp_error, CdpClient};
 use chromiumoxide::cdp::browser_protocol::input::{
     DispatchMouseEventParams, DispatchMouseEventType, InsertTextParams, MouseButton,
@@ -17,23 +17,16 @@ pub async fn cdp_click(
     include_snapshot: bool,
     cdp_client: Arc<RwLock<Option<CdpClient>>>,
 ) -> CallToolResult {
-    let guard = cdp_client.read().await;
-    let client = match guard.as_ref() {
-        Some(c) => c,
-        None => return cdp_error("No CDP connection. Use cdp_connect first."),
-    };
-
-    let page = match client.require_page() {
-        Ok(p) => p,
-        Err(e) => return e,
-    };
-
-    let (node_role, node_name, cx, cy) = match resolve_element_center(&uid, client, &page).await {
+    let (page, _generation) = match crate::cdp::checkout_page(&cdp_client).await {
         Ok(v) => v,
         Err(e) => return e,
     };
 
-    drop(guard);
+    let (node_role, node_name, cx, cy) =
+        match resolve_element_center(&uid, &cdp_client, &page).await {
+            Ok(v) => v,
+            Err(e) => return e,
+        };
 
     let click_count = if dbl_click { 2_i64 } else { 1_i64 };
 
@@ -69,23 +62,16 @@ pub async fn cdp_hover(
     include_snapshot: bool,
     cdp_client: Arc<RwLock<Option<CdpClient>>>,
 ) -> CallToolResult {
-    let guard = cdp_client.read().await;
-    let client = match guard.as_ref() {
-        Some(c) => c,
-        None => return cdp_error("No CDP connection. Use cdp_connect first."),
-    };
-
-    let page = match client.require_page() {
-        Ok(p) => p,
-        Err(e) => return e,
-    };
-
-    let (node_role, node_name, cx, cy) = match resolve_element_center(&uid, client, &page).await {
+    let (page, _generation) = match crate::cdp::checkout_page(&cdp_client).await {
         Ok(v) => v,
         Err(e) => return e,
     };
 
-    drop(guard);
+    let (node_role, node_name, cx, cy) =
+        match resolve_element_center(&uid, &cdp_client, &page).await {
+            Ok(v) => v,
+            Err(e) => return e,
+        };
 
     let move_event = DispatchMouseEventParams::new(DispatchMouseEventType::MouseMoved, cx, cy);
     if let Err(e) = page.execute(move_event).await {
@@ -105,24 +91,17 @@ pub async fn cdp_fill(
     include_snapshot: bool,
     cdp_client: Arc<RwLock<Option<CdpClient>>>,
 ) -> CallToolResult {
-    let guard = cdp_client.read().await;
-    let client = match guard.as_ref() {
-        Some(c) => c,
-        None => return cdp_error("No CDP connection. Use cdp_connect first."),
-    };
-
-    let page = match client.require_page() {
-        Ok(p) => p,
-        Err(e) => return e,
-    };
-
-    let current_url = crate::cdp::page_url(&page).await;
-    let (backend_node_id, node_role, node_name) = match resolve_node(&uid, client, &current_url) {
+    let (page, _generation) = match crate::cdp::checkout_page(&cdp_client).await {
         Ok(v) => v,
         Err(e) => return e,
     };
 
-    drop(guard);
+    let current_url = crate::cdp::page_url(&page).await;
+    let (backend_node_id, node_role, node_name) =
+        match resolve_node_checkout(&uid, &cdp_client, &current_url).await {
+            Ok(v) => v,
+            Err(e) => return e,
+        };
 
     let object_id = match resolve_to_object_id(&uid, backend_node_id, &page).await {
         Ok(id) => id,

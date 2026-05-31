@@ -10,20 +10,13 @@ use std::sync::Arc;
 use tokio::sync::RwLock;
 
 pub async fn cdp_summarize_page(cdp_client: Arc<RwLock<Option<CdpClient>>>) -> CallToolResult {
-    let guard = cdp_client.read().await;
-    let client = match guard.as_ref() {
-        Some(c) => c,
-        None => return cdp_error("No CDP connection. Use cdp_connect first."),
-    };
-
-    let page = match client.require_page() {
-        Ok(p) => p,
+    let (page, generation) = match crate::cdp::checkout_page(&cdp_client).await {
+        Ok(v) => v,
         Err(e) => return e,
     };
 
     let page_url = page_url(&page).await;
     let title = page_title(&page).await;
-    let generation = client.generation;
     let walker_js = crate::cdp::dom_discovery::dom_walker_js("", None, 0);
     let (_candidates, inventory) = match resolve_dom_candidates(&page, &walker_js).await {
         Ok(result) => result,
@@ -51,44 +44,49 @@ pub async fn cdp_get_element_context(
     max_chars: Option<u32>,
     cdp_client: Arc<RwLock<Option<CdpClient>>>,
 ) -> CallToolResult {
-    let guard = cdp_client.read().await;
-    let client = match guard.as_ref() {
-        Some(c) => c,
-        None => return cdp_error("No CDP connection. Use cdp_connect first."),
-    };
-
-    let page = match client.require_page() {
-        Ok(p) => p,
+    let (page, _generation) = match crate::cdp::checkout_page(&cdp_client).await {
+        Ok(v) => v,
         Err(e) => return e,
     };
 
     let current_url = page_url(&page).await;
-    let snapshot =
-        match client.last_dom_snapshot.as_ref() {
+
+    // Snapshot-derived data borrows the snapshot map, so compute owned values
+    // under a brief read lock and drop it before the live (heavy) RPCs below.
+    let (stored_element, nearby, backend_node_id, generation) = {
+        let guard = cdp_client.read().await;
+        let client = match guard.as_ref() {
+            Some(c) => c,
+            None => return cdp_error("No CDP connection. Use cdp_connect first."),
+        };
+        let snapshot = match client.last_dom_snapshot.as_ref() {
             Some(snapshot) => snapshot,
             None => return cdp_error(
                 "No DOM snapshot available. Call cdp_find_elements or cdp_take_dom_snapshot before cdp_get_element_context.",
             ),
         };
-    let node = match crate::cdp::resolve_uid_from_maps(
-        &uid,
-        Some(snapshot),
-        client.generation,
-        &current_url,
-    ) {
-        Ok(node) => node,
-        Err(msg) => return cdp_error(msg),
+        let node = match crate::cdp::resolve_uid_from_maps(
+            &uid,
+            Some(snapshot),
+            client.generation,
+            &current_url,
+        ) {
+            Ok(node) => node,
+            Err(msg) => return cdp_error(msg),
+        };
+        let generation = snapshot.generation;
+        let stored_element = snapshot
+            .uid_to_candidate
+            .get(&uid)
+            .map(|candidate| dom_candidate_json(&uid, candidate))
+            .unwrap_or_else(|| snapshot_node_json(&uid, node));
+        let nearby = nearby_snapshot_candidates(
+            snapshot,
+            &uid,
+            sibling_limit.unwrap_or(2).min(10) as usize,
+        );
+        (stored_element, nearby, node.backend_node_id, generation)
     };
-
-    let generation = snapshot.generation;
-    let stored_element = snapshot
-        .uid_to_candidate
-        .get(&uid)
-        .map(|candidate| dom_candidate_json(&uid, candidate))
-        .unwrap_or_else(|| snapshot_node_json(&uid, node));
-    let nearby =
-        nearby_snapshot_candidates(snapshot, &uid, sibling_limit.unwrap_or(2).min(10) as usize);
-    let backend_node_id = node.backend_node_id;
 
     let live_context = match live_element_context(
         &page,
@@ -126,20 +124,15 @@ pub async fn cdp_find_elements(
     max_results: Option<u32>,
     cdp_client: Arc<RwLock<Option<CdpClient>>>,
 ) -> CallToolResult {
-    let mut guard = cdp_client.write().await;
-    let client = match guard.as_mut() {
-        Some(c) => c,
-        None => return cdp_error("No CDP connection. Use cdp_connect first."),
-    };
-
-    let page = match client.require_page() {
-        Ok(p) => p,
+    // Check out the page lock-free: the snapshot build below fires up to
+    // ~3 RPCs per candidate and must not hold the lock across that work.
+    let (page, generation) = match crate::cdp::checkout_page(&cdp_client).await {
+        Ok(v) => v,
         Err(e) => return e,
     };
 
     let max = max_results.unwrap_or(10);
     let page_url = page_url(&page).await;
-    let generation = client.generation;
 
     let walker_js = crate::cdp::dom_discovery::dom_walker_js(&query, role.as_deref(), max);
 
@@ -158,7 +151,7 @@ pub async fn cdp_find_elements(
         .map(|(i, n)| dom_candidate_json(&format!("d{}", i + 1), n))
         .collect();
 
-    client.last_dom_snapshot = Some(snapshot_map);
+    crate::cdp::commit_cdp(&cdp_client, |c| c.last_dom_snapshot = Some(snapshot_map)).await;
 
     let result = serde_json::json!({
         "page_url": page_url,
@@ -176,20 +169,15 @@ pub async fn cdp_take_dom_snapshot(
     max_nodes: Option<u32>,
     cdp_client: Arc<RwLock<Option<CdpClient>>>,
 ) -> CallToolResult {
-    let mut guard = cdp_client.write().await;
-    let client = match guard.as_mut() {
-        Some(c) => c,
-        None => return cdp_error("No CDP connection. Use cdp_connect first."),
-    };
-
-    let page = match client.require_page() {
-        Ok(p) => p,
+    // Check out the page lock-free: the snapshot build below fires up to
+    // ~3 RPCs per candidate and must not hold the lock across that work.
+    let (page, generation) = match crate::cdp::checkout_page(&cdp_client).await {
+        Ok(v) => v,
         Err(e) => return e,
     };
 
     let max = max_nodes.unwrap_or(500);
     let page_url = page_url(&page).await;
-    let generation = client.generation;
 
     // Use empty query to match all interactive elements
     let walker_js = crate::cdp::dom_discovery::dom_walker_js("", None, max);
@@ -203,7 +191,7 @@ pub async fn cdp_take_dom_snapshot(
         crate::cdp::dom_discovery::build_dom_snapshot(&candidates, page_url, generation);
 
     let output = crate::cdp::dom_discovery::format_dom_snapshot(&candidates);
-    client.last_dom_snapshot = Some(snapshot_map);
+    crate::cdp::commit_cdp(&cdp_client, |c| c.last_dom_snapshot = Some(snapshot_map)).await;
 
     CallToolResult::success(vec![Content::text(output)])
 }

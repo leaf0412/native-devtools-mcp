@@ -12,18 +12,8 @@ pub async fn cdp_element_at_point(
     y: f64,
     cdp_client: Arc<RwLock<Option<CdpClient>>>,
 ) -> CallToolResult {
-    let client_guard = cdp_client.read().await;
-    let client = match client_guard.as_ref() {
-        Some(c) => c,
-        None => {
-            return CallToolResult::error(vec![Content::text(
-                "No CDP connection. Use cdp_connect first.",
-            )])
-        }
-    };
-
-    let page = match client.require_page() {
-        Ok(p) => p,
+    let (page, _generation) = match crate::cdp::checkout_page(&cdp_client).await {
+        Ok(v) => v,
         Err(e) => return e,
     };
 
@@ -70,9 +60,18 @@ pub async fn cdp_element_at_point(
         }
     };
 
-    // Step 5: Read-only lookup in the DOM snapshot map.
+    // Step 5: Read-only lookup in the DOM snapshot map, under a brief read lock.
     let current_url = crate::cdp::page_url(&page).await;
-    let note = match lookup_uid(client, backend_node_id, &current_url) {
+    let lookup = {
+        let guard = cdp_client.read().await;
+        let Some(client) = guard.as_ref() else {
+            return CallToolResult::error(vec![Content::text(
+                "No CDP connection. Use cdp_connect first.",
+            )]);
+        };
+        lookup_uid(client, backend_node_id, &current_url)
+    };
+    let note = match lookup {
         LookupResult::Found { uid, role, name } => {
             let json = serde_json::json!({
                 "uid": uid,

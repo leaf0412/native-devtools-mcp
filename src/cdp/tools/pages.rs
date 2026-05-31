@@ -10,15 +10,20 @@ use std::sync::Arc;
 use tokio::sync::RwLock;
 
 pub async fn cdp_list_pages(cdp_client: Arc<RwLock<Option<CdpClient>>>) -> CallToolResult {
-    let mut guard = cdp_client.write().await;
-    let client = match guard.as_mut() {
-        Some(c) => c,
-        None => return cdp_error("No CDP connection. Use cdp_connect first."),
-    };
-
-    let pages = match client.browser.pages().await {
-        Ok(p) => p,
-        Err(e) => return cdp_error(format!("Failed to list pages: {}", e)),
+    // Hold the lock only across the single `browser.pages()` RPC, then release
+    // it before the per-page URL fetches below (which are N more round trips).
+    let (pages, selected_target_id) = {
+        let guard = cdp_client.read().await;
+        let client = match guard.as_ref() {
+            Some(c) => c,
+            None => return cdp_error("No CDP connection. Use cdp_connect first."),
+        };
+        let pages = match client.browser.pages().await {
+            Ok(p) => p,
+            Err(e) => return cdp_error(format!("Failed to list pages: {}", e)),
+        };
+        let selected_target_id = client.selected_page.as_ref().map(|p| p.target_id().clone());
+        (pages, selected_target_id)
     };
 
     // Filter out chrome-extension:// pages, collecting URLs to avoid double fetch.
@@ -31,8 +36,6 @@ pub async fn cdp_list_pages(cdp_client: Arc<RwLock<Option<CdpClient>>>) -> CallT
             urls.push(url);
         }
     }
-
-    let selected_target_id = client.selected_page.as_ref().map(|p| p.target_id().clone());
 
     let total = filtered.len();
     let mut output = format!("Pages ({} total):\n", total);
@@ -48,7 +51,7 @@ pub async fn cdp_list_pages(cdp_client: Arc<RwLock<Option<CdpClient>>>) -> CallT
         output.push_str(&format!("  [{}]{} {}\n", i, marker, urls[i]));
     }
 
-    client.last_page_list = filtered;
+    crate::cdp::commit_cdp(&cdp_client, |c| c.last_page_list = filtered).await;
 
     CallToolResult::success(vec![Content::text(output.trim_end().to_string())])
 }
@@ -57,39 +60,47 @@ pub async fn cdp_select_page(
     page_idx: usize,
     cdp_client: Arc<RwLock<Option<CdpClient>>>,
 ) -> CallToolResult {
-    let mut guard = cdp_client.write().await;
-    let client = match guard.as_mut() {
-        Some(c) => c,
-        None => return cdp_error("No CDP connection. Use cdp_connect first."),
+    // Resolve the target page handle under a brief read lock, then release it
+    // before the `bring_to_front` / URL round trips.
+    let (page, same_page) = {
+        let guard = cdp_client.read().await;
+        let client = match guard.as_ref() {
+            Some(c) => c,
+            None => return cdp_error("No CDP connection. Use cdp_connect first."),
+        };
+
+        if client.last_page_list.is_empty() {
+            return cdp_error("No page list available. Call cdp_list_pages first.");
+        }
+
+        if page_idx >= client.last_page_list.len() {
+            return cdp_error(format!(
+                "Page index {} is out of range (0..{}). Call cdp_list_pages to refresh.",
+                page_idx,
+                client.last_page_list.len()
+            ));
+        }
+
+        let page = client.last_page_list[page_idx].clone();
+        let same_page = client
+            .selected_page
+            .as_ref()
+            .is_some_and(|sel| sel.target_id() == page.target_id());
+        (page, same_page)
     };
-
-    if client.last_page_list.is_empty() {
-        return cdp_error("No page list available. Call cdp_list_pages first.");
-    }
-
-    if page_idx >= client.last_page_list.len() {
-        return cdp_error(format!(
-            "Page index {} is out of range (0..{}). Call cdp_list_pages to refresh.",
-            page_idx,
-            client.last_page_list.len()
-        ));
-    }
-
-    let page = client.last_page_list[page_idx].clone();
-    let same_page = client
-        .selected_page
-        .as_ref()
-        .is_some_and(|sel| sel.target_id() == page.target_id());
 
     if let Err(e) = page.bring_to_front().await {
         return cdp_error(format!("Failed to bring page {} to front: {}", page_idx, e));
     }
 
     let url = page_url(&page).await;
-    client.selected_page = Some(page);
-    if !same_page {
-        client.invalidate_snapshots();
-    }
+    crate::cdp::commit_cdp(&cdp_client, |c| {
+        c.selected_page = Some(page);
+        if !same_page {
+            c.invalidate_snapshots();
+        }
+    })
+    .await;
 
     CallToolResult::success(vec![Content::text(format!(
         "Selected page [{}]: {}",
@@ -102,18 +113,10 @@ pub async fn cdp_handle_dialog(
     prompt_text: Option<String>,
     cdp_client: Arc<RwLock<Option<CdpClient>>>,
 ) -> CallToolResult {
-    let guard = cdp_client.read().await;
-    let client = match guard.as_ref() {
-        Some(c) => c,
-        None => return cdp_error("No CDP connection. Use cdp_connect first."),
-    };
-
-    let page = match client.require_page() {
-        Ok(p) => p,
+    let (page, _generation) = match crate::cdp::checkout_page(&cdp_client).await {
+        Ok(v) => v,
         Err(e) => return e,
     };
-
-    drop(guard);
 
     let accept = match action.as_str() {
         "accept" => true,
@@ -152,14 +155,11 @@ pub async fn cdp_navigate(
     timeout_ms: Option<u64>,
     cdp_client: Arc<RwLock<Option<CdpClient>>>,
 ) -> CallToolResult {
-    let mut guard = cdp_client.write().await;
-    let client = match guard.as_mut() {
-        Some(c) => c,
-        None => return cdp_error("No CDP connection. Use cdp_connect first."),
-    };
-
-    let page = match client.require_page() {
-        Ok(p) => p,
+    // Check out the page lock-free: `Page.navigate` can block for the full
+    // timeout (10s default), and holding the lock across it would serialize
+    // every other CDP tool for that whole window.
+    let (page, _generation) = match crate::cdp::checkout_page(&cdp_client).await {
+        Ok(v) => v,
         Err(e) => return e,
     };
 
@@ -193,7 +193,7 @@ pub async fn cdp_navigate(
                             target_url
                         ));
                     }
-                    client.invalidate_snapshots();
+                    crate::cdp::commit_cdp(&cdp_client, |c| c.invalidate_snapshots()).await;
                     CallToolResult::success(vec![Content::text(format!(
                         "Navigated to {}",
                         target_url
@@ -203,7 +203,7 @@ pub async fn cdp_navigate(
                 Err(_) => {
                     // Timed out waiting for load event — navigation was sent,
                     // page is likely still loading or already loaded.
-                    client.invalidate_snapshots();
+                    crate::cdp::commit_cdp(&cdp_client, |c| c.invalidate_snapshots()).await;
                     CallToolResult::success(vec![Content::text(format!(
                         "Navigated to {} (page may still be loading)",
                         target_url
@@ -213,7 +213,7 @@ pub async fn cdp_navigate(
         }
         "reload" => match page.execute(ReloadParams::default()).await {
             Ok(_) => {
-                client.invalidate_snapshots();
+                crate::cdp::commit_cdp(&cdp_client, |c| c.invalidate_snapshots()).await;
                 CallToolResult::success(vec![Content::text("Page reloaded")])
             }
             Err(e) => cdp_error(format!("Reload failed: {}", e)),
@@ -243,7 +243,7 @@ pub async fn cdp_navigate(
                 .await
             {
                 Ok(_) => {
-                    client.invalidate_snapshots();
+                    crate::cdp::commit_cdp(&cdp_client, |c| c.invalidate_snapshots()).await;
                     CallToolResult::success(vec![Content::text(format!(
                         "Navigated {}: {}",
                         action, entry_url
@@ -263,20 +263,26 @@ pub async fn cdp_new_page(
     url: String,
     cdp_client: Arc<RwLock<Option<CdpClient>>>,
 ) -> CallToolResult {
-    let mut guard = cdp_client.write().await;
-    let client = match guard.as_mut() {
-        Some(c) => c,
-        None => return cdp_error("No CDP connection. Use cdp_connect first."),
-    };
-
-    let page = match client.browser.new_page(&url).await {
-        Ok(p) => p,
-        Err(e) => return cdp_error(format!("Failed to create new page: {}", e)),
+    // `browser` isn't cloneable, so hold a read lock only across the single
+    // `new_page` RPC, then release before the URL fetch + commit.
+    let page = {
+        let guard = cdp_client.read().await;
+        let client = match guard.as_ref() {
+            Some(c) => c,
+            None => return cdp_error("No CDP connection. Use cdp_connect first."),
+        };
+        match client.browser.new_page(&url).await {
+            Ok(p) => p,
+            Err(e) => return cdp_error(format!("Failed to create new page: {}", e)),
+        }
     };
 
     let page_url = page_url(&page).await;
-    client.selected_page = Some(page);
-    client.invalidate_snapshots();
+    crate::cdp::commit_cdp(&cdp_client, |c| {
+        c.selected_page = Some(page);
+        c.invalidate_snapshots();
+    })
+    .await;
 
     CallToolResult::success(vec![Content::text(format!(
         "Created and selected new page: {}",
@@ -288,6 +294,10 @@ pub async fn cdp_close_page(
     page_idx: usize,
     cdp_client: Arc<RwLock<Option<CdpClient>>>,
 ) -> CallToolResult {
+    // Deliberately holds the write lock for the whole operation: the awaits
+    // here are single bounded RPCs (url/close/bring_to_front), and the
+    // `last_page_list` removal + replacement-selection must stay atomic —
+    // splitting it would race the index against a concurrent list/select.
     let mut guard = cdp_client.write().await;
     let client = match guard.as_mut() {
         Some(c) => c,

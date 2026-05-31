@@ -32,14 +32,8 @@ pub async fn cdp_evaluate_script(
     args: Option<Vec<serde_json::Value>>,
     cdp_client: Arc<RwLock<Option<CdpClient>>>,
 ) -> CallToolResult {
-    let guard = cdp_client.read().await;
-    let client = match guard.as_ref() {
-        Some(c) => c,
-        None => return cdp_error("No CDP connection. Use cdp_connect first."),
-    };
-
-    let page = match client.require_page() {
-        Ok(p) => p,
+    let (page, _generation) = match crate::cdp::checkout_page(&cdp_client).await {
+        Ok(v) => v,
         Err(e) => return e,
     };
 
@@ -84,18 +78,27 @@ pub async fn cdp_evaluate_script(
     // Collect (uid, backend_node_id) pairs first to avoid borrow issues.
     let mut uid_backend_pairs: Vec<(String, i64)> = Vec::with_capacity(arg_list.len());
     let current_url = page_url(&page).await;
-    for arg in arg_list {
-        if let Some(uid) = arg.get("uid").and_then(|v| v.as_str()) {
-            let node = match crate::cdp::resolve_uid_from_maps(
-                uid,
-                client.last_dom_snapshot.as_ref(),
-                client.generation,
-                &current_url,
-            ) {
-                Ok(n) => n,
-                Err(msg) => return cdp_error(msg),
-            };
-            uid_backend_pairs.push((uid.to_string(), node.backend_node_id));
+    {
+        // Snapshot resolution is sync; hold the lock only across it, then
+        // release before the resolve/call RPCs below.
+        let guard = cdp_client.read().await;
+        let client = match guard.as_ref() {
+            Some(c) => c,
+            None => return cdp_error("No CDP connection. Use cdp_connect first."),
+        };
+        for arg in arg_list {
+            if let Some(uid) = arg.get("uid").and_then(|v| v.as_str()) {
+                let node = match crate::cdp::resolve_uid_from_maps(
+                    uid,
+                    client.last_dom_snapshot.as_ref(),
+                    client.generation,
+                    &current_url,
+                ) {
+                    Ok(n) => n,
+                    Err(msg) => return cdp_error(msg),
+                };
+                uid_backend_pairs.push((uid.to_string(), node.backend_node_id));
+            }
         }
     }
 
