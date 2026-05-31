@@ -77,6 +77,86 @@ impl ToolHandler for CdpConnect {
     }
 }
 
+/// `cdp_launch` — start (or reuse) a managed debug Chrome with a stable
+/// profile so logins persist, then connect. See [`crate::cdp::launch`].
+pub struct CdpLaunch;
+
+#[async_trait::async_trait]
+impl ToolHandler for CdpLaunch {
+    fn name(&self) -> &'static str {
+        "cdp_launch"
+    }
+
+    fn schema(&self) -> Tool {
+        Tool::new(
+            "cdp_launch",
+            "Launch (or reuse) a Chrome with remote debugging enabled and connect to it in one step. Uses a STABLE dedicated profile under ~/.native-devtools-mcp/, so sites you log into once stay logged in on later launches — sign in manually the first time. This does NOT attach to your normal default-profile Chrome (Chrome 136+ blocks the debug port on the default profile, and an already-running browser cannot enable it retroactively). If a debug browser is already running on the port it is reused, preserving its session. Use cdp_connect instead when you started a browser with --remote-debugging-port yourself.",
+            Arc::new(json_to_object(serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "port": {
+                        "type": "integer",
+                        "description": "Remote debugging port (default 9222)"
+                    },
+                    "url": {
+                        "type": "string",
+                        "description": "Initial URL to open (default about:blank)"
+                    },
+                    "profile": {
+                        "type": "string",
+                        "description": "Profile name under ~/.native-devtools-mcp/ (default 'chrome-profile'). Use distinct names to keep separate logged-in identities."
+                    }
+                }
+            }))),
+        )
+    }
+
+    async fn call(&self, args: Value, ctx: &ToolContext) -> Result<CallToolResult, McpError> {
+        let port = args.get("port").and_then(|v| v.as_u64()).unwrap_or(9222);
+        if port > 65535 {
+            return Ok(CallToolResult::error(vec![Content::text(format!(
+                "Invalid port: {}. Port must be 0-65535.",
+                port
+            ))]));
+        }
+        let url = args
+            .get("url")
+            .and_then(|v| v.as_str())
+            .unwrap_or("about:blank");
+        let profile = args
+            .get("profile")
+            .and_then(|v| v.as_str())
+            .unwrap_or("chrome-profile");
+
+        match crate::cdp::launch::launch_and_connect(port as u16, profile, url).await {
+            Ok((client, reused)) => {
+                let page_info = if let Some(page) = client.selected_page.as_ref() {
+                    format!("Selected page: {}", crate::cdp::page_url(page).await)
+                } else {
+                    "No pages found".to_string()
+                };
+                *ctx.cdp_client.write().await = Some(client);
+                let how = if reused {
+                    format!(
+                        "Reused the debug browser already running on port {} (login session preserved).",
+                        port
+                    )
+                } else {
+                    format!(
+                        "Launched Chrome with managed profile '{}' on port {}. Log in once if a site needs it; the session persists for future launches.",
+                        profile, port
+                    )
+                };
+                Ok(CallToolResult::success(vec![Content::text(format!(
+                    "{}\nCDP tool calls will now succeed.\n{}",
+                    how, page_info
+                ))]))
+            }
+            Err(e) => Ok(CallToolResult::error(vec![Content::text(e)])),
+        }
+    }
+}
+
 /// `cdp_disconnect` — always visible; CDP tools remain listed afterward and
 /// return a "not connected" error until `cdp_connect` succeeds again.
 pub struct CdpDisconnect;

@@ -4,6 +4,7 @@
 //! using the chromiumoxide crate.
 
 pub mod dom_discovery;
+pub mod launch;
 pub mod tools;
 
 use chromiumoxide::browser::Browser;
@@ -40,7 +41,13 @@ impl CdpClient {
         let url = format!("http://127.0.0.1:{}", port);
         let (mut browser, mut handler) = Browser::connect(&url)
             .await
-            .map_err(|e| format!("Cannot connect to port {}. Is the app running with --remote-debugging-port? Error: {}", port, e))?;
+            .map_err(|e| format!(
+                "Cannot connect to CDP on port {port}: {e}. Check: (1) a browser is running \
+                 with --remote-debugging-port={port} and a non-default --user-data-dir \
+                 (Chrome 136+ requires this); (2) no other process is holding the port without \
+                 debugging enabled; (3) or use cdp_launch to start a managed debug browser \
+                 automatically.",
+            ))?;
 
         let handler_handle = tokio::spawn(async move { while handler.next().await.is_some() {} });
 
