@@ -367,79 +367,99 @@ pub fn press_key(key: &str, modifiers: &[String]) -> Result<(), String> {
 }
 
 /// Type a string of text by simulating key presses.
+/// Carbon Text Input Source (TIS) bindings used to neutralize an active IME
+/// while we synthesize typing.
+mod tis {
+    use std::ffi::c_void;
+    #[link(name = "Carbon", kind = "framework")]
+    extern "C" {
+        pub fn TISCopyCurrentKeyboardInputSource() -> *mut c_void;
+        pub fn TISCopyCurrentASCIICapableKeyboardInputSource() -> *mut c_void;
+        pub fn TISSelectInputSource(input_source: *mut c_void) -> i32;
+    }
+    extern "C" {
+        pub fn CFRelease(cf: *mut c_void);
+    }
+}
+
+/// Forces an ASCII-capable keyboard layout for the lifetime of the guard and
+/// restores the previous input source on drop.
+///
+/// An active IME (e.g. Chinese pinyin) captures synthesized latin keys — even
+/// Unicode-injected ones via `CGEventKeyboardSetUnicodeString` — into its
+/// composition buffer instead of committing them, so the caller ends up with
+/// pinyin candidates rather than the literal text. Switching to an
+/// ASCII-capable source removes the IME from the path; non-latin target
+/// characters are still injected verbatim as Unicode (no IME needed for that).
+struct AsciiInputGuard {
+    previous: *mut std::ffi::c_void,
+    switched: bool,
+}
+
+impl AsciiInputGuard {
+    fn activate() -> Self {
+        unsafe {
+            let previous = tis::TISCopyCurrentKeyboardInputSource();
+            let ascii = tis::TISCopyCurrentASCIICapableKeyboardInputSource();
+            let mut switched = false;
+            if !ascii.is_null() {
+                switched = tis::TISSelectInputSource(ascii) == 0;
+                tis::CFRelease(ascii);
+                if switched {
+                    // The input-source change is asynchronous; give it a beat
+                    // to take effect before we start posting key events.
+                    thread::sleep(Duration::from_millis(60));
+                }
+            }
+            AsciiInputGuard { previous, switched }
+        }
+    }
+}
+
+impl Drop for AsciiInputGuard {
+    fn drop(&mut self) {
+        unsafe {
+            if self.switched && !self.previous.is_null() {
+                tis::TISSelectInputSource(self.previous);
+            }
+            if !self.previous.is_null() {
+                tis::CFRelease(self.previous);
+            }
+        }
+    }
+}
+
 pub fn type_text(text: &str) -> Result<(), String> {
+    // Neutralize any active IME for the duration of typing; restored on drop.
+    let _ime_guard = AsciiInputGuard::activate();
+
     let source = CGEventSource::new(CGEventSourceStateID::HIDSystemState)
         .map_err(|_| "Failed to create event source")?;
 
     for c in text.chars() {
-        // Check if shift is needed
-        let needs_shift = c.is_uppercase()
-            || matches!(
-                c,
-                '!' | '@'
-                    | '#'
-                    | '$'
-                    | '%'
-                    | '^'
-                    | '&'
-                    | '*'
-                    | '('
-                    | ')'
-                    | '_'
-                    | '+'
-                    | '{'
-                    | '}'
-                    | '|'
-                    | ':'
-                    | '"'
-                    | '<'
-                    | '>'
-                    | '?'
-                    | '~'
-            );
+        // Inject every character as a Unicode string rather than as a physical
+        // keycode. Physical key events are routed through the active input
+        // method (IME): with a Chinese/Pinyin IME active, typing latin keys
+        // (e.g. "nihao") produces pinyin composition awaiting candidate
+        // selection instead of the literal text — the caller sees a buffer of
+        // latin letters, not what we meant to type. CGEventKeyboardSetUnicodeString
+        // bypasses both the keyboard layout and the IME, so the literal
+        // characters land regardless of the active input source. It also makes
+        // manual shift handling unnecessary: the unicode payload already encodes
+        // case and shifted symbols.
+        let down_event = CGEvent::new_keyboard_event(source.clone(), 0, true)
+            .map_err(|_| "Failed to create key down event")?;
+        down_event.set_string(&c.to_string());
+        down_event.post(CGEventTapLocation::HID);
 
-        let key_char = c.to_lowercase().next().unwrap_or(c);
-        let key_str = key_char.to_string();
+        thread::sleep(Duration::from_millis(5));
 
-        if let Some(keycode) = key_name_to_code(&key_str) {
-            let mut flags = CGEventFlags::empty();
-            if needs_shift {
-                flags |= CGEventFlags::CGEventFlagShift;
-            }
+        let up_event = CGEvent::new_keyboard_event(source.clone(), 0, false)
+            .map_err(|_| "Failed to create key up event")?;
+        up_event.set_string(&c.to_string());
+        up_event.post(CGEventTapLocation::HID);
 
-            // Key down
-            let down_event = CGEvent::new_keyboard_event(source.clone(), keycode, true)
-                .map_err(|_| "Failed to create key down event")?;
-            down_event.set_flags(flags);
-            down_event.post(CGEventTapLocation::HID);
-
-            thread::sleep(Duration::from_millis(5));
-
-            // Key up
-            let up_event = CGEvent::new_keyboard_event(source.clone(), keycode, false)
-                .map_err(|_| "Failed to create key up event")?;
-            up_event.set_flags(flags);
-            up_event.post(CGEventTapLocation::HID);
-
-            thread::sleep(Duration::from_millis(5));
-        } else {
-            // For characters we don't have a direct mapping for,
-            // use CGEvent's ability to set Unicode string
-            let down_event = CGEvent::new_keyboard_event(source.clone(), 0, true)
-                .map_err(|_| "Failed to create key event")?;
-
-            // Set the Unicode string for this character
-            down_event.set_string(&c.to_string());
-            down_event.post(CGEventTapLocation::HID);
-
-            thread::sleep(Duration::from_millis(5));
-
-            let up_event = CGEvent::new_keyboard_event(source.clone(), 0, false)
-                .map_err(|_| "Failed to create key up event")?;
-            up_event.post(CGEventTapLocation::HID);
-
-            thread::sleep(Duration::from_millis(5));
-        }
+        thread::sleep(Duration::from_millis(5));
     }
 
     Ok(())
