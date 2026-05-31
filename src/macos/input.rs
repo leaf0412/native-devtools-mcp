@@ -436,17 +436,20 @@ pub fn type_text(text: &str) -> Result<(), String> {
     let source = CGEventSource::new(CGEventSourceStateID::HIDSystemState)
         .map_err(|_| "Failed to create event source")?;
 
+    // Inject each character as a Unicode string rather than as a physical
+    // keycode. Physical key events are routed through the active input method
+    // (IME): with a Chinese/Pinyin IME active, typing latin keys (e.g. "nihao")
+    // produces pinyin composition awaiting candidate selection instead of the
+    // literal text. CGEventKeyboardSetUnicodeString bypasses both the keyboard
+    // layout and the IME, so the literal characters land regardless of the
+    // active input source, and the unicode payload already encodes case/shifted
+    // symbols (no manual shift handling).
+    //
+    // One event per character is intentional: a single key event can only carry
+    // one character reliably — batching a multi-char string into one event
+    // truncates to a short prefix in practice. For setting a large block of text
+    // into an editable field, prefer `ax_set_value` (sets the value at once).
     for c in text.chars() {
-        // Inject every character as a Unicode string rather than as a physical
-        // keycode. Physical key events are routed through the active input
-        // method (IME): with a Chinese/Pinyin IME active, typing latin keys
-        // (e.g. "nihao") produces pinyin composition awaiting candidate
-        // selection instead of the literal text — the caller sees a buffer of
-        // latin letters, not what we meant to type. CGEventKeyboardSetUnicodeString
-        // bypasses both the keyboard layout and the IME, so the literal
-        // characters land regardless of the active input source. It also makes
-        // manual shift handling unnecessary: the unicode payload already encodes
-        // case and shifted symbols.
         let down_event = CGEvent::new_keyboard_event(source.clone(), 0, true)
             .map_err(|_| "Failed to create key down event")?;
         down_event.set_string(&c.to_string());

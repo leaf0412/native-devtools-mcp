@@ -126,11 +126,11 @@ pub async fn type_text(params: TypeTextParams) -> CallToolResult {
         return err;
     }
 
-    let len = params.text.len();
+    let char_count = params.text.chars().count();
     let text = params.text;
     run_input(
         move || input::type_text(&text),
-        format!("Typed {} characters", len),
+        format!("Typed {} characters", char_count),
         "Type failed",
     )
     .await
