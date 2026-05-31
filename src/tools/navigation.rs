@@ -239,6 +239,20 @@ pub fn focus_window(params: FocusWindowParams) -> CallToolResult {
 }
 
 fn focus_by_app_name(app_name: &str) -> CallToolResult {
+    // Fast path: if the target app is already frontmost, skip the ~1s
+    // NSWorkspace activation and just ensure its window is raised. Resolving the
+    // pid is a cheap window-list lookup; windowless apps (no pid) fall through
+    // to the normal activation path below.
+    if let Some(pid) = platform::find_windows_by_app(app_name)
+        .ok()
+        .and_then(|w| w.first().map(|win| win.owner_pid as i32))
+    {
+        if platform::is_app_active_by_pid(pid) {
+            platform::raise_windows(pid);
+            return focused(build_result_for_pid(pid, Some(app_name)));
+        }
+    }
+
     if platform::activate_app(app_name) {
         // AXRaise ensures the window is physically raised even for apps without
         // a proper macOS bundle (e.g. Tauri dev builds) where NSRunningApplication.activate
@@ -280,6 +294,11 @@ fn focus_by_app_name(app_name: &str) -> CallToolResult {
 }
 
 fn focus_by_pid(pid: i32) -> CallToolResult {
+    // Skip the ~1s NSWorkspace activation if the app is already frontmost.
+    if platform::is_app_active_by_pid(pid) {
+        platform::raise_windows(pid);
+        return focused(build_result_for_pid(pid, None));
+    }
     if platform::activate_app_by_pid(pid) {
         platform::raise_windows(pid);
         focused(build_result_for_pid(pid, None))

@@ -106,10 +106,29 @@ pub fn find_window_by_id_direct(window_id: u32) -> Result<Option<WindowInfo>, St
 /// tiny off-screen helper panel over the real main window for multi-window apps.
 pub fn find_windows_by_app(app_name: &str) -> Result<Vec<WindowInfo>, String> {
     let needle = app_name.to_lowercase();
-    let mut windows: Vec<WindowInfo> = list_windows()?
-        .into_iter()
+    let all = list_windows()?;
+    let mut windows: Vec<WindowInfo> = all
+        .iter()
         .filter(|w| w.owner_name.to_lowercase().contains(&needle))
+        .cloned()
         .collect();
+
+    // Fallback for locale mismatch: owner_name is the process name in the
+    // system locale (e.g. "计算器"), but callers commonly pass the English app
+    // name or bundle id ("Calculator" / "com.apple.calculator"). When the
+    // localized-name match finds nothing, resolve PIDs via NSRunningApplication
+    // (which exposes both) and return those windows. Runs only on a miss, so
+    // the common case keeps its single CGWindowList pass.
+    if windows.is_empty() {
+        let pids = crate::macos::app::pids_matching_app_name(app_name);
+        if !pids.is_empty() {
+            windows = all
+                .into_iter()
+                .filter(|w| pids.contains(&(w.owner_pid as i32)))
+                .collect();
+        }
+    }
+
     sort_windows_main_first(&mut windows);
     Ok(windows)
 }
@@ -182,9 +201,22 @@ mod tests {
 
     #[test]
     fn test_find_windows_by_app() {
+        // Finder is always running on macOS. Searching by the English name must
+        // return its windows even when the OS reports a localized owner name
+        // (e.g. "访达" on a Chinese system) — that's the bundle/English-name
+        // fallback. So a returned window is valid if it matches by owner name
+        // OR its pid belongs to an app matching "Finder".
         let windows = find_windows_by_app("Finder").expect("find_windows_by_app should succeed");
+        let finder_pids = crate::macos::app::pids_matching_app_name("Finder");
         for w in &windows {
-            assert!(w.owner_name.to_lowercase().contains("finder"));
+            let by_name = w.owner_name.to_lowercase().contains("finder");
+            let by_pid = finder_pids.contains(&(w.owner_pid as i32));
+            assert!(
+                by_name || by_pid,
+                "window owner={:?} pid={} should belong to Finder",
+                w.owner_name,
+                w.owner_pid
+            );
         }
     }
 

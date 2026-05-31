@@ -167,6 +167,65 @@ pub fn list_apps() -> Vec<AppInfo> {
     apps
 }
 
+/// Return PIDs of running apps whose **bundle identifier** or **English bundle
+/// name** matches `needle` (case-insensitive substring).
+///
+/// `find_windows_by_app` matches the window owner name, which the OS reports in
+/// the user's locale (e.g. "计算器" for Calculator on a Chinese system). A model
+/// driving this server naturally passes the English name it launched the app
+/// with ("Calculator") or its bundle id ("com.apple.calculator"); neither
+/// matches the localized owner name. This resolves those via
+/// NSRunningApplication, which exposes both, so app targeting works regardless
+/// of system locale. The localized name is intentionally NOT matched here —
+/// callers already get that from the owner-name path.
+pub fn pids_matching_app_name(needle: &str) -> HashSet<i32> {
+    let needle = needle.to_lowercase();
+    let mut pids = HashSet::new();
+    if needle.is_empty() {
+        return pids;
+    }
+    unsafe {
+        for app in get_running_apps() {
+            if !is_app_alive(app) {
+                continue;
+            }
+            let pid: i32 = msg_send![app, processIdentifier];
+
+            let bundle_id_ns: id = msg_send![app, bundleIdentifier];
+            if bundle_id_ns != nil
+                && nsstring_to_string(bundle_id_ns)
+                    .to_lowercase()
+                    .contains(&needle)
+            {
+                pids.insert(pid);
+                continue;
+            }
+
+            if let Some(eng) = english_name_for_app(app) {
+                if eng.to_lowercase().contains(&needle) {
+                    pids.insert(pid);
+                }
+            }
+        }
+    }
+    pids
+}
+
+/// English app name from an NSRunningApplication's bundle URL
+/// (e.g. ".../Calculator.app" -> "Calculator"), independent of system locale.
+unsafe fn english_name_for_app(app: id) -> Option<String> {
+    let url: id = msg_send![app, bundleURL];
+    if url == nil {
+        return None;
+    }
+    let last: id = msg_send![url, lastPathComponent];
+    if last == nil {
+        return None;
+    }
+    let name = nsstring_to_string(last);
+    Some(name.strip_suffix(".app").unwrap_or(&name).to_string())
+}
+
 /// Activate (focus) an application by name
 pub fn activate_app(app_name: &str) -> bool {
     unsafe {
@@ -201,6 +260,25 @@ pub fn activate_app_by_pid(pid: i32) -> bool {
     }
 
     false
+}
+
+/// True if the app behind `pid` is currently the active (frontmost) app.
+///
+/// Cheap single message — used to skip the (~1s) NSWorkspace activation when
+/// the target is already frontmost, which is the common case for an agent
+/// issuing several actions against the same app.
+pub fn is_app_active_by_pid(pid: i32) -> bool {
+    unsafe {
+        let app: id = msg_send![
+            class!(NSRunningApplication),
+            runningApplicationWithProcessIdentifier: pid
+        ];
+        if app != nil {
+            msg_send![app, isActive]
+        } else {
+            false
+        }
+    }
 }
 
 /// Check if a user-facing application is currently running (case-insensitive name match).
