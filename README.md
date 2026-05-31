@@ -2,10 +2,9 @@
 
 > **An MCP server for computer use on native desktop and mobile apps — macOS, Windows, Android, and Chrome/Electron via CDP.**
 
-![Version](https://img.shields.io/npm/v/native-devtools-mcp?style=flat-square)
-![License](https://img.shields.io/npm/l/native-devtools-mcp?style=flat-square)
 ![Platform](https://img.shields.io/badge/platform-macOS%20%7C%20Windows%20%7C%20Android-blue?style=flat-square)
-![Downloads](https://img.shields.io/npm/dt/native-devtools-mcp?style=flat-square)
+![Built with Rust](https://img.shields.io/badge/built%20with-Rust%201.91%2B-orange?style=flat-square)
+![License](https://img.shields.io/badge/license-MIT-green?style=flat-square)
 
 `native-devtools-mcp` gives AI agents and MCP clients direct control over native desktop apps, Chrome/Electron browsers, and Android devices — screenshots, OCR, accessibility-first element lookup, input simulation, window management, Chrome DevTools Protocol (CDP), and ADB — all in one local server. Works with [Claude Desktop](https://claude.ai/download), [Claude Code](https://docs.anthropic.com/en/docs/claude-code), [Cursor](https://cursor.com), and other MCP-compatible clients.
 
@@ -13,9 +12,15 @@
 
 ## Quickstart
 
+This fork is **not published to npm** — build it from source (Rust 1.91+):
+
 ```bash
-npx -y native-devtools-mcp
+git clone https://github.com/leaf0412/native-devtools-mcp
+cd native-devtools-mcp
+cargo build --release          # binary: ./target/release/native-devtools-mcp
 ```
+
+> The `native-devtools-mcp` package on npm is the **upstream** project and does **not** include this fork's changes. Build from source to run this version.
 
 <div align="center">
 <table>
@@ -89,94 +94,49 @@ If you need *just* web automation, [Playwright MCP][pw-mcp] is more mature. If y
 
 ## 📦 Installation
 
-The install steps are identical on macOS and Windows.
+Build from source, then point your MCP client at the compiled binary. The steps are the same on macOS and Windows.
 
-### Option 1: Run with `npx` (no install needed)
-
-```bash
-npx -y native-devtools-mcp
-```
-
-### Option 2: Global install
+### 1. Build
 
 ```bash
-npm install -g native-devtools-mcp
-```
-
-### Option 3: Build from source (Rust)
-
-<details>
-<summary>Click to expand build instructions</summary>
-
-**Using the build script** (clones, builds, and runs setup):
-
-```bash
-curl -fsSL https://raw.githubusercontent.com/sh3ll3x3c/native-devtools-mcp/master/scripts/build-from-source.sh | bash
-```
-
-**Or manually:**
-
-```bash
-git clone https://github.com/sh3ll3x3c/native-devtools-mcp
+git clone https://github.com/leaf0412/native-devtools-mcp
 cd native-devtools-mcp
 cargo build --release
 # Binary: ./target/release/native-devtools-mcp
 ```
 
-Requires **Rust 1.91+** (the `adb_client` dependency needs it). The repo pins this via `.tool-versions`, so [asdf](https://asdf-vm.com) users get the right toolchain automatically; otherwise `rustup update stable`.
+Requires **Rust 1.91+** (the `adb_client` dependency needs it). The repo pins this via `.tool-versions`, so [asdf](https://asdf-vm.com) users get the right toolchain automatically on `cd`; otherwise `rustup update stable`.
 
-</details>
+### 2. Configure your MCP client
 
-### Manual configuration (without the setup wizard)
-
-<details>
-<summary>Click to expand MCP client config snippets</summary>
-
-#### macOS — Claude Desktop
-
-Config file: `~/Library/Application Support/Claude/claude_desktop_config.json`
+Use the **absolute path** to the binary you just built (replace `/path/to/...`).
 
 ```json
 {
   "mcpServers": {
     "native-devtools": {
-      "command": "/Applications/NativeDevtools.app/Contents/MacOS/native-devtools-mcp"
+      "command": "/path/to/native-devtools-mcp/target/release/native-devtools-mcp"
     }
   }
 }
 ```
 
-#### Windows — Claude Desktop
+Config file locations:
+- **macOS — Claude Desktop:** `~/Library/Application Support/Claude/claude_desktop_config.json`
+- **Windows — Claude Desktop:** `%APPDATA%\Claude\claude_desktop_config.json`
+- **Claude Code:** `.mcp.json` in your project, or `claude mcp add native-devtools /path/to/native-devtools-mcp`
+- **Cursor / others:** the client's MCP server config, same `command` shape.
 
-Config file: `%APPDATA%\Claude\claude_desktop_config.json`
-
-#### Claude Code, Cursor, and other MCP clients
-
-```json
-{
-  "mcpServers": {
-    "native-devtools": {
-      "command": "npx",
-      "args": ["-y", "native-devtools-mcp"]
-    }
-  }
-}
-```
-
-Requires Node.js 18+.
-
-</details>
-
-> **macOS permissions:** the server needs **Accessibility** and **Screen Recording** permissions. The setup wizard opens the right System Settings panes for you. Without both, clicks silently fail and screenshots return a black rectangle.
+> **macOS permissions:** the server needs **Accessibility** and **Screen Recording** permissions, granted to **the app that launches it** (Claude Desktop, Claude Code, your terminal) — not to the binary file. Run `target/release/native-devtools-mcp setup` to open the right System Settings panes. Without both, clicks silently fail and screenshots return a black rectangle.
 
 > **Linux is not supported yet.** The server uses platform-specific APIs (Core Graphics + Accessibility on macOS, Win32 + UI Automation on Windows) that don't exist on Linux. Contributions welcome — X11/Wayland screenshot, input, and AT-SPI paths would be a good first issue.
 
 ## 🏁 Getting Started
 
-After installing, run the setup wizard:
+After building, run the setup wizard from the compiled binary:
 
 ```bash
-npx native-devtools-mcp setup
+./target/release/native-devtools-mcp setup
 ```
 
 This will:
@@ -186,7 +146,7 @@ This will:
 
 Then restart your MCP client and you're ready to go.
 
-> **Claude Desktop on macOS** requires the signed app bundle (Gatekeeper blocks npx). Download `NativeDevtools-X.X.X.dmg` from [GitHub Releases](https://github.com/sh3ll3x3c/native-devtools-mcp/releases), drag to `/Applications`, then run setup — it will detect the app and configure Claude Desktop to use it.
+> **Self-built binary & Gatekeeper (macOS):** a binary you compiled yourself is not notarized, so macOS may quarantine it. If it's blocked, clear the quarantine flag with `xattr -dr com.apple.quarantine ./target/release/native-devtools-mcp`, or allow it under System Settings → Privacy & Security.
 
 > **VS Code, Windsurf, and other clients:** `setup` doesn't auto-detect these yet. Run `setup` for the permission checks, then see the manual configuration above for the JSON config snippet.
 
@@ -303,13 +263,9 @@ Tests must run sequentially since they share a single physical device. The devic
 
 This tool requires Accessibility and Screen Recording permissions — that's a lot of trust. Here's how to verify it deserves it.
 
-### Verify your binary
+### You build it from source
 
-```bash
-native-devtools-mcp verify
-```
-
-Computes the SHA-256 hash of the running binary and checks it against the official checksums published on the [GitHub Releases](https://github.com/sh3ll3x3c/native-devtools-mcp/releases) page. If the hash matches, you're running an unmodified official build.
+Because you compile this fork yourself, trust comes from source you can read — there is no opaque prebuilt binary to checksum. (The upstream project also ships a `verify` subcommand that matches official release checksums; that's only meaningful for those prebuilt releases, not a self-built fork binary.)
 
 ### Audit the code
 
@@ -317,7 +273,7 @@ Computes the SHA-256 hash of the running binary and checks it against the offici
 
 ### What this server does NOT do
 
-- **No unsolicited network access.** The server never phones home. Network is only used when the MCP client explicitly invokes `app_connect` (WebSocket to a local debug server) or when you run the `verify` subcommand (fetches checksums from GitHub).
+- **No unsolicited network access.** The server never phones home. Network is only used for explicit, local connections: `app_connect` (WebSocket to a local debug server) and the CDP tools (the local Chrome remote-debugging port).
 - **No file scanning.** Does not read or index your files. The only file reads are `load_image` (a path the MCP client explicitly provides) and short-lived temp files for screenshots (deleted immediately after capture).
 - **No background persistence.** Exits when the MCP client disconnects.
 - **No data exfiltration.** Screenshots are returned to the MCP client via stdout, never stored or transmitted elsewhere.
@@ -425,16 +381,6 @@ Works out of the box on **Windows 10/11**.
 
 Agent-oriented usage — intent definitions, schema examples, reasoning patterns — lives in [**`AGENTS.md`**](./AGENTS.md). It's a compact, token-optimized reference designed for ingestion by LLMs (Claude, Gemini, GPT, local models). If you're an AI agent reading this README to decide whether to use the server, go there next.
 
-## ⭐ Star History
-
-<a href="https://www.star-history.com/?repos=sh3ll3x3c%2Fnative-devtools-mcp&type=date&legend=bottom-right">
- <picture>
-   <source media="(prefers-color-scheme: dark)" srcset="https://api.star-history.com/chart?repos=sh3ll3x3c/native-devtools-mcp&type=date&theme=dark&legend=bottom-right" />
-   <source media="(prefers-color-scheme: light)" srcset="https://api.star-history.com/chart?repos=sh3ll3x3c/native-devtools-mcp&type=date&legend=bottom-right" />
-   <img alt="Star History Chart" src="https://api.star-history.com/chart?repos=sh3ll3x3c/native-devtools-mcp&type=date&legend=bottom-right" />
- </picture>
-</a>
-
 ## 📜 License
 
-MIT © [sh3ll3x3c](https://github.com/sh3ll3x3c)
+MIT. Original work © [sh3ll3x3c](https://github.com/sh3ll3x3c); fork modifications © [leaf0412](https://github.com/leaf0412). See [`LICENSE`](./LICENSE).
