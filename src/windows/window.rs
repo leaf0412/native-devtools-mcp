@@ -179,12 +179,25 @@ pub fn find_window_by_id(window_id: u32) -> Result<Option<WindowInfo>, String> {
 }
 
 /// Find windows by application name (case-insensitive substring match).
+///
+/// Returns ALL matching windows, sorted best-first so callers can take
+/// `windows[0]` as the main window. Parity with the macOS implementation, which
+/// sorts on-screen-before-off-screen then by descending area. On Windows
+/// `list_windows` already filters to visible windows and every result has
+/// `is_on_screen == true`, so the on-screen tiebreak is a no-op here and we sort
+/// by descending area only.
 pub fn find_windows_by_app(app_name: &str) -> Result<Vec<WindowInfo>, String> {
     let needle = app_name.to_lowercase();
-    Ok(list_windows()?
+    let mut windows: Vec<WindowInfo> = list_windows()?
         .into_iter()
         .filter(|w| w.owner_name.to_lowercase().contains(&needle))
-        .collect())
+        .collect();
+    windows.sort_by(|a, b| window_area(b).total_cmp(&window_area(a)));
+    Ok(windows)
+}
+
+fn window_area(window: &WindowInfo) -> f64 {
+    window.bounds.width * window.bounds.height
 }
 
 /// Get HWND from window ID.

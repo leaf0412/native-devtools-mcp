@@ -99,12 +99,33 @@ pub fn find_window_by_id_direct(window_id: u32) -> Result<Option<WindowInfo>, St
 }
 
 /// Find windows by application name (case-insensitive substring match).
+///
+/// Returns ALL matching windows, sorted best-first so callers can take
+/// `windows[0]` as the main window: on-screen windows precede off-screen ones,
+/// then larger windows (by area) precede smaller ones. This prevents picking a
+/// tiny off-screen helper panel over the real main window for multi-window apps.
 pub fn find_windows_by_app(app_name: &str) -> Result<Vec<WindowInfo>, String> {
     let needle = app_name.to_lowercase();
-    Ok(list_windows()?
+    let mut windows: Vec<WindowInfo> = list_windows()?
         .into_iter()
         .filter(|w| w.owner_name.to_lowercase().contains(&needle))
-        .collect())
+        .collect();
+    sort_windows_main_first(&mut windows);
+    Ok(windows)
+}
+
+/// Order windows so the most likely "main" window is first: on-screen before
+/// off-screen, then descending area.
+fn sort_windows_main_first(windows: &mut [WindowInfo]) {
+    windows.sort_by(|a, b| {
+        b.is_on_screen
+            .cmp(&a.is_on_screen)
+            .then_with(|| window_area(b).total_cmp(&window_area(a)))
+    });
+}
+
+fn window_area(window: &WindowInfo) -> f64 {
+    window.bounds.width * window.bounds.height
 }
 
 fn get_value(dict: &CFDict, key: *const c_void) -> Option<CFType> {
@@ -165,5 +186,44 @@ mod tests {
         for w in &windows {
             assert!(w.owner_name.to_lowercase().contains("finder"));
         }
+    }
+
+    fn make_window(id: u32, on_screen: bool, width: f64, height: f64) -> WindowInfo {
+        WindowInfo {
+            id,
+            name: None,
+            owner_name: "App".to_string(),
+            owner_pid: 1,
+            bounds: WindowBounds {
+                x: 0.0,
+                y: 0.0,
+                width,
+                height,
+            },
+            layer: 0,
+            is_on_screen: on_screen,
+        }
+    }
+
+    #[test]
+    fn test_sort_windows_main_first() {
+        // Mirrors the live WeChat bug: a tiny on-screen panel and a large
+        // off-screen window must not outrank the large on-screen main window.
+        let large_on_screen = make_window(1, true, 766.0, 645.0);
+        let tiny_on_screen = make_window(2, true, 187.0, 51.0);
+        let large_off_screen = make_window(3, false, 1200.0, 900.0);
+
+        let mut windows = vec![
+            tiny_on_screen.clone(),
+            large_off_screen.clone(),
+            large_on_screen.clone(),
+        ];
+        sort_windows_main_first(&mut windows);
+
+        // Largest on-screen window wins index 0 over the larger off-screen one.
+        assert_eq!(windows[0].id, large_on_screen.id);
+        // On-screen windows precede off-screen ones regardless of area.
+        assert_eq!(windows[1].id, tiny_on_screen.id);
+        assert_eq!(windows[2].id, large_off_screen.id);
     }
 }
