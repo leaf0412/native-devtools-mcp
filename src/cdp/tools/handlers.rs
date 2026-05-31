@@ -104,7 +104,15 @@ impl ToolHandler for CdpLaunch {
                     },
                     "profile": {
                         "type": "string",
-                        "description": "Profile name under ~/.native-devtools-mcp/ (default 'chrome-profile'). Use distinct names to keep separate logged-in identities."
+                        "description": "Profile name under ~/.native-devtools-mcp/ (default 'chrome-profile'). Use distinct names to keep separate logged-in identities. Ignored when ephemeral=true."
+                    },
+                    "headless": {
+                        "type": "boolean",
+                        "description": "Run Chrome headless (no window, no display/GUI session or screen-recording permission needed). Ideal for CI browser automation. Default false."
+                    },
+                    "ephemeral": {
+                        "type": "boolean",
+                        "description": "Use a throwaway temp profile that is deleted and whose Chrome is killed on cdp_disconnect, instead of the persistent ~/.native-devtools-mcp/ profile. Gives reproducible, contention-free runs (no shared-profile lock). Ideal for CI. Default false."
                     }
                 }
             }))),
@@ -127,8 +135,12 @@ impl ToolHandler for CdpLaunch {
             .get("profile")
             .and_then(|v| v.as_str())
             .unwrap_or("chrome-profile");
+        let headless = args.get("headless").and_then(|v| v.as_bool()).unwrap_or(false);
+        let ephemeral = args.get("ephemeral").and_then(|v| v.as_bool()).unwrap_or(false);
 
-        match crate::cdp::launch::launch_and_connect(port as u16, profile, url).await {
+        match crate::cdp::launch::launch_and_connect(port as u16, profile, url, headless, ephemeral)
+            .await
+        {
             Ok((client, reused)) => {
                 let page_info = if let Some(page) = client.selected_page.as_ref() {
                     format!("Selected page: {}", crate::cdp::page_url(page).await)
@@ -136,15 +148,21 @@ impl ToolHandler for CdpLaunch {
                     "No pages found".to_string()
                 };
                 *ctx.cdp_client.write().await = Some(client);
+                let mode = if headless { "headless" } else { "windowed" };
                 let how = if reused {
                     format!(
                         "Reused the debug browser already running on port {} (login session preserved).",
                         port
                     )
+                } else if ephemeral {
+                    format!(
+                        "Launched {} Chrome with an ephemeral profile on port {}. Its process is killed and the profile removed on cdp_disconnect (reproducible, no shared-profile lock).",
+                        mode, port
+                    )
                 } else {
                     format!(
-                        "Launched Chrome with managed profile '{}' on port {}. Log in once if a site needs it; the session persists for future launches.",
-                        profile, port
+                        "Launched {} Chrome with managed profile '{}' on port {}. Log in once if a site needs it; the session persists for future launches.",
+                        mode, profile, port
                     )
                 };
                 Ok(CallToolResult::success(vec![Content::text(format!(

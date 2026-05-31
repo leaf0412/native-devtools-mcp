@@ -13,6 +13,7 @@
 
 use super::CdpClient;
 use std::path::{Path, PathBuf};
+use std::process::{Child, Command, Stdio};
 use std::time::Duration;
 
 /// Resolve (and create) the stable debug-profile directory, e.g.
@@ -43,31 +44,85 @@ fn home_dir() -> Option<PathBuf> {
     }
 }
 
+/// Locate the Chrome executable for a direct (headless) launch, where the OS
+/// app-launcher (`open` / `start`) can't be used to pass `--headless`.
+fn chrome_binary() -> Option<PathBuf> {
+    #[cfg(target_os = "macos")]
+    {
+        const STD: &str = "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome";
+        if Path::new(STD).exists() {
+            return Some(PathBuf::from(STD));
+        }
+        let user = home_dir()?.join("Applications/Google Chrome.app/Contents/MacOS/Google Chrome");
+        user.exists().then_some(user)
+    }
+    #[cfg(target_os = "windows")]
+    {
+        for p in [
+            r"C:\Program Files\Google\Chrome\Application\chrome.exe",
+            r"C:\Program Files (x86)\Google\Chrome\Application\chrome.exe",
+        ] {
+            if Path::new(p).exists() {
+                return Some(PathBuf::from(p));
+            }
+        }
+        None
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "windows")))]
+    {
+        Some(PathBuf::from("google-chrome"))
+    }
+}
+
 /// Spawn Chrome as a new instance bound to `port`, using `dir` as its
-/// user-data-dir so the profile (and its logins) persists.
+/// user-data-dir. Returns the [`Child`] only when we launched the binary
+/// directly (headless) so the caller can kill it; the windowed `open`/`start`
+/// path detaches and returns `None` (left running on purpose).
 ///
 /// No URL is passed on the command line: `open -na ... <url>` is unreliable
 /// (the URL is often routed to an already-running Chrome rather than this new
 /// instance). We open the target page over CDP after connecting instead.
-fn spawn_chrome(port: u16, dir: &Path) -> Result<(), String> {
+fn spawn_chrome(port: u16, dir: &Path, headless: bool) -> Result<Option<Child>, String> {
     let debug = format!("--remote-debugging-port={}", port);
     let data_dir = format!("--user-data-dir={}", dir.display());
 
+    if headless {
+        let bin = chrome_binary().ok_or(
+            "Cannot find the Google Chrome binary for a headless launch. \
+             Install Chrome at the standard location.",
+        )?;
+        let child = Command::new(bin)
+            .args([
+                "--headless=new",
+                "--disable-gpu",
+                "--no-first-run",
+                "--no-default-browser-check",
+                &debug,
+                &data_dir,
+                "about:blank",
+            ])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .map_err(|e| format!("Failed to spawn headless Chrome: {}", e))?;
+        return Ok(Some(child));
+    }
+
     #[cfg(target_os = "macos")]
     let mut cmd = {
-        let mut c = std::process::Command::new("open");
+        let mut c = Command::new("open");
         c.args(["-na", "Google Chrome", "--args", &debug, &data_dir]);
         c
     };
     #[cfg(target_os = "windows")]
     let mut cmd = {
-        let mut c = std::process::Command::new("cmd");
+        let mut c = Command::new("cmd");
         c.args(["/C", "start", "", "chrome", &debug, &data_dir]);
         c
     };
     #[cfg(not(any(target_os = "macos", target_os = "windows")))]
     let mut cmd = {
-        let mut c = std::process::Command::new("google-chrome");
+        let mut c = Command::new("google-chrome");
         c.args([&debug, &data_dir]);
         c
     };
@@ -76,7 +131,7 @@ fn spawn_chrome(port: u16, dir: &Path) -> Result<(), String> {
         .status()
         .map_err(|e| format!("Failed to spawn Chrome: {}. Is Google Chrome installed?", e))?;
     if status.success() {
-        Ok(())
+        Ok(None)
     } else {
         Err(format!("Chrome launch command exited with status {}", status))
     }
@@ -105,6 +160,8 @@ pub async fn launch_and_connect(
     port: u16,
     profile: &str,
     url: &str,
+    headless: bool,
+    ephemeral: bool,
 ) -> Result<(CdpClient, bool), String> {
     // Reuse path: a debug browser is already up on this port. Leave its
     // existing tabs untouched (that's the logged-in session we want); only
@@ -116,8 +173,19 @@ pub async fn launch_and_connect(
         return Ok((client, true));
     }
 
-    let dir = profile_dir(profile)?;
-    spawn_chrome(port, &dir)?;
+    // Ephemeral (CI) uses a throwaway temp profile for a reproducible,
+    // contention-free run; otherwise the stable managed profile persists logins.
+    let (dir, mut tempdir): (PathBuf, Option<tempfile::TempDir>) = if ephemeral {
+        let td = tempfile::Builder::new()
+            .prefix("ndt-cdp-")
+            .tempdir()
+            .map_err(|e| format!("Failed to create ephemeral profile dir: {}", e))?;
+        (td.path().to_path_buf(), Some(td))
+    } else {
+        (profile_dir(profile)?, None)
+    };
+
+    let mut child = spawn_chrome(port, &dir, headless)?;
 
     // Chrome needs a moment to open the debug port; retry until it answers,
     // then open the target page over CDP.
@@ -127,11 +195,19 @@ pub async fn launch_and_connect(
         match CdpClient::connect(port).await {
             Ok(mut client) => {
                 open_page(&mut client, url).await?;
+                client.chrome_child = child.take();
+                client.profile_tempdir = tempdir.take();
                 return Ok((client, false));
             }
             Err(e) => last_err = e,
         }
     }
+    // Never connected — don't leak the process or temp dir we just created.
+    if let Some(mut c) = child.take() {
+        let _ = c.kill();
+        let _ = c.wait();
+    }
+    drop(tempdir);
     Err(format!(
         "Launched Chrome but could not connect on port {} within ~15s. Last error: {}",
         port, last_err

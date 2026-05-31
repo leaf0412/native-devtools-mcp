@@ -35,6 +35,14 @@ pub struct CdpClient {
     /// (same-URL reload, SPA pushState/replaceState, switching to another tab
     /// with an identical URL).
     pub generation: u64,
+    /// The Chrome process when *we* spawned it directly (headless/ephemeral
+    /// launches). Killed on [`Self::disconnect`]. `None` for `cdp_connect` and
+    /// for the persistent `open -na` launch (which detaches and is left running
+    /// on purpose so its logged-in session survives).
+    pub chrome_child: Option<std::process::Child>,
+    /// Temp profile dir for an ephemeral launch; removed when this field drops
+    /// (on disconnect), after the Chrome process is killed.
+    pub profile_tempdir: Option<tempfile::TempDir>,
 }
 
 impl CdpClient {
@@ -69,12 +77,21 @@ impl CdpClient {
             last_dom_snapshot: None,
             last_page_list: Vec::new(),
             generation: 0,
+            chrome_child: None,
+            profile_tempdir: None,
         })
     }
 
-    /// Disconnect from the browser by aborting the handler task.
-    pub fn disconnect(self) {
+    /// Disconnect from the browser by aborting the handler task. If we spawned
+    /// the Chrome process ourselves (headless/ephemeral), kill it; the temp
+    /// profile dir is then removed when `profile_tempdir` drops.
+    pub fn disconnect(mut self) {
         self.handler_handle.abort();
+        if let Some(mut child) = self.chrome_child.take() {
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+        // self.profile_tempdir drops here, removing the temp dir.
     }
 
     /// Mark the current `backendNodeId` space as invalidated.
