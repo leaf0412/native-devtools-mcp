@@ -1,20 +1,40 @@
-# Running the E2E suite in CI (GitLab)
+# Running the E2E suite from your CI (GitLab)
 
-`ci_runner.py` is the CI entrypoint. It drives the built binary, writes
-`e2e-report/{report.html,report.json,run.mp4}`, and exits non-zero if any
-scenario failed — so a CI job gates on it and you get a readable report (with a
-video and exact reproduction steps) as an artifact.
+This tool is installed **on your runner machine** and *called by* your pipeline.
+There is no daemon and no network service to run: a GitLab job on that machine
+invokes `ci_runner.py`, which drives the built binary and writes
+`e2e-report/{report.html,report.json,run.mp4}`, exiting non-zero on any failure
+so the job gates on it.
+
+## Install on the runner (once)
+
+On the runner machine, logged into its GUI session:
+
+```bash
+bash scripts/e2e/setup-runner.sh
+```
+
+It builds the binary, checks dependencies (Chrome / python3 / ffmpeg), and runs
+the **preflight** — so you learn immediately whether permissions and the GUI
+session are right, instead of when CI produces black screenshots. Verify any
+time with:
+
+```bash
+python3 scripts/e2e/ci_runner.py --check --native --video   # exits 0 only if the host is ready
+```
+
+## In your pipeline job
 
 ```bash
 cargo build --release
-python3 scripts/e2e/ci_runner.py --out e2e-report            # headless browser only
+python3 scripts/e2e/ci_runner.py --out e2e-report                    # headless browser only
 python3 scripts/e2e/ci_runner.py --out e2e-report --native --video   # + native macOS + video
 ```
 
-This repo does **not** ship its own pipeline — it's meant to be *called by* your
-GitLab service/pipeline. Invoke `ci_runner.py` from a job in your own repo and
-publish `e2e-report/` as an artifact (open `report.html` from the artifacts
-browser).
+Publish `e2e-report/` as a job artifact and open `report.html` from the
+artifacts browser. The first scenario in every run is the environment preflight;
+if it fails, the native scenarios are skipped with a clear pointer here (no wall
+of black-frame failures).
 
 ## The two tiers, by what they need
 

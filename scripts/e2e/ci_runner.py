@@ -26,6 +26,7 @@ import html
 import json
 import os
 import re
+import shutil
 import subprocess
 import sys
 import time
@@ -180,6 +181,35 @@ class Reporter:
 
 
 # ----------------------------------------------------------------------------- suites
+def preflight(rep, m, need_native, need_video):
+    """Verify the host can actually run the requested suites BEFORE running them,
+    so a misconfigured runner fails with one clear reason instead of a wall of
+    black-screenshot failures. Returns True if the native suite is safe to run."""
+    native_ok = True
+    with rep.scenario("preflight: environment",
+                      "Check the runner can do what's asked (permissions, GUI session, tools).") as check:
+        chrome_paths = [
+            "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
+            os.path.expanduser("~/Applications/Google Chrome.app/Contents/MacOS/Google Chrome"),
+        ]
+        check("Google Chrome installed", any(os.path.exists(p) for p in chrome_paths)
+              or shutil.which("google-chrome") is not None,
+              "install Google Chrome")
+        if need_video:
+            check("ffmpeg installed (--video)", shutil.which("ffmpeg") is not None,
+                  "brew install ffmpeg (video will be skipped without it)")
+        if need_native:
+            s = m.call("take_screenshot", {"mode": "screen", "include_ocr": True})
+            granted = s["img"] > 5000 and len(s["text"]) > 20
+            check("Screen Recording granted + running in a GUI session (screenshot not black)",
+                  granted,
+                  "" if granted else
+                  "black/empty screen: grant Screen Recording to the runner's shell AND run jobs in "
+                  "a logged-in GUI session (not a root launchd daemon). See scripts/e2e/CI.md")
+            native_ok = granted
+    return native_ok
+
+
 def suite_browser_headless(rep, m):
     """CI-portable: headless Chrome, no GUI session / TCC needed."""
     PORT = 9521
@@ -261,12 +291,9 @@ def main():
     ap.add_argument("--out", default="e2e-report")
     ap.add_argument("--video", action="store_true")
     ap.add_argument("--native", action="store_true")
+    ap.add_argument("--check", action="store_true",
+                    help="run only the environment preflight, then exit (for install verification)")
     args = ap.parse_args()
-
-    os.makedirs(args.out, exist_ok=True)
-    rec = ScreenRecorder(os.path.join(args.out, "run.mp4")) if args.video else None
-    if rec:
-        rec.start()
 
     m = MCP(args.bin)
     if not m.initialize():
@@ -274,9 +301,29 @@ def main():
         sys.exit(2)
     rep = Reporter(m)
 
-    suite_browser_headless(rep, m)
+    # --check: just verify the host is ready (no scenarios, no video).
+    if args.check:
+        native_ok = preflight(rep, m, args.native, args.video)
+        m.close()
+        rep.write(args.out, None, "skipped (--check)")
+        ok = rep.all_passed
+        print("preflight OK" if ok else "preflight FAILED — see messages above / scripts/e2e/CI.md")
+        sys.exit(0 if ok else 1)
+
+    os.makedirs(args.out, exist_ok=True)
+    rec = ScreenRecorder(os.path.join(args.out, "run.mp4")) if args.video else None
+    if rec:
+        rec.start()
+
+    native_ok = preflight(rep, m, args.native, args.video)
+    suite_browser_headless(rep, m)  # headless needs no GUI/permissions
     if args.native:
-        suite_native_macos(rep, m)
+        if native_ok:
+            suite_native_macos(rep, m)
+        else:
+            with rep.scenario("native suite skipped", "preflight failed; not running native scenarios.") as check:
+                check("environment ready for native control", False,
+                      "see the preflight scenario above and scripts/e2e/CI.md")
 
     m.close()
     video_path = rec.stop() if rec else None
