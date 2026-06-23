@@ -20,6 +20,7 @@ use crate::macos::ax::{
 use crate::tools::ax_response;
 use crate::tools::ax_row_target::{resolve_row_and_container, RowResolution};
 use crate::tools::ax_session::{AxSession, LookupError};
+use crate::tools::ax_snapshot::append_ax_snapshot_if_requested;
 use rmcp::model::CallToolResult;
 use serde::Deserialize;
 use std::sync::Arc;
@@ -29,6 +30,13 @@ const DISPATCHED_VIA: &str = "AXSelectedRows";
 #[derive(Deserialize)]
 pub struct AxSelectParams {
     pub uid: String,
+    /// When true, take a fresh AX snapshot after the action and append it
+    /// to the result.
+    #[serde(default)]
+    pub include_snapshot: bool,
+    /// Optional app name for the follow-up snapshot.
+    #[serde(default)]
+    pub app_name: Option<String>,
 }
 
 pub async fn ax_select(params: AxSelectParams, session: Arc<AxSession>) -> CallToolResult {
@@ -99,7 +107,7 @@ pub async fn ax_select(params: AxSelectParams, session: Arc<AxSession>) -> CallT
         })
         .await;
 
-    match outcome {
+    let mut result = match outcome {
         Ok(result) => result,
         Err(LookupError::SnapshotExpired { reason }) => {
             ax_response::error("snapshot_expired", &reason, None)
@@ -109,7 +117,17 @@ pub async fn ax_select(params: AxSelectParams, session: Arc<AxSession>) -> CallT
             &format!("uid {} is not present in the current snapshot", params.uid),
             None,
         ),
-    }
+    };
+
+    append_ax_snapshot_if_requested(
+        &mut result,
+        params.include_snapshot,
+        params.app_name.as_deref(),
+        &session,
+    )
+    .await;
+
+    result
 }
 
 use crate::tools::registry::{json_to_object, ToolContext, ToolHandler};
@@ -147,6 +165,14 @@ impl ToolHandler for AxSelect {
                     "uid": {
                         "type": "string",
                         "description": "Element uid from the most recent take_ax_snapshot. Points at the row itself, a cell within the row, or any descendant."
+                    },
+                    "include_snapshot": {
+                        "type": "boolean",
+                        "description": "When true, take a fresh AX snapshot after the action and append it to the result (default: false)."
+                    },
+                    "app_name": {
+                        "type": "string",
+                        "description": "Optional app name for the follow-up AX snapshot."
                     }
                 }
             }))),

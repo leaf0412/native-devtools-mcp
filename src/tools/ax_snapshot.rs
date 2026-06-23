@@ -45,6 +45,19 @@ pub struct AXSnapshotNode {
     /// element exposes `kAXPositionAttribute` and `kAXSizeAttribute`.
     /// Always `None` from Windows UIA and CDP collectors.
     pub bbox: Option<Rect>,
+    /// Whether the element supports `AXPress` (e.g. buttons).
+    pub can_press: bool,
+    /// Whether the element's `AXValue` attribute is writable
+    /// (e.g. text fields, search fields).
+    pub can_set_value: bool,
+    /// Whether the element supports any scroll action
+    /// (AXScrollDown/Up/Left/Right).
+    pub can_scroll: bool,
+    /// Whether the element's `AXFocused` attribute is settable.
+    pub can_focus: bool,
+    /// Whether the element supports `AXIncrement` or `AXDecrement`
+    /// (e.g. sliders, steppers).
+    pub can_adjust: bool,
 }
 
 /// Format snapshot nodes into the text representation.
@@ -93,6 +106,28 @@ pub fn format_snapshot(nodes: &[AXSnapshotNode], generation: Option<u64>) -> Str
                 "bbox=({},{},{},{})",
                 bbox.x as i64, bbox.y as i64, bbox.w as i64, bbox.h as i64
             ));
+        }
+
+        // Capability tags — short suffixes so the LLM can decide at a glance
+        // whether an element is a valid dispatch target for each action type.
+        let mut caps = Vec::new();
+        if node.can_press {
+            caps.push("P");
+        }
+        if node.can_set_value {
+            caps.push("SV");
+        }
+        if node.can_scroll {
+            caps.push("SC");
+        }
+        if node.can_focus {
+            caps.push("F");
+        }
+        if node.can_adjust {
+            caps.push("ADJ");
+        }
+        if !caps.is_empty() {
+            parts.push(format!("[{}]", caps.join(",")));
         }
 
         lines.push(format!("{}{}", indent, parts.join(" ")));
@@ -188,6 +223,7 @@ pub fn map_uia_control_type(control_type_id: i32) -> String {
     .to_string()
 }
 
+use crate::tools::ax_session::AxSession;
 use crate::tools::registry::{json_to_object, ToolContext, ToolHandler};
 use rmcp::{
     model::{CallToolResult, Content, Tool},
@@ -265,6 +301,46 @@ impl ToolHandler for TakeAxSnapshot {
     }
 }
 
+/// Append a fresh AX snapshot to `result.content` when `include_snapshot`
+/// is true. Uses the given AX session and optional app name to collect a
+/// new tree, install it into the session (bumping the generation), and
+/// format it with tagged uids.
+///
+/// On macOS this produces a full `a<N>g<gen>` snapshot; on other platforms
+/// it appends a note that AX snapshots are not available from this tool.
+pub(crate) async fn append_ax_snapshot_if_requested(
+    result: &mut CallToolResult,
+    include_snapshot: bool,
+    app_name: Option<&str>,
+    session: &Arc<AxSession>,
+) {
+    if !include_snapshot {
+        return;
+    }
+
+    #[cfg(target_os = "macos")]
+    let snapshot_text = {
+        match crate::macos::ax::collect_ax_tree_indexed(app_name) {
+            Ok((nodes, refs)) => {
+                let generation = session.create_snapshot(refs).await;
+                format!(
+                    "## Updated AX Snapshot\n{}",
+                    format_snapshot(&nodes, Some(generation))
+                )
+            }
+            Err(e) => format!("## Updated AX Snapshot\nFailed to collect AX tree: {}", e),
+        }
+    };
+
+    #[cfg(not(target_os = "macos"))]
+    let snapshot_text =
+        "## Updated AX Snapshot\nAX snapshot append is not supported on this platform.".to_string();
+
+    result
+        .content
+        .push(Content::text(snapshot_text));
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -283,6 +359,11 @@ mod tests {
                 selected: None,
                 depth: 0,
                 bbox: None,
+                can_press: false,
+                can_set_value: false,
+                can_scroll: false,
+                can_focus: false,
+                can_adjust: false,
             },
             AXSnapshotNode {
                 uid: 2,
@@ -295,6 +376,11 @@ mod tests {
                 selected: None,
                 depth: 1,
                 bbox: None,
+                can_press: true,
+                can_set_value: false,
+                can_scroll: false,
+                can_focus: true,
+                can_adjust: false,
             },
             AXSnapshotNode {
                 uid: 3,
@@ -307,13 +393,18 @@ mod tests {
                 selected: None,
                 depth: 1,
                 bbox: None,
+                can_press: false,
+                can_set_value: true,
+                can_scroll: false,
+                can_focus: true,
+                can_adjust: false,
             },
         ];
 
         let result = format_snapshot(&nodes, None);
         assert_eq!(
             result,
-            "uid=a1 RootWebArea \"Page Title\"\n  uid=a2 button \"Submit\"\n  uid=a3 textbox value=\"hello\" focused"
+            "uid=a1 RootWebArea \"Page Title\"\n  uid=a2 button \"Submit\" [P,F]\n  uid=a3 textbox value=\"hello\" focused [SV,F]"
         );
     }
 
@@ -330,10 +421,15 @@ mod tests {
             selected: Some(true),
             depth: 0,
             bbox: None,
+            can_press: true,
+            can_set_value: false,
+            can_scroll: false,
+            can_focus: true,
+            can_adjust: false,
         }];
 
         let result = format_snapshot(&nodes, None);
-        assert_eq!(result, "uid=a1 checkbox \"Remember me\" disabled selected");
+        assert_eq!(result, "uid=a1 checkbox \"Remember me\" disabled selected [P,F]");
     }
 
     #[test]
@@ -349,6 +445,11 @@ mod tests {
             selected: None,
             depth: 0,
             bbox: None,
+            can_press: false,
+            can_set_value: false,
+            can_scroll: false,
+            can_focus: false,
+            can_adjust: false,
         }];
 
         let result = format_snapshot(&nodes, None);
@@ -368,6 +469,11 @@ mod tests {
             selected: None,
             depth: 0,
             bbox: None,
+            can_press: false,
+            can_set_value: false,
+            can_scroll: false,
+            can_focus: false,
+            can_adjust: false,
         }];
         let result = format_snapshot(&nodes, Some(3));
         assert_eq!(result, "uid=a42g3 button \"5\"");
@@ -391,9 +497,14 @@ mod tests {
                 w: 64.0,
                 h: 32.0,
             }),
+            can_press: true,
+            can_set_value: false,
+            can_scroll: false,
+            can_focus: true,
+            can_adjust: false,
         }];
         let result = format_snapshot(&nodes, Some(3));
-        assert_eq!(result, "uid=a1g3 button \"5\" bbox=(412,285,64,32)");
+        assert_eq!(result, "uid=a1g3 button \"5\" bbox=(412,285,64,32) [P,F]");
     }
 
     #[test]
@@ -409,9 +520,109 @@ mod tests {
             selected: None,
             depth: 0,
             bbox: None,
+            can_press: false,
+            can_set_value: false,
+            can_scroll: false,
+            can_focus: false,
+            can_adjust: false,
         }];
         let result = format_snapshot(&nodes, Some(3));
         assert_eq!(result, "uid=a1g3 generic");
+    }
+
+    #[test]
+    fn test_format_snapshot_capability_all_on() {
+        let nodes = vec![AXSnapshotNode {
+            uid: 1,
+            role: "textbox".to_string(),
+            name: Some("Search".to_string()),
+            value: None,
+            focused: false,
+            disabled: false,
+            expanded: None,
+            selected: None,
+            depth: 0,
+            bbox: Some(Rect { x: 0.0, y: 0.0, w: 200.0, h: 24.0 }),
+            can_press: true,
+            can_set_value: true,
+            can_scroll: true,
+            can_focus: true,
+            can_adjust: true,
+        }];
+        let result = format_snapshot(&nodes, Some(1));
+        assert_eq!(
+            result,
+            "uid=a1g1 textbox \"Search\" bbox=(0,0,200,24) [P,SV,SC,F,ADJ]"
+        );
+    }
+
+    #[test]
+    fn test_format_snapshot_capability_scroll_only() {
+        let nodes = vec![AXSnapshotNode {
+            uid: 1,
+            role: "scrollbar".to_string(),
+            name: None,
+            value: None,
+            focused: false,
+            disabled: false,
+            expanded: None,
+            selected: None,
+            depth: 0,
+            bbox: None,
+            can_press: false,
+            can_set_value: false,
+            can_scroll: true,
+            can_focus: false,
+            can_adjust: false,
+        }];
+        let result = format_snapshot(&nodes, None);
+        assert_eq!(result, "uid=a1 scrollbar [SC]");
+    }
+
+    #[test]
+    fn test_format_snapshot_capability_slider_adjust() {
+        let nodes = vec![AXSnapshotNode {
+            uid: 1,
+            role: "slider".to_string(),
+            name: Some("Volume".to_string()),
+            value: Some("0.5".to_string()),
+            focused: false,
+            disabled: false,
+            expanded: None,
+            selected: None,
+            depth: 0,
+            bbox: None,
+            can_press: false,
+            can_set_value: false,
+            can_scroll: false,
+            can_focus: false,
+            can_adjust: true,
+        }];
+        let result = format_snapshot(&nodes, None);
+        assert_eq!(result, "uid=a1 slider \"Volume\" value=\"0.5\" [ADJ]");
+    }
+
+    #[test]
+    fn test_format_snapshot_capability_no_bbox_still_shows_caps() {
+        let nodes = vec![AXSnapshotNode {
+            uid: 1,
+            role: "button".to_string(),
+            name: Some("OK".to_string()),
+            value: None,
+            focused: false,
+            disabled: false,
+            expanded: None,
+            selected: None,
+            depth: 0,
+            bbox: None,
+            can_press: true,
+            can_set_value: false,
+            can_scroll: false,
+            can_focus: true,
+            can_adjust: false,
+        }];
+        let result = format_snapshot(&nodes, None);
+        assert_eq!(result, "uid=a1 button \"OK\" [P,F]");
     }
 
     #[test]

@@ -370,6 +370,11 @@ unsafe fn collect_uia_tree_recursive(
         selected,
         depth,
         bbox: None,
+        can_press: false,
+        can_set_value: false,
+        can_scroll: false,
+        can_focus: false,
+        can_adjust: false,
     });
 
     // Walk children via the tree walker

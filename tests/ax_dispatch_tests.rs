@@ -145,7 +145,7 @@ async fn ax_click_presses_calculator_five_button() {
     let five_uid = extract_uid_for_named_button(&snap_text, "5");
     let before = extract_calculator_display_value(&snap_text).unwrap_or_default();
 
-    let click = ax_click(AxClickParams { uid: five_uid }, session.clone()).await;
+    let click = ax_click(AxClickParams { uid: five_uid, include_snapshot: false, app_name: None }, session.clone()).await;
     let body = parse_json(&extract_text(&click));
     assert_eq!(body["ok"], true);
     assert_eq!(body["dispatched_via"], "AXPress");
@@ -179,7 +179,7 @@ async fn ax_click_stale_generation_returns_snapshot_expired() {
     // Fresh snapshot bumps the generation. Don't use its uids.
     let _snap2 = snapshot(&session, Some("Calculator")).await;
 
-    let click = ax_click(AxClickParams { uid: five_g1 }, session.clone()).await;
+    let click = ax_click(AxClickParams { uid: five_g1, include_snapshot: false, app_name: None }, session.clone()).await;
     assert_eq!(click.is_error, Some(true));
     let body = parse_json(&extract_text(&click));
     assert_eq!(
@@ -208,7 +208,7 @@ async fn ax_click_unknown_uid_in_current_gen_returns_uid_not_found() {
     let gen: u64 = gen_part.parse().unwrap();
 
     let missing = format!("a99999g{}", gen);
-    let click = ax_click(AxClickParams { uid: missing }, session.clone()).await;
+    let click = ax_click(AxClickParams { uid: missing, include_snapshot: false, app_name: None }, session.clone()).await;
     assert_eq!(click.is_error, Some(true));
     let body = parse_json(&extract_text(&click));
     assert_eq!(body["error"]["code"], "uid_not_found");
@@ -238,6 +238,8 @@ async fn ax_click_on_decorative_label_returns_not_dispatchable_with_fallback() {
     let click = ax_click(
         AxClickParams {
             uid: decorative_uid,
+            include_snapshot: false,
+            app_name: None,
         },
         session.clone(),
     )
@@ -324,7 +326,7 @@ async fn ax_click_preserves_focus_while_calculator_stays_background() {
     );
 
     // Click Calculator's 5 button without stealing focus.
-    let click = ax_click(AxClickParams { uid: five_uid }, session.clone()).await;
+    let click = ax_click(AxClickParams { uid: five_uid, include_snapshot: false, app_name: None }, session.clone()).await;
     let body = parse_json(&extract_text(&click));
     assert_eq!(body["ok"], true);
 
@@ -389,6 +391,8 @@ async fn ax_set_value_preserves_focus_writing_textedit_while_terminal_is_front()
         AxSetValueParams {
             uid: doc_uid,
             text: "hello".to_string(),
+            include_snapshot: false,
+            app_name: None,
         },
         session.clone(),
     )
@@ -536,6 +540,8 @@ async fn ax_select_moves_sidebar_selection_in_system_settings() {
     let result = ax_select(
         AxSelectParams {
             uid: target.uid.clone(),
+            include_snapshot: false,
+            app_name: None,
         },
         session.clone(),
     )
@@ -594,7 +600,7 @@ async fn ax_select_on_non_row_element_returns_no_row_ancestor() {
     let snap_text = snapshot(&session, Some("Calculator")).await;
     let five_uid = extract_uid_for_named_button(&snap_text, "5");
 
-    let result = ax_select(AxSelectParams { uid: five_uid }, session.clone()).await;
+    let result = ax_select(AxSelectParams { uid: five_uid, include_snapshot: false, app_name: None }, session.clone()).await;
     assert_eq!(result.is_error, Some(true));
     let body = parse_json(&extract_text(&result));
     assert_eq!(body["error"]["code"], "no_row_ancestor");

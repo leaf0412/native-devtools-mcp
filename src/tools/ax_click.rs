@@ -4,6 +4,7 @@
 use crate::macos::ax::{element_bbox, press_element, AXDispatchError, AXRef};
 use crate::tools::ax_response;
 use crate::tools::ax_session::{AxSession, LookupError};
+use crate::tools::ax_snapshot::append_ax_snapshot_if_requested;
 use rmcp::model::CallToolResult;
 use serde::Deserialize;
 use std::sync::Arc;
@@ -13,6 +14,14 @@ const DISPATCHED_VIA: &str = "AXPress";
 #[derive(Deserialize)]
 pub struct AxClickParams {
     pub uid: String,
+    /// When true, take a fresh AX snapshot after the action and append it
+    /// to the result so the caller can observe the new UI state without an
+    /// extra round-trip.
+    #[serde(default)]
+    pub include_snapshot: bool,
+    /// Optional app name for the follow-up snapshot. Defaults to frontmost.
+    #[serde(default)]
+    pub app_name: Option<String>,
 }
 
 /// Handle an `ax_click` tool call.
@@ -62,7 +71,7 @@ pub async fn ax_click(params: AxClickParams, session: Arc<AxSession>) -> CallToo
         })
         .await;
 
-    match outcome {
+    let mut result = match outcome {
         Ok(result) => result,
         Err(LookupError::SnapshotExpired { reason }) => {
             ax_response::error("snapshot_expired", &reason, None)
@@ -72,7 +81,17 @@ pub async fn ax_click(params: AxClickParams, session: Arc<AxSession>) -> CallToo
             &format!("uid {} is not present in the current snapshot", params.uid),
             None,
         ),
-    }
+    };
+
+    append_ax_snapshot_if_requested(
+        &mut result,
+        params.include_snapshot,
+        params.app_name.as_deref(),
+        &session,
+    )
+    .await;
+
+    result
 }
 
 use crate::tools::registry::{json_to_object, ToolContext, ToolHandler};
@@ -97,7 +116,8 @@ impl ToolHandler for AxClick {
              not move the mouse cursor and does not steal focus from the frontmost \
              app. On failure the tool returns an error whose JSON body includes \
              { error: { code, message, fallback: { x, y } | null } }; when fallback is \
-             populated you can retry via click(x, y).",
+             populated, prefer click(x, y, background=true, app_name=...) to retry without \
+             stealing the cursor — fall back to a plain click(x, y) only if that also fails.",
             Arc::new(json_to_object(serde_json::json!({
                 "type": "object",
                 "required": ["uid"],
@@ -105,6 +125,14 @@ impl ToolHandler for AxClick {
                     "uid": {
                         "type": "string",
                         "description": "Element uid from the most recent take_ax_snapshot, e.g. \"a42g3\". Must match the current snapshot generation."
+                    },
+                    "include_snapshot": {
+                        "type": "boolean",
+                        "description": "When true, take a fresh AX snapshot after the action and append it to the result (default: false)."
+                    },
+                    "app_name": {
+                        "type": "string",
+                        "description": "Optional app name for the follow-up AX snapshot. Defaults to the frontmost app."
                     }
                 }
             }))),

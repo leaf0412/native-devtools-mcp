@@ -52,4 +52,13 @@ extern "C" {
         element: *mut AXUIElementRef,
     ) -> i32;
     pub(super) fn AXUIElementGetPid(element: AXUIElementRef, pid: *mut i32) -> i32;
+    pub(super) fn AXUIElementCopyActionNames(
+        element: AXUIElementRef,
+        names: *mut core_foundation::base::CFTypeRef,
+    ) -> i32;
+    pub(super) fn AXUIElementIsAttributeSettable(
+        element: AXUIElementRef,
+        attribute: core_foundation::string::CFStringRef,
+        settable: *mut bool,
+    ) -> i32;
 }

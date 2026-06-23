@@ -210,6 +210,15 @@ pub(crate) unsafe fn collect_ax_tree_recursive(
     let selected = attr::boolean(element, "AXSelected").ok().flatten();
     let bbox = element_bbox(element);
 
+    // Query capabilities: press, set-value, scroll, focus, adjust.
+    let actions = attr::action_names(element);
+    let can_press = actions.iter().any(|a| a == "AXPress");
+    let can_set_value = attr::is_settable(element, "AXValue");
+    let can_scroll = attr::supports_any_scroll_action(element);
+    let can_focus = attr::is_settable(element, "AXFocused");
+    let can_adjust = actions.iter().any(|a| a == "AXIncrement")
+        || actions.iter().any(|a| a == "AXDecrement");
+
     nodes.push(AXSnapshotNode {
         uid,
         role,
@@ -221,6 +230,11 @@ pub(crate) unsafe fn collect_ax_tree_recursive(
         selected,
         depth,
         bbox,
+        can_press,
+        can_set_value,
+        can_scroll,
+        can_focus,
+        can_adjust,
     });
 
     // Retain under get-rule: the current `element` was obtained either from

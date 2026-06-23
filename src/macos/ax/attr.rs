@@ -176,6 +176,54 @@ pub(super) fn array(
     Ok(Some(unsafe { CFArray::wrap_under_create_rule(raw as _) }))
 }
 
+/// Query the list of supported action names for an element.
+///
+/// Returns a `Vec<String>` of CFString action names (e.g. `"AXPress"`,
+/// `"AXScrollDown"`). Returns an empty vec on error or absent attribute.
+pub(super) fn action_names(element: AXUIElementRef) -> Vec<String> {
+    use super::ffi::AXUIElementCopyActionNames;
+
+    let mut cf_array_ref: core_foundation::base::CFTypeRef = std::ptr::null();
+    let code = unsafe { AXUIElementCopyActionNames(element, &mut cf_array_ref) };
+    if code != super::ffi::K_AX_ERROR_SUCCESS || cf_array_ref.is_null() {
+        return Vec::new();
+    }
+    let cf_array = unsafe { CFArray::<*const c_void>::wrap_under_create_rule(cf_array_ref as _) };
+    let mut names = Vec::with_capacity(cf_array.len() as usize);
+    for i in 0..cf_array.len() {
+        if let Some(ptr) = cf_array.get(i) {
+            let raw = *ptr;
+            if !raw.is_null() {
+                let cf_str =
+                    unsafe { CFString::wrap_under_get_rule(raw as core_foundation::string::CFStringRef) };
+                names.push(cf_str.to_string());
+            }
+        }
+    }
+    names
+}
+
+/// Check whether a named attribute is settable on an element.
+/// Returns `false` on error or absent attribute.
+pub(super) fn is_settable(element: AXUIElementRef, key: &'static str) -> bool {
+    use super::ffi::AXUIElementIsAttributeSettable;
+
+    let attr = CFString::new(key);
+    let mut settable: bool = false;
+    let code =
+        unsafe { AXUIElementIsAttributeSettable(element, attr.as_concrete_TypeRef(), &mut settable) };
+    code == super::ffi::K_AX_ERROR_SUCCESS && settable
+}
+
+/// Check whether the element supports any scroll action
+/// (AXScrollDown/AXScrollUp/AXScrollLeft/AXScrollRight).
+pub(super) fn supports_any_scroll_action(element: AXUIElementRef) -> bool {
+    let names = action_names(element);
+    names.iter().any(|n| {
+        n == "AXScrollDown" || n == "AXScrollUp" || n == "AXScrollLeft" || n == "AXScrollRight"
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
