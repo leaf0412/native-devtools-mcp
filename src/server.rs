@@ -298,6 +298,7 @@ impl MacOSDevToolsServer {
                 tools,
                 &[
                     "cdp_connect",
+                    "cdp_auto_connect",
                     "cdp_disconnect",
                     "cdp_click",
                     "cdp_hover",

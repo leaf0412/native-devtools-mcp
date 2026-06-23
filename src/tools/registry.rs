@@ -141,6 +141,7 @@ impl ToolRegistry {
         #[cfg(feature = "cdp")]
         {
             tools.push(Box::new(crate::cdp::tools::handlers::CdpConnect));
+            tools.push(Box::new(crate::cdp::tools::handlers::CdpAutoConnect));
             tools.push(Box::new(crate::cdp::tools::handlers::CdpLaunch));
             tools.push(Box::new(crate::cdp::tools::handlers::CdpDisconnect));
             tools.push(Box::new(crate::cdp::tools::handlers::CdpNavigate));

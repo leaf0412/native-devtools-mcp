@@ -3,6 +3,7 @@
 //! Connects to Chrome/Electron apps via their remote debugging port
 //! using the chromiumoxide crate.
 
+pub mod auto_connect;
 pub mod dom_discovery;
 pub mod launch;
 pub mod tools;
@@ -68,6 +69,40 @@ impl CdpClient {
         // Chrome 136+ with chromiumoxide: fetch_targets() queues discovery but
         // Page objects are NOT guaranteed to be ready when it returns. We must
         // poll until at least one real page appears or we time out.
+        let selected_page = poll_for_page(&mut browser, std::time::Duration::from_secs(10)).await?;
+
+        Ok(Self {
+            browser,
+            selected_page,
+            handler_handle,
+            last_dom_snapshot: None,
+            last_page_list: Vec::new(),
+            generation: 0,
+            chrome_child: None,
+            profile_tempdir: None,
+        })
+    }
+
+    /// Connect to a Chromium instance using an already-resolved WebSocket URL.
+    ///
+    /// Skips chromiumoxide's HTTP-discovery step (which would `GET /json/version`
+    /// and fail on browsers that reject that endpoint, e.g. Chrome 144+ on the
+    /// default profile when remote debugging is enabled only via the
+    /// `chrome://inspect/#remote-debugging` toggle).
+    ///
+    /// The URL is expected to be `ws://127.0.0.1:<port><path>`, exactly as
+    /// written in `<userDataDir>/DevToolsActivePort`. Use
+    /// [`crate::cdp::auto_connect::connect_default_chrome`] to wire that up.
+    pub async fn connect_ws(ws_url: &str) -> Result<Self, String> {
+        let (mut browser, mut handler) = Browser::connect(ws_url)
+            .await
+            .map_err(|e| format!(
+                "Cannot connect to CDP at {ws_url}: {e}. Check that the browser is running \
+                 and that its remote debugging endpoint is reachable."
+            ))?;
+
+        let handler_handle = tokio::spawn(async move { while handler.next().await.is_some() {} });
+
         let selected_page = poll_for_page(&mut browser, std::time::Duration::from_secs(10)).await?;
 
         Ok(Self {

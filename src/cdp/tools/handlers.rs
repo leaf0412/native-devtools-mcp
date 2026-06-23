@@ -175,6 +175,56 @@ impl ToolHandler for CdpLaunch {
     }
 }
 
+/// `cdp_auto_connect` — attach to the user's *existing* default-profile Chrome
+/// (Chrome 144+ only). Skips chromiumoxide's HTTP discovery step (which
+/// Chrome 144 rejects on the default profile) by reading
+/// `<userDataDir>/DevToolsActivePort` and connecting directly via `ws://`.
+///
+/// Prerequisite: open `chrome://inspect/#remote-debugging` in Chrome and
+/// enable "Allow remote debugging for this browser instance". Without that
+/// toggle Chrome 144 doesn't expose the WebSocket endpoint either.
+pub struct CdpAutoConnect;
+
+#[async_trait::async_trait]
+impl ToolHandler for CdpAutoConnect {
+    fn name(&self) -> &'static str {
+        "cdp_auto_connect"
+    }
+
+    fn schema(&self) -> Tool {
+        Tool::new(
+            "cdp_auto_connect",
+            "Attach to the user's existing default-profile Chrome (Chrome 144+) via its DevToolsActivePort file. Requires Chrome 144+ with 'Allow remote debugging' enabled at chrome://inspect/#remote-debugging — see the schema for the full prerequisite list. Connects to the user's actual browser (same tabs, cookies, extensions, login sessions) — unlike cdp_launch which spawns a SEPARATE managed Chrome with a dedicated profile. Uses Google Chrome stable only on macOS / Linux / Windows; Canary / Beta / other Chromium-based browsers are not supported by this tool.",
+            Arc::new(json_to_object(serde_json::json!({
+                "type": "object",
+                "properties": {},
+                "description": "Prerequisites:\n  1. Chrome 144+ installed (stable channel).\n  2. Open chrome://inspect/#remote-debugging in Chrome.\n  3. Enable 'Allow remote debugging for this browser instance'.\n  4. Chrome is running.\n\nOn success you are connected to your actual Chrome: all open tabs, cookies, extensions, and login sessions are visible to subsequent CDP tool calls. Use cdp_list_pages to see the current pages, then cdp_select_page to switch focus."
+            }))),
+        )
+    }
+
+    async fn call(&self, _args: Value, ctx: &ToolContext) -> Result<CallToolResult, McpError> {
+        match crate::cdp::auto_connect::connect_default_chrome().await {
+            Ok((client, endpoint)) => {
+                let page_info = if let Some(page) = client.selected_page.as_ref() {
+                    format!("Selected page: {}", crate::cdp::page_url(page).await)
+                } else {
+                    "No pages found (browser is running but has no open tabs)".to_string()
+                };
+                *ctx.cdp_client.write().await = Some(client);
+                Ok(CallToolResult::success(vec![Content::text(format!(
+                    "Attached to your default-profile Chrome at ws://127.0.0.1:{}{}.\n\
+                     Connected to the user's actual browser — tabs, cookies, extensions, \
+                     and login sessions are now visible to CDP tool calls.\n\
+                     CDP tool calls will now succeed.\n{}",
+                    endpoint.port, endpoint.ws_path, page_info
+                ))]))
+            }
+            Err(e) => Ok(CallToolResult::error(vec![Content::text(e)])),
+        }
+    }
+}
+
 /// `cdp_disconnect` — always visible; CDP tools remain listed afterward and
 /// return a "not connected" error until `cdp_connect` succeeds again.
 pub struct CdpDisconnect;
