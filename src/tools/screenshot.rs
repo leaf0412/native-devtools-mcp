@@ -434,7 +434,7 @@ impl ToolHandler for TakeScreenshot {
     fn schema(&self) -> Tool {
         Tool::new(
             "take_screenshot",
-            "Capture a screenshot of the screen, a specific window, or a region. Returns a base64-encoded image, JSON metadata for coordinate conversion, and OCR text annotations including clickable coordinates.",
+            "Capture a screenshot of the screen, a specific window, or a region. Returns a base64-encoded image, JSON metadata for coordinate conversion, and OCR text annotations including clickable coordinates. For native macOS apps, prefer include_screenshot=\"auto\" over the \"always\" default — it takes an AX snapshot first and only falls back to pixels when AX coverage is insufficient, avoiding a vision pass (and the pixel-coordinate click() it leads to) when ax_click/ax_set_value/ax_select can already reach the target.",
             Arc::new(json_to_object(serde_json::json!({
                 "type": "object",
                 "properties": {

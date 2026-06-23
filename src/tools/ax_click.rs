@@ -109,7 +109,9 @@ impl ToolHandler for AxClick {
     fn schema(&self) -> Tool {
         Tool::new(
             "ax_click",
-            "macOS only. Dispatch AXPress against a UI element identified by its uid \
+            "macOS only. PREFERRED way to click in a native macOS app — prefer this over \
+             click() whenever take_ax_snapshot exposes a [P]-tagged uid for the target. \
+             Dispatch AXPress against a UI element identified by its uid \
              from the most recent take_ax_snapshot (e.g. \"a42g3\"). The 'g<gen>' \
              suffix is a generation tag — any fresh take_ax_snapshot invalidates all \
              prior uids, so always snapshot immediately before the uid is used. Does \

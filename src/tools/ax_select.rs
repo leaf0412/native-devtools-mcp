@@ -156,8 +156,9 @@ impl ToolHandler for AxSelect {
              message, fallback: { x, y } | null } } with codes snapshot_expired, \
              uid_not_found, no_row_ancestor, no_outline_container, not_dispatchable, or \
              ax_error. The fallback centre falls back from the row bbox to the \
-             originally-targeted element bbox so the caller can still click(x, y) if \
-             desired.",
+             originally-targeted element bbox so the caller can still retry via \
+             click(x, y, background=true, app_name=...) without stealing the cursor — drop \
+             background only as a last resort.",
             Arc::new(json_to_object(serde_json::json!({
                 "type": "object",
                 "required": ["uid"],

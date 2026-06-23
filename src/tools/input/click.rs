@@ -264,7 +264,10 @@ impl ToolHandler for Click {
              (3) 'window-relative' — window_x, window_y, window_id from list_windows; \
              (4) 'screenshot-pixels-legacy' (DEPRECATED) — screenshot_x, screenshot_y, \
              screenshot_window_id. \
-             Works with any app (egui, Electron, etc.). Requires Accessibility permission on macOS.",
+             Works with any app (egui, Electron, etc.). Requires Accessibility permission on macOS. \
+             LAST RESORT on macOS: this moves the real cursor and steals focus. Prefer ax_click \
+             (native apps) or cdp_click (browsers) first; if AXPress is unsupported \
+             (not_dispatchable), prefer background=true + app_name on this tool before omitting it.",
             Arc::new(json_to_object(serde_json::json!({
                 "type": "object",
                 "properties": {

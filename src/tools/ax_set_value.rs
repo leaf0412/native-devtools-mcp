@@ -107,13 +107,17 @@ impl ToolHandler for AxSetValue {
     fn schema(&self) -> Tool {
         Tool::new(
             "ax_set_value",
-            "macOS only. Write to an element's kAXValueAttribute — value assignment, \
+            "macOS only. PREFERRED way to fill a text field in a native macOS app — prefer \
+             this over click()+type_text() whenever take_ax_snapshot exposes a [SV]-tagged \
+             uid for the target. Write to an element's kAXValueAttribute — value assignment, \
              not key-event typing. Use for AXTextField / AXTextArea / AXSearchField and \
              similar text widgets. Does NOT fire keydown/keyup, does NOT participate in \
              IME/composition, does NOT populate the app's undo stack, and will not work \
              on rich editors that refuse AXValue writes. On not_dispatchable, the caller \
-             should fall back to a two-step sequence: click(fallback.x, fallback.y) to \
-             focus, then type_text(text) for key-event input.",
+             should fall back to a two-step sequence: click(fallback.x, fallback.y, \
+             background=true, app_name=...) to focus, then type_text(text, background=true, \
+             app_name=...) for key-event input without stealing the cursor — drop \
+             background only if that also fails.",
             Arc::new(json_to_object(serde_json::json!({
                 "type": "object",
                 "required": ["uid", "text"],

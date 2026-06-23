@@ -450,7 +450,7 @@ impl ToolHandler for TypeText {
     fn schema(&self) -> Tool {
         Tool::new(
             "type_text",
-            "Type text at the current cursor position. Works with any app. Requires Accessibility permission on macOS. Set background=true with app_name for cursor-free background typing via CGEventPostToPid.",
+            "Type text at the current cursor position. Works with any app. Requires Accessibility permission on macOS. LAST RESORT without background=true: prefer ax_set_value for native macOS apps or cdp_fill for browsers first. Set background=true with app_name for cursor-free, focus-preserving typing via CGEventPostToPid — use this instead of a plain call when escalating from ax_set_value's not_dispatchable.",
             Arc::new(json_to_object(serde_json::json!({
                 "type": "object",
                 "required": ["text"],
@@ -496,7 +496,7 @@ impl ToolHandler for PressKey {
     fn schema(&self) -> Tool {
         Tool::new(
             "press_key",
-            "Press a key combination. Works with any app. Requires Accessibility permission on macOS. Set background=true with app_name for cursor-free background key press via CGEventPostToPid.",
+            "Press a key combination. Works with any app. Requires Accessibility permission on macOS. LAST RESORT without background=true: prefer ax_click/ax_set_value/ax_select or cdp_press_key first. Set background=true with app_name for cursor-free, focus-preserving key delivery via CGEventPostToPid — use this instead of a plain call when escalating from an AX not_dispatchable result.",
             Arc::new(json_to_object(serde_json::json!({
                 "type": "object",
                 "required": ["key"],

@@ -10,14 +10,14 @@
 
 ## 🧠 Core Reasoning Loop
 
-For robust automation, follow this "Visual Feedback Loop":
+**Decision order — climb down this list one tier at a time. A real mouse click/keystroke (`click`/`type_text`/`press_key` without `background=true`) is the LAST resort, not the default ACT step:**
 
-1.  **OBSERVE:** Call `take_screenshot(app_name="TargetApp")` to see the current state.
-2.  **LOCATE:** Analyze the image or use the OCR summary text in the response to find coordinates.
-3.  **ACT:** Call `click()`, `type_text()`, or `scroll()` using those coordinates.
-4.  **VERIFY:** Call `take_screenshot` again to confirm the action had the intended effect.
+1.  **Browser content (macOS/any):** `cdp_connect(port)` or `cdp_auto_connect()` → `cdp_find_elements(query)` → `cdp_click(uid)` / `cdp_fill(uid, value)` / `cdp_press_key(key)`. DOM-level targeting, no cursor movement.
+2.  **Native macOS app:** `take_ax_snapshot(app_name='...')` → read `uid` + capability tags (`[P,SV,SC,F,ADJ]`) + bbox from the emitted tree → `ax_click(uid)` for `[P]` controls, `ax_set_value(uid, text)` for `[SV]` fields, or `ax_select(uid)` for `NSOutlineView` / `NSTableView` rows (sidebars, rule lists). No cursor movement, no focus steal — composes with background work.
+3.  **AX dispatch returned `not_dispatchable`** (element exists but doesn't implement the action — common on custom-drawn controls): retry the error's `fallback: { x, y }` coordinates via `click(x, y, background=true, app_name='...')`, `type_text(text, background=true, app_name='...')`, or `press_key(key, background=true, app_name='...')`. Delivered via `CGEventPostToPid` — still no cursor movement, still no focus steal.
+4.  **Last resort** — only when AX is unavailable (canvas/WebGL apps, accessibility-opaque apps exposing no usable tree) or tier 3 itself failed (`bg_click_failed`): `take_screenshot(app_name="TargetApp", include_screenshot="auto")` (returns the AX snapshot alone when it's already good enough; only attaches pixels when it isn't) → locate visually or via the OCR summary → plain `click(x, y)` / `type_text(text)` / `press_key(key)`. This moves the real cursor and steals focus.
 
-**macOS-preferred branch (native apps):** substitute OBSERVE with `take_ax_snapshot(app_name='...')`; LOCATE reads uid + bbox from the emitted tree; ACT calls `ax_click(uid)` for pressable controls, `ax_set_value(uid, text)` for text fields, or `ax_select(uid)` for `NSOutlineView` / `NSTableView` row selection (sidebars, rule lists); VERIFY re-snapshots and reads the new state. This branch does not move the cursor or steal focus, so it composes with background work.
+**VERIFY** every tier the same way you acted: re-`take_ax_snapshot` for tiers 2–3, re-`take_screenshot` for tier 4, and confirm the intended state actually changed before moving on.
 
 ---
 
@@ -27,21 +27,15 @@ Use this table to choose the right tool sequence for the user's goal.
 
 | User Goal | Tool Sequence | Why? |
 |-----------|---------------|------|
-| "Click the 'Submit' button" | `find_text(text="Submit")` → `click(x, y)` | Fastest. No visual analysis needed if text is known. |
-| "Click the red icon" | `take_screenshot()` → (Analyze Image) → `click(screenshot_x=..., screenshot_y=..., screenshot_origin_x=..., screenshot_origin_y=..., screenshot_scale=...)` | Visual features require full screenshot analysis. |
 | "What element is at (500, 300)?" | `element_at_point(x=500, y=300)` | Returns the accessibility element at those coordinates (name, role, bounds, etc.). |
-| "Type into the search bar" | `find_text(text="Search")` → `click(x, y)` → `type_text("hello")` | Must click to focus before typing. |
 | "Scroll down" | `scroll(x=500, y=500, delta_y=200)` | Positive `delta_y` scrolls down. |
 | "Find an open window" | `list_windows()` → `focus_window(window_id=...)` | Don't guess window names; list them first. |
 | "Track what I hover over" | `start_hover_tracking(min_dwell_ms=300)` → user moves mouse → `stop_hover_tracking()` | Records element transitions with dwell filtering. |
 | "Record what the user does" | `start_recording(output_dir="/tmp/rec")` → user interacts → `stop_recording()` | Captures frontmost app at ~5fps as JPEG frames. |
 | "Launch Safari with debug port" | `launch_app(app_name="Safari", args=["--remote-debugging-port=9222"])` | Pass CLI args on fresh launch. |
 | "Quit an app" | `quit_app(app_name="Safari")` | Graceful by default; use `force=true` to kill immediately. |
-| "Click a named button in a native app (macOS)" | `take_ax_snapshot` → `ax_click(uid)` | Focus-preserving. Generation-tagged uids; fresh snapshot invalidates prior uids. |
-| "Enter text into a text field via value assignment (macOS)" | `take_ax_snapshot` → `ax_set_value(uid, text)` | No key events, no IME, no undo-stack entry. Fall back to `click` + `type_text` on `not_dispatchable`. |
-| "Select a sidebar row in System Settings / a `NSOutlineView` row (macOS)" | `take_ax_snapshot` → `ax_select(uid)` | Writes `AXSelectedRows` on the enclosing outline/table. Use this instead of `ax_click` for row targets — rows typically refuse `AXPress`. |
-| "AX snapshot invalidation rule (macOS)" | — | Every `take_ax_snapshot` call bumps the generation. All prior uids become stale; `ax_*` tools return `snapshot_expired`. |
-| "Click a button in Chrome" | `cdp_connect(port=9222)` → `cdp_find_elements(query="Submit")` → `cdp_click(uid="d1")` | CDP is more reliable than coordinates for web content. |
+| "Click a button in Chrome" | `cdp_connect(port=9222)` → `cdp_find_elements(query="Submit")` → `cdp_click(uid="d1")` | CDP is more reliable than coordinates for web content. No cursor movement. |
+| "Attach to my own already-open Chrome (not a separate debug profile)" | `cdp_auto_connect()` → `cdp_list_pages()` → `cdp_select_page(page_idx=1)` | Chrome 144+ with the `chrome://inspect/#remote-debugging` "Allow remote debugging" toggle on. Reuses your real tabs, cookies, extensions, and logins instead of `cdp_launch`'s separate managed profile. |
 | "Type in a web input" | `cdp_find_elements(query="Email")` → `cdp_fill(uid="d1", value="hello")` | Works for `<input>`, `<textarea>`, and `<select>` elements. |
 | "Run JS in a browser page" | `cdp_evaluate_script(function="() => document.title")` | Evaluate any JS in the selected page. |
 | "Navigate to a URL" | `cdp_navigate(url="https://example.com")` | Also supports back, forward, reload. |
@@ -49,6 +43,15 @@ Use this table to choose the right tool sequence for the user's goal.
 | "Wait for page content" | `cdp_wait_for(text=["Success"])` | Polls page text until any value appears or timeout. Pass `include_snapshot=true` to also get a DOM snapshot. |
 | "Switch browser tabs" | `cdp_list_pages()` → `cdp_select_page(page_idx=1)` | List tabs, then select by index. |
 | "Get browser page structure" | `cdp_take_dom_snapshot()` | Full interactive-element DOM snapshot with UIDs, roles, and labels. |
+| "Click a named button in a native app (macOS)" | `take_ax_snapshot` → `ax_click(uid)` | Focus-preserving. Generation-tagged uids; fresh snapshot invalidates prior uids. Check the uid's `[P]` capability tag first. |
+| "Enter text into a text field via value assignment (macOS)" | `take_ax_snapshot` → `ax_set_value(uid, text)` | No key events, no IME, no undo-stack entry. Check the uid's `[SV]` tag first; on `not_dispatchable` prefer `click(..., background=true)` + `type_text(..., background=true)` over a real click. |
+| "Select a sidebar row in System Settings / a `NSOutlineView` row (macOS)" | `take_ax_snapshot` → `ax_select(uid)` | Writes `AXSelectedRows` on the enclosing outline/table. Use this instead of `ax_click` for row targets — rows typically refuse `AXPress`. |
+| "AX snapshot invalidation rule (macOS)" | — | Every `take_ax_snapshot` call bumps the generation. All prior uids become stale; `ax_*` tools return `snapshot_expired`. |
+| "`ax_click`/`ax_set_value`/`ax_select` returned `not_dispatchable` (macOS)" | `click(fallback.x, fallback.y, background=true, app_name="TargetApp")` (or `type_text`/`press_key` with the same flag) | Retries via `CGEventPostToPid` — still no cursor movement, still no focus steal. Try this before a plain `click`/`type_text`/`press_key`. |
+| "Inspect a native app's UI without a full vision pass (macOS)" | `take_screenshot(app_name="TargetApp", include_screenshot="auto")` | Returns the AX snapshot alone when coverage is good; only attaches pixels when it's sparse, unlabeled, or weak. |
+| "Click a button when AX/CDP can't reach it — last resort" | `find_text(text="Submit")` → `click(x, y)` | Real cursor movement, steals focus. Use only when the tiers above don't apply (canvas/WebGL apps, accessibility-opaque apps) or failed (`bg_click_failed`). |
+| "Click an unlabeled visual feature — last resort" | `take_screenshot()` → (Analyze Image) → `click(screenshot_x=..., screenshot_y=..., screenshot_origin_x=..., screenshot_origin_y=..., screenshot_scale=...)` | Visual features require full screenshot analysis. Real cursor movement — same last-resort tier as above. |
+| "Type into the search bar — last resort" | `find_text(text="Search")` → `click(x, y)` → `type_text("hello")` | Must click to focus before typing. Real cursor movement; prefer `ax_set_value`/`cdp_fill`/background `click`+`type_text` first. |
 
 ---
 
@@ -63,6 +66,8 @@ Use this table to choose the right tool sequence for the user's goal.
 **Schema:**
 - `app_name: string` (optional) — target app; defaults to frontmost.
 
+**Capability tags (macOS):** each node line ends with a bracketed tag listing which dispatch actions apply: `P` (supports `ax_click`), `SV` (supports `ax_set_value`), `SC` (supports a scroll action), `F` (focusable), `ADJ` (supports `AXIncrement`/`AXDecrement`, e.g. sliders). Check the tag before dispatching instead of guessing — e.g. `uid=a7g3 button "Save" [P,F]` is a valid `ax_click` target; a node with no tags at all is not a valid target for any `ax_*` tool.
+
 **macOS session state:** on macOS this tool is no longer a pure read — it writes session state. Every call bumps a monotonic generation and replaces the server's cached map of `AXUIElement` handles. Uids are emitted as `a<N>g<gen>` (e.g. `a42g3`). All uids from prior snapshots become stale for `ax_click` / `ax_set_value` / `ax_select` consumption (return `snapshot_expired`). Windows behavior is unchanged — no session, uids stay bare `a<N>`.
 
 **Usage pattern (macOS):** snapshot immediately before each `ax_click` / `ax_set_value` / `ax_select` call to avoid `snapshot_expired`. Every branch or retry starts with a fresh snapshot.
@@ -75,6 +80,7 @@ Captures pixel data and layout.
     *   `window_id` (number, optional): Window ID (for mode `"window"`).
     *   `x`, `y`, `width`, `height` (numbers): Region bounds (for mode `"region"`).
     *   `include_ocr` (boolean, default `true`): Include OCR summary text with coordinates.
+    *   `include_screenshot` (string, default `"always"`): `"always"` captures pixels unconditionally; `"auto"` (macOS) takes an AX snapshot first and only captures pixels when AX coverage is insufficient (sparse tree, no strong interactive targets, mostly-unlabeled, or duplicated labels); `"never"` (macOS) returns the AX snapshot alone. Prefer `"auto"` when inspecting a native app — it avoids a vision pass entirely on apps with a usable accessibility tree.
 *   **Returns (content list):**
     ```json
     [
@@ -126,18 +132,29 @@ Inspect the accessibility element at given screen coordinates.
 ### 2. Input & Interaction (The "Hands")
 
 #### `click`
-Simulates a mouse click.
+Simulates a mouse click. **Last resort** for native macOS apps and browsers — prefer `ax_click`/`ax_select` (Tier 2) or `cdp_click` (Tier 1); see Core Reasoning Loop above.
 *   **Inputs:**
     *   **Method A (Screen Absolute):** `x` (number), `y` (number). Use with `find_text` results.
     *   **Method B (Window Relative):** `window_x`, `window_y`, `window_id`.
     *   **Method C (Screenshot Relative):** `screenshot_x`, `screenshot_y`, `screenshot_origin_x`, `screenshot_origin_y`, `screenshot_scale`. Use with `take_screenshot` visual analysis.
     *   `button`: "left" (default), "right", "center".
     *   `click_count`: 1 (default), 2 (double-click).
+    *   `background` (boolean, default `false`, macOS only): deliver via `CGEventPostToPid` instead of `CGEventPost` — no cursor movement, no focus steal. Requires `app_name`. Use this (Tier 3) before a plain click when `ax_click`/`ax_set_value`/`ax_select` returned `not_dispatchable` with a `fallback` coordinate.
+    *   `app_name` (string, optional): target app for `background` mode, or for the optional post-click `include_snapshot`.
+    *   `include_snapshot` (boolean, default `false`): append a fresh AX snapshot after the click so you can read the new state without a separate `take_ax_snapshot` call.
 
 #### `type_text`
-Types text at the *current* cursor position.
+Types text at the *current* cursor position. **Last resort** for native macOS apps — prefer `ax_set_value` (Tier 2) when the target exposes a writable `kAXValueAttribute`.
 *   **Inputs:** `text` (string).
 *   **Warning:** Always `click()` the input field first to ensure focus!
+*   `background` (boolean, default `false`, macOS only): deliver keystrokes via `CGEventPostToPid` — no cursor movement, no focus steal, bypasses keyboard layout/IME. Requires `app_name`. Use this (Tier 3) instead of a plain `type_text` when escalating from a `not_dispatchable` AX result.
+*   `app_name` (string, optional): target app for `background` mode.
+
+#### `press_key`
+Presses a key combination at the *current* focus. Same Tier 3/4 framing as `click`/`type_text`.
+*   **Inputs:** `key` (string), `modifiers` (array of `"shift"`/`"control"`/`"option"`/`"command"`, optional).
+*   `background` (boolean, default `false`, macOS only): deliver via `CGEventPostToPid`. Requires `app_name`.
+*   `app_name` (string, optional): target app for `background` mode.
 
 #### `ax_click` (macOS only)
 
@@ -145,6 +162,8 @@ Types text at the *current* cursor position.
 
 **Schema:**
 - `uid: string` — generation-tagged uid from the most recent `take_ax_snapshot`, e.g. `"a42g3"`.
+- `include_snapshot: boolean` (default `false`) — append a fresh AX snapshot after the click.
+- `app_name: string` (optional) — app for the follow-up snapshot; defaults to frontmost.
 
 **Response:**
 - Success: `{ "ok": true, "dispatched_via": "AXPress", "bbox": { "x", "y", "w", "h" } }`.
@@ -152,7 +171,7 @@ Types text at the *current* cursor position.
 
 **Gotchas:**
 - Any fresh `take_ax_snapshot` invalidates every prior uid — snapshot immediately before calling.
-- When `fallback` is populated on `not_dispatchable`, retry via `click(fallback.x, fallback.y)`.
+- When `fallback` is populated on `not_dispatchable`, prefer `click(fallback.x, fallback.y, background=true, app_name="TargetApp")` (Tier 3, no cursor movement) before a plain `click(fallback.x, fallback.y)`.
 
 #### `ax_set_value` (macOS only)
 
@@ -161,6 +180,8 @@ Types text at the *current* cursor position.
 **Schema:**
 - `uid: string` — generation-tagged uid.
 - `text: string` — value to assign.
+- `include_snapshot: boolean` (default `false`) — append a fresh AX snapshot after the write.
+- `app_name: string` (optional) — app for the follow-up snapshot.
 
 **Response:** same shape as `ax_click`, with `"dispatched_via": "AXSetAttributeValue"`.
 
@@ -170,7 +191,7 @@ Types text at the *current* cursor position.
 - Does not populate the app's undo stack.
 - Only works on elements that expose a writable `kAXValueAttribute` (e.g. `AXTextField`, `AXTextArea`, `AXSearchField`).
 
-**Fallback on `not_dispatchable`:** perform `click(fallback.x, fallback.y)` to focus, then `type_text(text)` for true key-event input.
+**Fallback on `not_dispatchable`:** prefer `click(fallback.x, fallback.y, background=true, app_name="TargetApp")` to focus, then `type_text(text, background=true, app_name="TargetApp")` for true key-event input without stealing the cursor (Tier 3). Drop to a plain `click`/`type_text` only if the background variants fail.
 
 #### `ax_select` (macOS only)
 
@@ -178,16 +199,18 @@ Types text at the *current* cursor position.
 
 **Schema:**
 - `uid: string` — generation-tagged uid. Points at the row itself, a cell inside the row, or any descendant; the tool walks up to the enclosing `AXRow`.
+- `include_snapshot: boolean` (default `false`) — append a fresh AX snapshot after the selection.
+- `app_name: string` (optional) — app for the follow-up snapshot.
 
 **Response:**
 - Success: `{ "ok": true, "dispatched_via": "AXSelectedRows", "bbox": { "x", "y", "w", "h" } }`. The bbox describes the resolved row (not necessarily the uid-targeted descendant).
 - Error: same envelope as `ax_click` with codes `snapshot_expired`, `uid_not_found`, `no_row_ancestor`, `no_outline_container`, `not_dispatchable`, `ax_error`.
 
-**When to reach for `ax_select` vs `ax_click`:** rows in native sidebars typically refuse `AXPress` — `ax_click` returns `not_dispatchable` or AX error `-25205` against them. Use `ax_select` for row targets. A coordinate-based fallback (`click(x, y)`) works but steals focus — the whole reason `ax_*` exists.
+**When to reach for `ax_select` vs `ax_click`:** rows in native sidebars typically refuse `AXPress` — `ax_click` returns `not_dispatchable` or AX error `-25205` against them. Use `ax_select` for row targets. A coordinate-based fallback (`click(x, y, background=true, app_name="TargetApp")`, Tier 3) works without stealing focus — the whole reason `ax_*` exists; drop the `background` flag only as a last resort.
 
 **Gotchas:**
 - `no_row_ancestor` means the uid is not inside a row at all — you probably targeted the wrong element. Re-snapshot and pick the `AXRow` or one of its descendants.
-- `no_outline_container` means the row exists but is not nested in an `AXOutline` / `AXTable` — unusual; custom row containers may need `click(fallback.x, fallback.y)`.
+- `no_outline_container` means the row exists but is not nested in an `AXOutline` / `AXTable` — unusual; custom row containers may need `click(fallback.x, fallback.y, background=true, app_name="TargetApp")`.
 
 #### `scroll`
 Scrolls at a specific screen position.
@@ -244,10 +267,12 @@ Connect to Chrome or Electron apps via Chrome DevTools Protocol for DOM-level el
 **Setup:**
 - **Chrome 136+:** Must launch with both `--remote-debugging-port=PORT` and `--user-data-dir=PATH` (non-default profile required — Chrome silently ignores the debug port with the default profile). The profile is persistent across launches.
 - **Electron apps** (Signal, Discord, Slack, VS Code, etc.): Only need `--remote-debugging-port=PORT`. No `--user-data-dir` required — Electron respects the flag with its default profile.
+- **Chrome 144+ with the user's actual default-profile browser:** use `cdp_auto_connect()` instead — no relaunch, no separate profile, keeps the user's real tabs/cookies/logins. Requires the `chrome://inspect/#remote-debugging` "Allow remote debugging" toggle on.
 
 #### Tools (always listed; calls fail with "No CDP connection" until `cdp_connect` succeeds)
 
 *   `cdp_connect(port)`: Connect to a Chrome/Electron debug port. Auto-selects the first page.
+*   `cdp_auto_connect()`: Attach to the user's existing default-profile Chrome (144+) by reading its `DevToolsActivePort` file and dialing the WebSocket directly — skips chromiumoxide's HTTP-discovery step, which Chrome 144 rejects on the default profile. Connects to the user's real tabs, cookies, extensions, and login sessions, unlike `cdp_launch`'s separate managed profile.
 *   `cdp_disconnect`: Disconnect the CDP client. The CDP tools stay listed; subsequent calls return a "not connected" error until `cdp_connect` is called again.
 *   `cdp_take_dom_snapshot(max_nodes?)`: Full DOM snapshot of interactive elements — returns UIDs prefixed `d` (e.g., d1, d2) with roles, labels, and parent context. Use when you need the complete page structure; for targeted lookups prefer `cdp_find_elements`. **Always take a fresh snapshot after any navigation or DOM change before resolving UIDs.**
 *   `cdp_find_elements(query, role?, max_results?)`: **Preferred discovery tool.** Search the live DOM for interactive elements matching a text query. Returns matches with `d`-prefixed UIDs plus a page-level inventory grouped by role — focused results without flooding context.
