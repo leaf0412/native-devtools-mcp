@@ -1,4 +1,6 @@
 use crate::platform;
+use crate::tools::ax_snapshot::{AXSnapshotNode, format_snapshot};
+use crate::tools::ax_session::AxSession;
 use crate::tools::screenshot_cache::{ScreenshotCache, ScreenshotMetadata as CacheMetadata};
 use base64::Engine;
 use image::ImageReader;
@@ -9,7 +11,7 @@ use std::io::Cursor;
 use std::sync::Arc;
 use tokio::sync::RwLock;
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Clone)]
 pub struct TakeScreenshotParams {
     /// Capture mode: "screen", "window", or "region"
     #[serde(default = "default_mode")]
@@ -30,6 +32,14 @@ pub struct TakeScreenshotParams {
     /// Include OCR text annotations with clickable coordinates (default: true)
     #[serde(default = "default_include_ocr")]
     pub include_ocr: bool,
+
+    /// Screenshot attachment mode:
+    /// - "always" (default): always capture a pixel screenshot.
+    /// - "auto": take an AX snapshot first; only capture pixels when AX
+    ///   coverage is insufficient (sparse, unlabeled, or weak targets).
+    /// - "never": skip pixel capture entirely, return AX snapshot only.
+    #[serde(default = "default_include_screenshot")]
+    pub include_screenshot: String,
 }
 
 fn default_mode() -> String {
@@ -38,6 +48,10 @@ fn default_mode() -> String {
 
 fn default_include_ocr() -> bool {
     true
+}
+
+fn default_include_screenshot() -> String {
+    "always".to_string()
 }
 
 use super::JPEG_QUALITY;
@@ -282,6 +296,135 @@ use rmcp::{model::Tool, Error as McpError};
 /// `take_screenshot` MCP tool handler.
 pub struct TakeScreenshot;
 
+/// Return an AX-only snapshot for "never" and auto-fallback paths.
+async fn ax_only_screenshot(
+    params: &TakeScreenshotParams,
+    session: &Arc<AxSession>,
+) -> CallToolResult {
+    #[cfg(target_os = "macos")]
+    {
+        let app_name = params.app_name.as_deref();
+        match crate::macos::ax::collect_ax_tree_indexed(app_name) {
+            Ok((nodes, refs)) => {
+                let generation = session.create_snapshot(refs).await;
+                let snapshot = format_snapshot(&nodes, Some(generation));
+                let header = match params.include_screenshot.as_str() {
+                    "never" => "## AX Snapshot (pixel capture skipped)\n",
+                    _ => "## AX Snapshot (coverage sufficient, pixel capture skipped)\n",
+                };
+                CallToolResult::success(vec![Content::text(format!("{}{}", header, snapshot))])
+            }
+            Err(e) => CallToolResult::error(vec![Content::text(format!(
+                "Failed to collect AX snapshot: {}",
+                e
+            ))]),
+        }
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        CallToolResult::error(vec![Content::text(
+            "AX-only screenshot mode is only supported on macOS.",
+        )])
+    }
+}
+
+/// Analyze AX snapshot nodes and decide whether a pixel screenshot is needed.
+/// Returns `Some(reason)` when coverage is insufficient, `None` when the
+/// AX tree is good enough on its own.
+fn ax_coverage_insufficient(nodes: &[AXSnapshotNode]) -> Option<String> {
+    let total = nodes.len();
+    if total == 0 {
+        return Some("No AX targets found".to_string());
+    }
+
+    let labeled_count = nodes.iter().filter(|n| n.name.is_some()).count();
+    let unlabeled = total - labeled_count;
+
+    // Roles considered "strong" interactive targets
+    let strong_roles: &[&str] = &[
+        "textbox", "button", "link", "combobox", "checkbox",
+        "radio", "menuitem", "slider", "tab",
+    ];
+    let strong_targets: Vec<_> = nodes
+        .iter()
+        .filter(|n| {
+            strong_roles.contains(&n.role.as_str())
+                && (n.name.is_some() || n.can_press || n.can_set_value || n.can_adjust)
+        })
+        .collect();
+
+    if total < 3 && strong_targets.is_empty() {
+        return Some(
+            "Sparse AX targets with no strong interactive elements".to_string(),
+        );
+    }
+    if strong_targets.is_empty() {
+        return Some("No strong AX targets (buttons, textboxes, links) found".to_string());
+    }
+    if total >= 3 && unlabeled * 2 > total {
+        return Some("Most AX targets are unlabeled".to_string());
+    }
+
+    // Duplicate-label check
+    let labels: Vec<&str> = nodes
+        .iter()
+        .filter_map(|n| n.name.as_deref())
+        .filter(|l| !l.is_empty())
+        .collect();
+    if labels.len() > 3 {
+        let unique = labels
+            .iter()
+            .collect::<std::collections::HashSet<_>>()
+            .len();
+        if unique * 2 <= labels.len() {
+            return Some("AX target labels are highly duplicated".to_string());
+        }
+    }
+
+    None
+}
+
+/// "auto" mode: try AX snapshot first; fall back to pixel capture only when
+/// coverage is insufficient.
+#[cfg(target_os = "macos")]
+async fn auto_screenshot(
+    params: &TakeScreenshotParams,
+    ctx: &ToolContext,
+) -> Result<CallToolResult, McpError> {
+    let app_name = params.app_name.as_deref();
+    match crate::macos::ax::collect_ax_tree_indexed(app_name) {
+        Ok((nodes, refs)) => {
+            let insufficient = ax_coverage_insufficient(&nodes);
+            if let Some(reason) = insufficient {
+                // AX coverage is weak — fall through to full pixel capture.
+                // Install the AX snapshot anyway (bumps generation) so the
+                // caller has tagged uids to work with.
+                let generation = ctx.ax_session.create_snapshot(refs).await;
+                let snapshot = format_snapshot(&nodes, Some(generation));
+
+                let mut result =
+                    take_screenshot(params.clone(), Some(ctx.screenshot_cache.clone())).await;
+                // Prepend the AX snapshot so the LLM sees uids first.
+                let header = format!(
+                    "## AX Snapshot (pixel capture included — {})\n{}\n\n",
+                    reason, snapshot
+                );
+                result
+                    .content
+                    .insert(0, Content::text(header));
+                Ok(result)
+            } else {
+                // AX coverage is sufficient — skip pixel capture.
+                Ok(ax_only_screenshot(params, &ctx.ax_session).await)
+            }
+        }
+        Err(_e) => {
+            // AX tree collection failed — fall back to pixel screenshot.
+            Ok(take_screenshot(params.clone(), Some(ctx.screenshot_cache.clone())).await)
+        }
+    }
+}
+
 #[async_trait::async_trait]
 impl ToolHandler for TakeScreenshot {
     fn name(&self) -> &'static str {
@@ -329,12 +472,19 @@ impl ToolHandler for TakeScreenshot {
                         "type": "boolean",
                         "description": "Include OCR text detection with clickable coordinates (default: true)",
                         "default": true
+                    },
+                    "include_screenshot": {
+                        "type": "string",
+                        "enum": ["always", "auto", "never"],
+                        "description": "Screenshot attachment mode: 'always' captures pixel screenshot (default), 'auto' takes AX snapshot first and only captures pixels when AX coverage is insufficient, 'never' skips pixel capture entirely.",
+                        "default": "always"
                     }
                 }
             }))),
         )
     }
 
+    #[cfg_attr(not(target_os = "macos"), allow(unused_variables))]
     async fn call(
         &self,
         args: serde_json::Value,
@@ -342,7 +492,29 @@ impl ToolHandler for TakeScreenshot {
     ) -> Result<CallToolResult, McpError> {
         let params: TakeScreenshotParams = serde_json::from_value(args)
             .map_err(|e| McpError::invalid_params(e.to_string(), None))?;
-        Ok(take_screenshot(params, Some(ctx.screenshot_cache.clone())).await)
+
+        match params.include_screenshot.as_str() {
+            "never" => {
+                // AX-only: no pixel capture.
+                Ok(ax_only_screenshot(&params, &ctx.ax_session).await)
+            }
+            "auto" => {
+                // AX-first: try AX snapshot; only capture pixels when
+                // coverage is insufficient.
+                #[cfg(target_os = "macos")]
+                {
+                    auto_screenshot(&params, ctx).await
+                }
+                #[cfg(not(target_os = "macos"))]
+                {
+                    Ok(take_screenshot(params, Some(ctx.screenshot_cache.clone())).await)
+                }
+            }
+            _ => {
+                // "always" — current behaviour.
+                Ok(take_screenshot(params, Some(ctx.screenshot_cache.clone())).await)
+            }
+        }
     }
 }
 
@@ -350,6 +522,105 @@ impl ToolHandler for TakeScreenshot {
 mod tests {
     use super::*;
     use crate::platform::ocr::{TextBounds, TextMatch};
+
+    // Helper to build a minimal AXSnapshotNode for coverage tests.
+    fn node(role: &str, name: Option<&str>, can_press: bool) -> AXSnapshotNode {
+        AXSnapshotNode {
+            uid: 0,
+            role: role.to_string(),
+            name: name.map(|s| s.to_string()),
+            value: None,
+            focused: false,
+            disabled: false,
+            expanded: None,
+            selected: None,
+            depth: 0,
+            bbox: None,
+            can_press,
+            can_set_value: role == "textbox" || role == "combobox",
+            can_scroll: role == "scrollbar",
+            can_focus: role == "textbox" || role == "button",
+            can_adjust: role == "slider",
+        }
+    }
+
+    #[test]
+    fn test_ax_coverage_empty_nodes() {
+        let result = ax_coverage_insufficient(&[]);
+        assert_eq!(result, Some("No AX targets found".to_string()));
+    }
+
+    #[test]
+    fn test_ax_coverage_sparse_without_strong() {
+        let nodes = vec![
+            node("generic", None, false),
+            node("text", Some("hello"), false),
+        ];
+        let result = ax_coverage_insufficient(&nodes);
+        assert!(result.is_some());
+        assert!(result.unwrap().contains("Sparse"));
+    }
+
+    #[test]
+    fn test_ax_coverage_strong_targets_sufficient() {
+        let nodes = vec![
+            node("button", Some("OK"), true),
+            node("textbox", Some("Search"), false),
+            node("link", Some("Home"), false),
+        ];
+        let result = ax_coverage_insufficient(&nodes);
+        assert_eq!(result, None);
+    }
+
+    #[test]
+    fn test_ax_coverage_no_strong_targets() {
+        let nodes = vec![
+            node("generic", None, false),
+            node("text", Some("A"), false),
+            node("text", Some("B"), false),
+            node("text", Some("C"), false),
+        ];
+        let result = ax_coverage_insufficient(&nodes);
+        assert!(result.is_some());
+        assert!(result.unwrap().contains("No strong AX targets"));
+    }
+
+    #[test]
+    fn test_ax_coverage_mostly_unlabeled() {
+        let nodes = vec![
+            node("button", None, true),
+            node("button", None, true),
+            node("button", None, true),
+            node("button", Some("OK"), true),
+        ];
+        let result = ax_coverage_insufficient(&nodes);
+        assert!(result.is_some());
+        assert!(result.unwrap().contains("unlabeled"));
+    }
+
+    #[test]
+    fn test_ax_coverage_duplicated_labels() {
+        let mut nodes = Vec::new();
+        for _ in 0..5 {
+            nodes.push(node("button", Some("Submit"), true));
+        }
+        let result = ax_coverage_insufficient(&nodes);
+        assert!(result.is_some());
+        assert!(result.unwrap().contains("duplicated"));
+    }
+
+    #[test]
+    fn test_ax_coverage_good_coverage() {
+        let nodes = vec![
+            node("button", Some("Cancel"), true),
+            node("button", Some("OK"), true),
+            node("textbox", Some("Name"), false),
+            node("combobox", Some("Country"), false),
+            node("checkbox", Some("Agree"), true),
+        ];
+        let result = ax_coverage_insufficient(&nodes);
+        assert_eq!(result, None);
+    }
 
     fn make_text_match(text: &str, x: f64, y: f64, confidence: f64) -> TextMatch {
         TextMatch {
