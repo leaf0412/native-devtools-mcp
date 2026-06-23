@@ -337,6 +337,9 @@ mod tests {
             screenshot_window_id: None,
             button: None,
             click_count: 1,
+            include_snapshot: false,
+            app_name: None,
+            background: false,
         }
     }
 

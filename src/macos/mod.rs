@@ -1,5 +1,6 @@
 pub mod app;
 pub mod ax;
+pub mod bg_click;
 pub mod display;
 pub mod input;
 pub mod ocr;

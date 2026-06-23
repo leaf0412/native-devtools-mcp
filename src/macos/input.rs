@@ -224,7 +224,7 @@ pub fn scroll(x: f64, y: f64, delta_x: i32, delta_y: i32) -> Result<(), String> 
 }
 
 /// Map a key name to a CGKeyCode.
-fn key_name_to_code(key: &str) -> Option<CGKeyCode> {
+pub fn key_name_to_code(key: &str) -> Option<CGKeyCode> {
     // Virtual key codes from Events.h
     Some(match key.to_lowercase().as_str() {
         // Letters

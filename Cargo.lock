@@ -1371,6 +1371,7 @@ dependencies = [
  "criterion",
  "futures-util",
  "image",
+ "libc",
  "objc",
  "quick-xml",
  "rayon",

@@ -3,7 +3,7 @@
 use super::{check_permission, run_input};
 use crate::platform::input;
 use crate::tools::registry::{json_to_object, ToolContext, ToolHandler};
-use rmcp::model::CallToolResult;
+use rmcp::model::{CallToolResult, Content};
 use rmcp::{model::Tool, Error as McpError};
 use serde::Deserialize;
 use std::sync::Arc;
@@ -119,6 +119,14 @@ pub async fn scroll(params: ScrollParams) -> CallToolResult {
 pub struct TypeTextParams {
     /// Text to type
     pub text: String,
+
+    /// When true, deliver keystrokes via CGEventPostToPid without moving
+    /// cursor or stealing focus. Requires `app_name`. macOS only.
+    #[serde(default)]
+    pub background: bool,
+    /// Target app name for background typing.
+    #[serde(default)]
+    pub app_name: Option<String>,
 }
 
 pub async fn type_text(params: TypeTextParams) -> CallToolResult {
@@ -128,6 +136,53 @@ pub async fn type_text(params: TypeTextParams) -> CallToolResult {
 
     let char_count = params.text.chars().count();
     let text = params.text;
+    let background = params.background;
+
+    #[cfg(target_os = "macos")]
+    if background {
+        let app = match &params.app_name {
+            Some(name) => name.clone(),
+            None => {
+                return CallToolResult::error(vec![Content::text(
+                    "background type_text requires app_name to resolve the target process",
+                )])
+            }
+        };
+        let windows = match crate::macos::window::find_windows_by_app(&app) {
+            Ok(w) => w,
+            Err(e) => {
+                return CallToolResult::error(vec![Content::text(format!(
+                    "Failed to find windows for '{}': {}", app, e
+                ))])
+            }
+        };
+        let pid = match windows.first() {
+            Some(w) => w.owner_pid as i32,
+            None => {
+                return CallToolResult::error(vec![Content::text(format!(
+                    "No window found for app '{}'", app
+                ))])
+            }
+        };
+
+        let mut errors = Vec::new();
+        for ch in text.chars() {
+            if let Err(e) = crate::macos::bg_click::post_key_event_unicode(pid, ch) {
+                errors.push(e);
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        if !errors.is_empty() {
+            return CallToolResult::error(vec![Content::text(format!(
+                "Background type errors: {}", errors.join(", ")
+            ))]);
+        }
+        return CallToolResult::success(vec![Content::text(format!(
+            "Background typed {} characters on '{}'",
+            char_count, app
+        ))]);
+    }
+
     run_input(
         move || input::type_text(&text),
         format!("Typed {} characters", char_count),
@@ -147,6 +202,12 @@ pub struct PressKeyParams {
     /// Modifier keys: "shift", "control", "option", "command"
     #[serde(default)]
     pub modifiers: Vec<String>,
+    /// When true, deliver via CGEventPostToPid in background. Requires app_name. macOS only.
+    #[serde(default)]
+    pub background: bool,
+    /// Target app name for background key press.
+    #[serde(default)]
+    pub app_name: Option<String>,
 }
 
 pub async fn press_key(params: PressKeyParams) -> CallToolResult {
@@ -159,6 +220,68 @@ pub async fn press_key(params: PressKeyParams) -> CallToolResult {
     } else {
         format!("{}+{}", params.modifiers.join("+"), params.key)
     };
+
+    let background = params.background;
+
+    #[cfg(target_os = "macos")]
+    if background {
+        let app = match &params.app_name {
+            Some(name) => name.clone(),
+            None => {
+                return CallToolResult::error(vec![Content::text(
+                    "background press_key requires app_name to resolve the target process",
+                )])
+            }
+        };
+        let windows = match crate::macos::window::find_windows_by_app(&app) {
+            Ok(w) => w,
+            Err(e) => {
+                return CallToolResult::error(vec![Content::text(format!(
+                    "Failed to find windows for '{}': {}", app, e
+                ))])
+            }
+        };
+        let pid = match windows.first() {
+            Some(w) => w.owner_pid as i32,
+            None => {
+                return CallToolResult::error(vec![Content::text(format!(
+                    "No window found for app '{}'", app
+                ))])
+            }
+        };
+
+        let keycode = match crate::macos::input::key_name_to_code(&params.key) {
+            Some(k) => k,
+            None => {
+                return CallToolResult::error(vec![Content::text(format!("Unknown key: {}", params.key))])
+            }
+        };
+
+        // Build modifier flags
+        let mut flags: u64 = 0;
+        for m in &params.modifiers {
+            match m.to_lowercase().as_str() {
+                "shift" => flags |= 0x0002,   // kCGEventFlagMaskShift
+                "control" | "ctrl" => flags |= 0x0004,  // kCGEventFlagMaskControl
+                "option" | "alt" => flags |= 0x0008,    // kCGEventFlagMaskAlternate
+                "command" | "cmd" => flags |= 0x0010,   // kCGEventFlagMaskCommand
+                _ => {}
+            }
+        }
+
+        match crate::macos::bg_click::post_key_event_bg(pid, keycode, flags) {
+            Ok(()) => {
+                return CallToolResult::success(vec![Content::text(format!(
+                    "Background pressed {} on '{}'", key_desc, app
+                ))]);
+            }
+            Err(e) => {
+                return CallToolResult::error(vec![Content::text(format!(
+                    "Background key press failed: {}", e
+                ))]);
+            }
+        }
+    }
 
     let key = params.key;
     let modifiers = params.modifiers;
@@ -327,7 +450,7 @@ impl ToolHandler for TypeText {
     fn schema(&self) -> Tool {
         Tool::new(
             "type_text",
-            "Type text at the current cursor position. Works with any app. Requires Accessibility permission on macOS.",
+            "Type text at the current cursor position. Works with any app. Requires Accessibility permission on macOS. Set background=true with app_name for cursor-free background typing via CGEventPostToPid.",
             Arc::new(json_to_object(serde_json::json!({
                 "type": "object",
                 "required": ["text"],
@@ -335,6 +458,15 @@ impl ToolHandler for TypeText {
                     "text": {
                         "type": "string",
                         "description": "Text to type"
+                    },
+                    "background": {
+                        "type": "boolean",
+                        "description": "When true, deliver keystrokes via CGEventPostToPid without moving cursor or stealing focus. Requires app_name. macOS only.",
+                        "default": false
+                    },
+                    "app_name": {
+                        "type": "string",
+                        "description": "Target app name for background typing."
                     }
                 }
             }))),
@@ -364,7 +496,7 @@ impl ToolHandler for PressKey {
     fn schema(&self) -> Tool {
         Tool::new(
             "press_key",
-            "Press a key combination. Works with any app. Requires Accessibility permission on macOS.",
+            "Press a key combination. Works with any app. Requires Accessibility permission on macOS. Set background=true with app_name for cursor-free background key press via CGEventPostToPid.",
             Arc::new(json_to_object(serde_json::json!({
                 "type": "object",
                 "required": ["key"],
@@ -378,6 +510,15 @@ impl ToolHandler for PressKey {
                         "items": { "type": "string" },
                         "description": "Modifier keys: 'shift', 'control', 'option', 'command'",
                         "default": []
+                    },
+                    "background": {
+                        "type": "boolean",
+                        "description": "When true, deliver key via CGEventPostToPid without moving cursor or stealing focus. Requires app_name. macOS only.",
+                        "default": false
+                    },
+                    "app_name": {
+                        "type": "string",
+                        "description": "Target app name for background key press."
                     }
                 }
             }))),

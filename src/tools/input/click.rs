@@ -3,7 +3,9 @@
 use super::click_variant::{select_click_variant, ClickVariant};
 use super::{check_permission, run_input};
 use crate::platform::{display, input};
+use crate::tools::ax_snapshot::append_ax_snapshot_if_requested;
 use crate::tools::registry::{json_to_object, ToolContext, ToolHandler};
+use core_graphics::geometry::CGPoint;
 use rmcp::model::{CallToolResult, Content};
 use rmcp::{model::Tool, Error as McpError};
 use serde::Deserialize;
@@ -43,6 +45,21 @@ pub struct ClickParams {
     /// Number of clicks (1 for single, 2 for double)
     #[serde(default = "default_click_count")]
     pub click_count: u32,
+
+    /// When true, take a fresh AX snapshot after the click and append it
+    /// to the result so the caller can observe the new UI state without an
+    /// extra round-trip.
+    #[serde(default)]
+    pub include_snapshot: bool,
+    /// Optional app name for the follow-up AX snapshot.
+    #[serde(default)]
+    pub app_name: Option<String>,
+
+    /// When true, deliver the click via CGEventPostToPid without moving
+    /// the cursor or stealing focus. Requires `app_name` to resolve the
+    /// target window. On non-macOS this is ignored.
+    #[serde(default)]
+    pub background: bool,
 }
 
 fn default_click_count() -> u32 {
@@ -156,6 +173,68 @@ pub async fn click(params: ClickParams) -> CallToolResult {
     };
 
     let click_count = params.click_count;
+    let background = params.background;
+
+    // ── Background click (CGEventPostToPid) ─────────────────────────
+    #[cfg(target_os = "macos")]
+    if background {
+        let app = match &params.app_name {
+            Some(name) => name.clone(),
+            None => {
+                return CallToolResult::error(vec![Content::text(
+                    "background click requires app_name to resolve the target window",
+                )])
+            }
+        };
+        let windows = match crate::macos::window::find_windows_by_app(&app) {
+            Ok(w) => w,
+            Err(e) => {
+                return CallToolResult::error(vec![Content::text(format!(
+                    "Failed to find windows for '{}': {}", app, e
+                ))])
+            }
+        };
+        let win = match windows.first() {
+            Some(w) => w,
+            None => {
+                return CallToolResult::error(vec![Content::text(format!(
+                    "No window found for app '{}'", app
+                ))])
+            }
+        };
+        let local_x = x - win.bounds.x;
+        let local_y = y - win.bounds.y;
+        let screen_point = CGPoint { x, y };
+        let local_point = CGPoint {
+            x: local_x,
+            y: local_y,
+        };
+        let result = crate::macos::bg_click::mouse_click_bg(
+            win.owner_pid as i32,
+            win.id,
+            screen_point,
+            local_point,
+        );
+        return match result {
+            crate::macos::bg_click::BgClickResult::Ok => {
+                CallToolResult::success(vec![Content::text(format!(
+                    "Background click at ({:.0}, {:.0}) on '{}'",
+                    x, y, app
+                ))])
+            }
+            crate::macos::bg_click::BgClickResult::EventCreationFailed => {
+                CallToolResult::error(vec![Content::text(
+                    "Background click: NSEvent factory returned nil",
+                )])
+            }
+            crate::macos::bg_click::BgClickResult::PrivateSymbolMissing => {
+                CallToolResult::error(vec![Content::text(
+                    "Background click: CGEventSetWindowLocation symbol not found (macOS too old?)",
+                )])
+            }
+        };
+    }
+
     run_input(
         move || input::click(x, y, button, click_count),
         format!("Clicked at ({:.0}, {:.0})", x, y),
@@ -242,6 +321,19 @@ impl ToolHandler for Click {
                         "type": "integer",
                         "description": "Number of clicks (1=single, 2=double)",
                         "default": 1
+                    },
+                    "include_snapshot": {
+                        "type": "boolean",
+                        "description": "When true, take a fresh AX snapshot after the click and append it to the result (default: false)."
+                    },
+                    "app_name": {
+                        "type": "string",
+                        "description": "Optional app name for the follow-up AX snapshot, or target app for background click."
+                    },
+                    "background": {
+                        "type": "boolean",
+                        "description": "When true, deliver click via CGEventPostToPid without moving cursor or stealing focus. Requires app_name. macOS only.",
+                        "default": false
                     }
                 }
             }))),
@@ -251,11 +343,24 @@ impl ToolHandler for Click {
     async fn call(
         &self,
         args: serde_json::Value,
-        _ctx: &ToolContext,
+        ctx: &ToolContext,
     ) -> Result<CallToolResult, McpError> {
         let params: ClickParams = serde_json::from_value(args)
             .map_err(|e| McpError::invalid_params(e.to_string(), None))?;
-        Ok(click(params).await)
+        let include_snapshot = params.include_snapshot;
+        let app_name = params.app_name.clone();
+        let mut result = click(params).await;
+
+        #[cfg(target_os = "macos")]
+        append_ax_snapshot_if_requested(
+            &mut result,
+            include_snapshot,
+            app_name.as_deref(),
+            &ctx.ax_session,
+        )
+        .await;
+
+        Ok(result)
     }
 }
 
