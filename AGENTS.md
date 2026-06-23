@@ -8,14 +8,37 @@
 
 **Constraint:** You are operating a real machine. Actions are permanent. Ensure you verify the state of the screen before and after actions.
 
+## 🚨 MANDATORY: Two Rules You Must Never Violate
+
+### Rule 1 — NEVER launch a new browser if the user already has Chrome open
+
+Your **first action** for ANY web/browser task MUST be `cdp_auto_connect()`. This attaches to the user's real Chrome (same tabs, cookies, logins). Do NOT use `cdp_launch` or manually launch Chrome with `--remote-debugging-port` unless:
+
+- `cdp_auto_connect()` returns an explicit error (e.g. Chrome too old, remote debugging toggle off), **OR**
+- The user explicitly asks for a fresh/isolated browser profile.
+
+`cdp_launch` creates a SEPARATE Chrome with an empty profile under `~/.native-devtools-mcp/` — it has none of the user's tabs, cookies, or login sessions. It is a fallback, not the default.
+
+### Rule 2 — NEVER move the real mouse cursor as your first action
+
+Coordinate-based input (`click`/`type_text`/`press_key` **without** `background=true`) is the **ABSOLUTE LAST RESORT**. Always climb the tiers in order:
+
+1.  **CDP** (browser content) or **AX** (native macOS app) — no cursor, no focus steal
+2.  **Background dispatch** (`background=true` on `click`/`type_text`/`press_key`) — still no cursor movement, still no focus steal
+3.  **Only then** — plain `click(x, y)` / `type_text(text)` with real cursor movement
+
+If you find yourself typing `click(x=` or `type_text(text=` before you've exhausted tiers 1 and 2, STOP. You are skipping steps.
+
+---
+
 ## 🧠 Core Reasoning Loop
 
 **Decision order — climb down this list one tier at a time. A real mouse click/keystroke (`click`/`type_text`/`press_key` without `background=true`) is the LAST resort, not the default ACT step:**
 
-1.  **Browser content (macOS/any):** `cdp_connect(port)` or `cdp_auto_connect()` → `cdp_find_elements(query)` → `cdp_click(uid)` / `cdp_fill(uid, value)` / `cdp_press_key(key)`. DOM-level targeting, no cursor movement.
-2.  **Native macOS app:** `take_ax_snapshot(app_name='...')` → read `uid` + capability tags (`[P,SV,SC,F,ADJ]`) + bbox from the emitted tree → `ax_click(uid)` for `[P]` controls, `ax_set_value(uid, text)` for `[SV]` fields, or `ax_select(uid)` for `NSOutlineView` / `NSTableView` rows (sidebars, rule lists). No cursor movement, no focus steal — composes with background work.
-3.  **AX dispatch returned `not_dispatchable`** (element exists but doesn't implement the action — common on custom-drawn controls): retry the error's `fallback: { x, y }` coordinates via `click(x, y, background=true, app_name='...')`, `type_text(text, background=true, app_name='...')`, or `press_key(key, background=true, app_name='...')`. Delivered via `CGEventPostToPid` — still no cursor movement, still no focus steal.
-4.  **Last resort** — only when AX is unavailable (canvas/WebGL apps, accessibility-opaque apps exposing no usable tree) or tier 3 itself failed (`bg_click_failed`): `take_screenshot(app_name="TargetApp", include_screenshot="auto")` (returns the AX snapshot alone when it's already good enough; only attaches pixels when it isn't) → locate visually or via the OCR summary → plain `click(x, y)` / `type_text(text)` / `press_key(key)`. This moves the real cursor and steals focus.
+1.  **Browser content (macOS/any):** `cdp_auto_connect()` (ALWAYS try this FIRST — see Rule 1) → `cdp_find_elements(query)` → `cdp_click(uid)` / `cdp_fill(uid, value)` / `cdp_press_key(key)`. DOM-level targeting, no cursor movement. Only if `cdp_auto_connect` fails, fall back to `cdp_launch`.
+2.  **Native macOS app:** `take_ax_snapshot(app_name='...')` → read `uid` + capability tags (`[P,SV,SC,F,ADJ]`) + bbox from the emitted tree → `ax_click(uid)` for `[P]` controls, `ax_set_value(uid, text)` for `[SV]` fields, or `ax_select(uid)` for `NSOutlineView` / `NSTableView` rows (sidebars, rule lists). No cursor movement, no focus steal.
+3.  **AX dispatch returned `not_dispatchable`** — OR — **the target is an Electron app / custom-drawn UI where AX doesn't reach:** use `click(x, y, background=true, app_name='...')`, `type_text(text, background=true, app_name='...')`, or `press_key(key, background=true, app_name='...')`. Delivered via `CGEventPostToPid` (Accessibility) — still no cursor movement, still no focus steal. **This is the primary no-cursor path for Electron apps and non-AX-reachable UI.**
+4.  **Last resort** — only when AX is unavailable AND background dispatch failed: `take_screenshot(app_name="TargetApp", include_screenshot="auto")` → locate visually or via OCR → plain `click(x, y)` / `type_text(text)` / `press_key(key)`. This moves the real cursor and steals focus.
 
 **VERIFY** every tier the same way you acted: re-`take_ax_snapshot` for tiers 2–3, re-`take_screenshot` for tier 4, and confirm the intended state actually changed before moving on.
 
@@ -23,35 +46,56 @@
 
 ## 🗺️ Capabilities Matrix (Strategy Guide)
 
-Use this table to choose the right tool sequence for the user's goal.
+Use this table to choose the right tool sequence for the user's goal. **Rows are ordered by tier: preferred (no-cursor) first, last-resort (real mouse) last.**
+
+### 🥇 Tier 1 — No Cursor Movement (CDP / AX)
 
 | User Goal | Tool Sequence | Why? |
 |-----------|---------------|------|
-| "What element is at (500, 300)?" | `element_at_point(x=500, y=300)` | Returns the accessibility element at those coordinates (name, role, bounds, etc.). |
+| "Interact with ANY web page in the user's browser" | **ALWAYS** `cdp_auto_connect()` FIRST → `cdp_list_pages()` → `cdp_select_page(page_idx=N)` → `cdp_find_elements(query)` → `cdp_click`/`cdp_fill`/`cdp_press_key` | This is the DEFAULT for web tasks. Attaches to the user's real Chrome (same tabs, cookies, logins). Only fall back to `cdp_launch` if `cdp_auto_connect` errors. |
+| "Click a button in Chrome" | `cdp_auto_connect()` → `cdp_find_elements(query="Submit")` → `cdp_click(uid="d1")` | CDP is more reliable than coordinates for web content. No cursor movement. |
+| "Type in a web input" | `cdp_auto_connect()` → `cdp_find_elements(query="Email")` → `cdp_fill(uid="d1", value="hello")` | Works for `<input>`, `<textarea>`, and `<select>` elements. No cursor movement. |
+| "Navigate to a URL" | `cdp_navigate(url="https://example.com")` | Also supports back, forward, reload. Requires active CDP connection from `cdp_auto_connect`. |
+| "Click a named button in a native app (macOS)" | `take_ax_snapshot(app_name="...")` → `ax_click(uid)` | Focus-preserving. Check `[P]` tag first. **Do NOT use `find_text` + `click(x,y)` — that's Tier 3.** |
+| "Enter text into a text field in a native app (macOS)" | `take_ax_snapshot(app_name="...")` → `ax_set_value(uid, text)` | No key events, no IME. Check `[SV]` tag first. **Do NOT use `click` + `type_text` — that's Tier 3.** |
+| "Select a sidebar row in System Settings / Finder (macOS)" | `take_ax_snapshot(app_name="...")` → `ax_select(uid)` | For `NSOutlineView` / `NSTableView` rows. Rows refuse `AXPress`; `ax_select` works. |
+| "Inspect a native app's UI (macOS)" | `take_screenshot(app_name="TargetApp", include_screenshot="auto")` | AX snapshot first; only attaches pixels when AX coverage is insufficient. |
+
+### 🥈 Tier 2 — Background Dispatch (no cursor movement, works for ANY app)
+
+**The key mechanism for Electron apps and UI that AX doesn't reach.** Uses `CGEventPostToPid` via Accessibility — delivers events directly to the target process without moving the real cursor.
+
+| User Goal | Tool Sequence | Why? |
+|-----------|---------------|------|
+| "AX returned `not_dispatchable`" | `click(fallback.x, fallback.y, background=true, app_name="TargetApp")` / `type_text(text, background=true, app_name="TargetApp")` / `press_key(key, background=true, app_name="TargetApp")` | `CGEventPostToPid` — still no cursor movement, still no focus steal. **ALWAYS try this before dropping `background=true`.** |
+| "Interact with an Electron app (no CDP, AX limited)" | `find_text(text="...", app_name="App")` → `click(x, y, background=true, app_name="App")` | Find the target with AX/OCR, then click via background dispatch. No cursor movement. |
+| "Type into an Electron app's input" | `find_text(text="Search", app_name="App")` → `click(x, y, background=true, app_name="App")` → `type_text("hello", background=true, app_name="App")` | Focus then type, all via `CGEventPostToPid`. No cursor movement. |
+
+### 🥉 Tier 3 — Last Resort (real cursor movement, steals focus)
+
+| User Goal | Tool Sequence | Why? |
+|-----------|---------------|------|
+| "Click a button when CDP/AX/background ALL failed" | `find_text(text="Submit")` → `click(x, y)` | Real cursor movement, steals focus. **Only when tiers 0–2 are exhausted.** |
+| "Click an unlabeled visual feature (canvas/WebGL)" | `take_screenshot()` → (Analyze Image) → `click(screenshot_x=..., screenshot_y=..., ...)` | Visual features require full screenshot analysis. Real cursor movement. |
+| "Type into a field when background typing failed" | `find_text(text="Search")` → `click(x, y)` → `type_text("hello")` | Real cursor movement. Only as final fallback. |
+
+### 🔧 Utility
+
+| User Goal | Tool Sequence | Why? |
+|-----------|---------------|------|
+| "What element is at (500, 300)?" | `element_at_point(x=500, y=300)` | Returns the accessibility element at those coordinates. |
 | "Scroll down" | `scroll(x=500, y=500, delta_y=200)` | Positive `delta_y` scrolls down. |
 | "Find an open window" | `list_windows()` → `focus_window(window_id=...)` | Don't guess window names; list them first. |
+| "Quit an app" | `quit_app(app_name="Safari")` | Graceful by default; use `force=true` to kill immediately. |
+| "Launch an app with debug flags" | `launch_app(app_name="App", args=[...])` | Pass CLI args on fresh launch. For Electron CDP only; for Chrome, use `cdp_auto_connect` instead. |
 | "Track what I hover over" | `start_hover_tracking(min_dwell_ms=300)` → user moves mouse → `stop_hover_tracking()` | Records element transitions with dwell filtering. |
 | "Record what the user does" | `start_recording(output_dir="/tmp/rec")` → user interacts → `stop_recording()` | Captures frontmost app at ~5fps as JPEG frames. |
-| "Launch Safari with debug port" | `launch_app(app_name="Safari", args=["--remote-debugging-port=9222"])` | Pass CLI args on fresh launch. |
-| "Quit an app" | `quit_app(app_name="Safari")` | Graceful by default; use `force=true` to kill immediately. |
-| "Click a button in Chrome" | `cdp_connect(port=9222)` → `cdp_find_elements(query="Submit")` → `cdp_click(uid="d1")` | CDP is more reliable than coordinates for web content. No cursor movement. |
-| "Attach to my own already-open Chrome (not a separate debug profile)" | `cdp_auto_connect()` → `cdp_list_pages()` → `cdp_select_page(page_idx=1)` | Chrome 144+ with the `chrome://inspect/#remote-debugging` "Allow remote debugging" toggle on. Reuses your real tabs, cookies, extensions, and logins instead of `cdp_launch`'s separate managed profile. |
-| "Type in a web input" | `cdp_find_elements(query="Email")` → `cdp_fill(uid="d1", value="hello")` | Works for `<input>`, `<textarea>`, and `<select>` elements. |
 | "Run JS in a browser page" | `cdp_evaluate_script(function="() => document.title")` | Evaluate any JS in the selected page. |
-| "Navigate to a URL" | `cdp_navigate(url="https://example.com")` | Also supports back, forward, reload. |
-| "Press Enter or shortcut" | `cdp_press_key(key="Enter")` or `cdp_press_key(key="Control+A")` | Supports modifier combos. |
-| "Wait for page content" | `cdp_wait_for(text=["Success"])` | Polls page text until any value appears or timeout. Pass `include_snapshot=true` to also get a DOM snapshot. |
+| "Press a browser keyboard shortcut" | `cdp_press_key(key="Enter")` or `cdp_press_key(key="Control+A")` | Supports modifier combos. |
+| "Wait for page content" | `cdp_wait_for(text=["Success"])` | Polls page text until any value appears or timeout. |
 | "Switch browser tabs" | `cdp_list_pages()` → `cdp_select_page(page_idx=1)` | List tabs, then select by index. |
 | "Get browser page structure" | `cdp_take_dom_snapshot()` | Full interactive-element DOM snapshot with UIDs, roles, and labels. |
-| "Click a named button in a native app (macOS)" | `take_ax_snapshot` → `ax_click(uid)` | Focus-preserving. Generation-tagged uids; fresh snapshot invalidates prior uids. Check the uid's `[P]` capability tag first. |
-| "Enter text into a text field via value assignment (macOS)" | `take_ax_snapshot` → `ax_set_value(uid, text)` | No key events, no IME, no undo-stack entry. Check the uid's `[SV]` tag first; on `not_dispatchable` prefer `click(..., background=true)` + `type_text(..., background=true)` over a real click. |
-| "Select a sidebar row in System Settings / a `NSOutlineView` row (macOS)" | `take_ax_snapshot` → `ax_select(uid)` | Writes `AXSelectedRows` on the enclosing outline/table. Use this instead of `ax_click` for row targets — rows typically refuse `AXPress`. |
 | "AX snapshot invalidation rule (macOS)" | — | Every `take_ax_snapshot` call bumps the generation. All prior uids become stale; `ax_*` tools return `snapshot_expired`. |
-| "`ax_click`/`ax_set_value`/`ax_select` returned `not_dispatchable` (macOS)" | `click(fallback.x, fallback.y, background=true, app_name="TargetApp")` (or `type_text`/`press_key` with the same flag) | Retries via `CGEventPostToPid` — still no cursor movement, still no focus steal. Try this before a plain `click`/`type_text`/`press_key`. |
-| "Inspect a native app's UI without a full vision pass (macOS)" | `take_screenshot(app_name="TargetApp", include_screenshot="auto")` | Returns the AX snapshot alone when coverage is good; only attaches pixels when it's sparse, unlabeled, or weak. |
-| "Click a button when AX/CDP can't reach it — last resort" | `find_text(text="Submit")` → `click(x, y)` | Real cursor movement, steals focus. Use only when the tiers above don't apply (canvas/WebGL apps, accessibility-opaque apps) or failed (`bg_click_failed`). |
-| "Click an unlabeled visual feature — last resort" | `take_screenshot()` → (Analyze Image) → `click(screenshot_x=..., screenshot_y=..., screenshot_origin_x=..., screenshot_origin_y=..., screenshot_scale=...)` | Visual features require full screenshot analysis. Real cursor movement — same last-resort tier as above. |
-| "Type into the search bar — last resort" | `find_text(text="Search")` → `click(x, y)` → `type_text("hello")` | Must click to focus before typing. Real cursor movement; prefer `ax_set_value`/`cdp_fill`/background `click`+`type_text` first. |
 
 ---
 
@@ -297,25 +341,34 @@ Connect to Chrome or Electron apps via Chrome DevTools Protocol for DOM-level el
 
 #### CDP Workflow Examples
 
-**Chrome:**
+**User's real Chrome (DEFAULT — always try this first):**
 ```
-1. launch_app(app_name="Google Chrome", args=["--remote-debugging-port=9222", "--user-data-dir=/tmp/chrome-profile"])
-2. cdp_connect(port=9222)                        → "Connected. Selected page: chrome://new-tab-page/"
-3. cdp_navigate(url="https://example.com")
-4. cdp_find_elements(query="Search")              → matches=[{uid:"d1", role:"textbox", label:"Search", ...}]
+1. cdp_auto_connect()                              → "Connected to Chrome. Selected page: https://..."
+2. cdp_list_pages()                                → see all the user's open tabs
+3. cdp_select_page(page_idx=2)                     → switch to the target tab, OR
+   cdp_new_page(url="https://example.com")         → open a new tab
+4. cdp_find_elements(query="Search")               → matches=[{uid:"d1", role:"textbox", label:"Search", ...}]
 5. cdp_fill(uid="d1", value="search query")
 6. cdp_press_key(key="Enter")
 7. cdp_wait_for(text=["Results"])
-8. cdp_find_elements(query="Submit")              → matches=[{uid:"d1", role:"button", label:"Submit", ...}]
-9. cdp_click(uid="d1")                             → "Clicked uid=d1 'Submit' (button) at (200, 300)"
+8. cdp_find_elements(query="Submit")               → matches=[{uid:"d1", role:"button", label:"Submit", ...}]
+9. cdp_click(uid="d1")                              → "Clicked uid=d1 'Submit' (button)"
 ```
 
-**Electron app (e.g., Slack, Discord, Signal):**
+**Fresh Chrome (FALLBACK — only when `cdp_auto_connect` fails):**
+```
+1. cdp_launch(url="https://example.com")           → launches a SEPARATE Chrome with empty profile
+2. cdp_find_elements(query="Search")               → matches=[{uid:"d1", role:"textbox", ...}]
+3. cdp_fill(uid="d1", value="search query")
+4. cdp_press_key(key="Enter")
+```
+
+**Electron app (e.g., Slack, Discord, Signal) — these need a debug port on launch:**
 ```
 1. quit_app(app_name="MyElectronApp")
 2. launch_app(app_name="MyElectronApp", args=["--remote-debugging-port=9333"])
 3. cdp_connect(port=9333)                  → "Connected. Selected page: file:///...app.html"
-4. cdp_take_dom_snapshot()                  → uid=d1 button "New Chat" tag=button ... (full interactive surface)
+4. cdp_take_dom_snapshot()                  → uid=d1 button "New Chat" ... (full interactive surface)
 5. cdp_click(uid="d5")                      → click a list item or button
 6. cdp_take_dom_snapshot()                  → fresh snapshot of the new view
 7. cdp_fill(uid="d12", value="hello")
@@ -387,36 +440,42 @@ Use this when you (the model) look at the *image* from `take_screenshot` and est
 
 ## ⚡ Intent Examples (Chain of Thought)
 
-### "Click the 'Save' button in Notepad"
-1.  **Thought:** I need to find the text "Save" in the app "Notepad".
-2.  **Call:** `focus_window(app_name="Notepad")`
-3.  **Call:** `find_text(text="Save")` -> Returns `[{"text":"Save","x":200,"y":400,...}]`
-4.  **Call:** `click(x=200, y=400)`
+Each example shows the **preferred tier first**, then fallback. The old pattern of `find_text → click(x,y)` for native apps is **wrong** — always try AX/CDP first.
 
-### "Draw a circle in Paint"
-1.  **Thought:** Text search won't work for a canvas. I need to see the screen.
+### 🌐 "Search for something on Google" (web — Tier 1 CDP)
+1.  **Call:** `cdp_auto_connect()` → "Connected to Chrome. Selected page: https://..."
+    - ❌ Do NOT use `cdp_launch` for this. The user already has Chrome open.
+2.  **Call:** `cdp_find_elements(query="search")` → `[{uid:"d1", role:"searchbox", ...}]`
+3.  **Call:** `cdp_fill(uid="d1", value="weather today")`
+4.  **Call:** `cdp_press_key(key="Enter")`
+5.  **Call:** `cdp_wait_for(text=["Results"])` → verify page loaded.
+
+### 🖥️ "Click the 'Save' button in TextEdit" (native macOS — Tier 1 AX)
+1.  **Thought:** This is a native macOS app. I should use AX, not `find_text` + `click(x,y)`.
+2.  **Call:** `take_ax_snapshot(app_name="TextEdit")` → scan for `AXButton "Save" [P,F]`.
+3.  **Call:** `ax_click(uid="a12g3")` → no cursor movement, no focus steal.
+4.  **Verify:** `take_ax_snapshot(app_name="TextEdit")` → confirm the save dialog closed or file saved.
+5.  **Fallback (only if `ax_click` returns `not_dispatchable`):** `click(fallback.x, fallback.y, background=true, app_name="TextEdit")` → still no cursor movement.
+6.  **Last resort (only if background click also fails):** `find_text(text="Save", app_name="TextEdit")` → `click(x, y)`.
+
+### 🖥️ "Fill the search field in Finder" (native macOS — Tier 1 AX)
+1.  **Call:** `take_ax_snapshot(app_name="Finder")` → `AXSearchField` at `uid="a7g2" [SV,F]`.
+2.  **Call:** `ax_set_value(uid="a7g2", text="invoice.pdf")` → `{ "ok": true }`.
+3.  **Fallback on `not_dispatchable`:** `click(fallback.x, fallback.y, background=true, app_name="Finder")` then `type_text("invoice.pdf", background=true, app_name="Finder")` — still no cursor movement.
+4.  **Last resort:** `click(fallback.x, fallback.y)` then `type_text("invoice.pdf")` — real cursor.
+
+### 🖥️ "Open the Wi-Fi pane in System Settings" (native macOS — Tier 1 AX)
+1.  **Call:** `take_ax_snapshot(app_name="System Settings")` → `AXRow "Wi-Fi"` at `uid="a18g3"`.
+2.  **Thought:** Sidebar rows are backed by `NSOutlineView` — they refuse `AXPress`, so use `ax_select`.
+3.  **Call:** `ax_select(uid="a18g3")` → `{ "ok": true, "dispatched_via": "AXSelectedRows" }`.
+4.  **Call:** `take_ax_snapshot(app_name="System Settings")` → verify the Wi-Fi detail pane is visible.
+
+### 🎨 "Draw a circle in Paint" (canvas app — Tier 3, AX unavailable)
+1.  **Thought:** Canvas apps have no accessibility tree. This genuinely needs screenshots + coordinates.
 2.  **Call:** `take_screenshot(app_name="Paint")`
 3.  **Analysis:** I see the canvas center at pixel (500, 500) in the image.
 4.  **Compute:** `start_x = screenshot_origin_x + 500 / screenshot_scale`, `start_y = screenshot_origin_y + 500 / screenshot_scale`
 5.  **Call:** `drag(start_x=..., start_y=..., end_x=..., end_y=...)`
-
-### "Copy text from this window"
-1.  **Thought:** I can read text directly from the screenshot OCR data without using the clipboard.
-2.  **Call:** `take_screenshot(include_ocr=true)`
-3.  **Action:** Read the OCR summary text in the response (lines include clickable coordinates).
-
-### "Open the Wi-Fi pane in System Settings (macOS)"
-1.  **Thought:** This is a native macOS app. The AX-dispatch branch is preferred — no mouse movement, no focus steal, and sidebar rows are a perfect fit for `ax_select`.
-2.  **Call:** `take_ax_snapshot(app_name="System Settings")` → tree with a row `AXRow "Wi-Fi"` at `uid="a18g3"`.
-3.  **Thought:** Sidebar rows are backed by `NSOutlineView` — they refuse `AXPress`, so use `ax_select` rather than `ax_click`.
-4.  **Call:** `ax_select(uid="a18g3")` → `{ "ok": true, "dispatched_via": "AXSelectedRows" }`.
-5.  **Call:** `take_ax_snapshot(app_name="System Settings")` → verify the Wi-Fi detail pane is visible. The generation bumps; any earlier uids are now stale.
-
-### "Fill the search field in Finder (macOS)"
-1.  **Thought:** Native macOS app with a text field. `ax_set_value` writes `kAXValueAttribute` directly — but it doesn't fire keydown/keyup and doesn't feed IME, so if the app has key-handlers fall back to `click` + `type_text`.
-2.  **Call:** `take_ax_snapshot(app_name="Finder")` → `AXSearchField` at `uid="a7g2"`.
-3.  **Call:** `ax_set_value(uid="a7g2", text="invoice.pdf")` → `{ "ok": true, "dispatched_via": "AXSetAttributeValue" }`.
-4.  **Fallback on `not_dispatchable`:** `click(fallback.x, fallback.y)` to focus, then `type_text("invoice.pdf")` for real key events.
 
 ---
 
