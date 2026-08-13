@@ -50,8 +50,8 @@ impl ToolHandler for StartHoverTracking {
                     },
                     "max_duration_ms": {
                         "type": "integer",
-                        "description": "Auto-stop after this many milliseconds (default: 60000 = 60s)",
-                        "default": 60000
+                        "description": "Auto-stop after this many milliseconds (0 = unlimited — runs until stop_hover_tracking)",
+                        "default": 0
                     },
                     "min_dwell_ms": {
                         "type": "integer",
@@ -99,8 +99,12 @@ impl ToolHandler for StartHoverTracking {
         let max_duration_ms = args
             .get("max_duration_ms")
             .and_then(|v| v.as_u64())
-            .unwrap_or(60000)
-            .clamp(100, u32::MAX as u64) as u32;
+            .unwrap_or(0);
+        let max_duration_ms = if max_duration_ms == 0 {
+            u32::MAX as u64
+        } else {
+            max_duration_ms.clamp(100, u32::MAX as u64)
+        } as u32;
         let min_dwell_ms = args
             .get("min_dwell_ms")
             .and_then(|v| v.as_u64())
