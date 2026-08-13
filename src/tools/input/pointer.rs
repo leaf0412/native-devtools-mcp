@@ -450,7 +450,7 @@ impl ToolHandler for TypeText {
     fn schema(&self) -> Tool {
         Tool::new(
             "type_text",
-            "Type text at the current cursor position. Works with any app. Requires Accessibility permission on macOS. LAST RESORT without background=true: prefer ax_set_value for native macOS apps or cdp_fill for browsers first. Set background=true with app_name for cursor-free, focus-preserving typing via CGEventPostToPid — use this instead of a plain call when escalating from ax_set_value's not_dispatchable.",
+            "Type text at the current cursor position. PREFERRED: use with background=true + app_name (macOS) for cursor-free, focus-preserving typing via CGEventPostToPid — NO cursor movement, NO focus steal. Without background=true, the real cursor moves and focus may shift — fallback only. Requires Accessibility permission on macOS.",
             Arc::new(json_to_object(serde_json::json!({
                 "type": "object",
                 "required": ["text"],
@@ -461,7 +461,7 @@ impl ToolHandler for TypeText {
                     },
                     "background": {
                         "type": "boolean",
-                        "description": "When true, deliver keystrokes via CGEventPostToPid without moving cursor or stealing focus. Requires app_name. macOS only.",
+                        "description": "PREFERRED mode (macOS): deliver keystrokes via CGEventPostToPid — NO cursor movement, NO focus steal. Requires app_name.",
                         "default": false
                     },
                     "app_name": {
@@ -496,7 +496,7 @@ impl ToolHandler for PressKey {
     fn schema(&self) -> Tool {
         Tool::new(
             "press_key",
-            "Press a key combination. Works with any app. Requires Accessibility permission on macOS. LAST RESORT without background=true: prefer ax_click/ax_set_value/ax_select or cdp_press_key first. Set background=true with app_name for cursor-free, focus-preserving key delivery via CGEventPostToPid — use this instead of a plain call when escalating from an AX not_dispatchable result.",
+            "Press a key combination. PREFERRED: use with background=true + app_name (macOS) for cursor-free, focus-preserving key delivery via CGEventPostToPid — NO cursor movement, NO focus steal. Without background=true, the real cursor moves and focus may shift — fallback only. Requires Accessibility permission on macOS.",
             Arc::new(json_to_object(serde_json::json!({
                 "type": "object",
                 "required": ["key"],
@@ -513,7 +513,7 @@ impl ToolHandler for PressKey {
                     },
                     "background": {
                         "type": "boolean",
-                        "description": "When true, deliver key via CGEventPostToPid without moving cursor or stealing focus. Requires app_name. macOS only.",
+                        "description": "PREFERRED mode (macOS): deliver key via CGEventPostToPid — NO cursor movement, NO focus steal. Requires app_name.",
                         "default": false
                     },
                     "app_name": {

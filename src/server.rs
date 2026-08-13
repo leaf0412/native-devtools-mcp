@@ -330,50 +330,45 @@ impl ServerHandler for MacOSDevToolsServer {
         let mut instructions = String::from(
             "Native DevTools MCP server for automating desktop apps (macOS/Windows) and Android devices.\n\n\
              WHICH TOOLS TO USE:\n\
-             - Desktop apps (coordinate-based, cross-platform): no prefix (click, find_text, take_screenshot, type_text, etc.). Moves the cursor; steals focus.\n",
+             - Desktop apps (background input, PREFERRED): click(x, y, background=true, app_name=...),\n\
+               type_text(text, background=true, app_name=...) — NO cursor movement, NO focus steal.\n\
+               Use find_text to locate targets first.\n\
+             - Desktop apps (plain input, fallback): click(x, y), type_text(text) — moves cursor,\n\
+               steals focus. Only when background input has no visible effect.\n",
         );
-
-        #[cfg(target_os = "macos")]
-        {
-            instructions.push_str(
-                "- Desktop apps (element-precise, macOS only): ax_* (ax_click, ax_set_value, ax_select) — focus-preserving dispatch against uids from take_ax_snapshot.\n",
-            );
-        }
 
         instructions.push_str(
             "- Android devices: android_* (android_click, android_find_text, etc.)\n\
              - App debug protocol: app_* — only when given a WebSocket URL to connect to.\n\
              NEVER mix these — desktop tools do not work on Android and vice versa.\n\n\
              == DESKTOP (macOS/Windows) ==\n\n\
-             CLICKING BY TEXT (PREFERRED): Use find_text to locate UI elements by name, \
-             then click at the returned coordinates.\n\
-             Example: find_text(text='Submit') → click(x=..., y=...).\n\n\
-             CLICKING BY VISUAL POSITION: Use take_screenshot with include_ocr=true. \
-             The OCR results include screen coordinates you can click directly. \
-             For positions not covered by OCR, use the screenshot metadata \
+             BACKGROUND INPUT (PREFERRED): Use find_text to locate UI elements by name,\n\
+             then click via background dispatch — NO cursor movement, NO focus steal.\n\
+             For clicking: find_text(text='Submit', app_name='App') → click(x=..., y=..., background=true, app_name='App').\n\
+             For typing: locate with find_text, focus with a background click, then type_text(text, background=true, app_name='App').\n\
+             For keyboard shortcuts: press_key(key, modifiers=[...], background=true, app_name='App').\n\n\
+             PLAIN INPUT (fallback): Only when background input has no visible effect.\n\
+             Use click(x, y) / type_text(text). This MOVES the real cursor and steals focus.\n\n\
+             CLICKING BY VISUAL POSITION: Use take_screenshot with include_ocr=true.\n\
+             The OCR results include screen coordinates. Prefer background=input variants;\n\
+             fall back to plain click(x, y) only if background has no effect.\n\
+             For positions not covered by OCR, use the screenshot metadata\n\
              (origin_x, origin_y, scale) to convert pixel positions.\n\n\
-             Always call focus_window before clicking to ensure the target window receives input.\n\n\
-             Screenshot best practice: Use take_screenshot with app_name (e.g., app_name='Code') \
+             Background dispatch (click/type_text/press_key with background=true) delivers\n\
+             directly to the target process via CGEventPostToPid — NO focus_window needed.\n\
+             For plain input (without background=true), call focus_window first.\n\n\
+             Screenshot best practice: Use take_screenshot with app_name (e.g., app_name='Code')\n\
              to capture a specific window. Avoid mode='screen' unless you need to see multiple windows.\n\n",
         );
 
         #[cfg(target_os = "macos")]
         {
             instructions.push_str(
-                "ELEMENT-PRECISE AUTOMATION (macOS, PREFERRED for native apps): \
-                 Call take_ax_snapshot(app_name='...') to get a tree of elements tagged \
-                 with generation-stamped uids like 'a42g3'. Then pick the dispatch \
-                 primitive that matches the target: ax_click(uid) dispatches AXPress for \
-                 buttons, menu items, and anything pressable; ax_set_value(uid, text) \
-                 writes kAXValueAttribute on text fields; ax_select(uid) writes \
-                 AXSelectedRows for NSOutlineView / NSTableView row selection (sidebars, \
-                 rule lists, file browsers) — rows typically refuse AXPress so ax_click \
-                 returns not_dispatchable or AX error -25205 against them. IMPORTANT: any \
-                 fresh take_ax_snapshot invalidates all prior uids — snapshot immediately \
-                 before each ax_click / ax_set_value / ax_select call. ax_set_value is \
-                 value assignment, not keystrokes: no IME, no undo-stack entry. If a call \
-                 fails with not_dispatchable and returns a fallback {x, y}, retry via \
-                 click(x, y) (plus type_text(text) for ax_set_value).\n\n",
+                "(macOS only: ax_click / ax_set_value / ax_select via take_ax_snapshot exist for native apps but are not the primary path.\n\
+                 Prefer background input first. If ax_dispatch fails with not_dispatchable\n\
+                 and returns a fallback {x, y}, retry via click(x, y, background=true,\
+                 app_name=...) — still no cursor movement. Fall back to plain click(x, y)\
+                 only as a last resort.)\n\n",
             );
         }
 

@@ -255,19 +255,16 @@ impl ToolHandler for Click {
     fn schema(&self) -> Tool {
         Tool::new(
             "click",
-            "Click at screen coordinates. Pass exactly one coordinate variant — the runtime \
-             rejects mixes. Variants: \
-             (1) 'screenshot-pixels' (PREFERRED after take_screenshot) — screenshot_x, \
-             screenshot_y, screenshot_origin_x, screenshot_origin_y, screenshot_scale from \
-             take_screenshot metadata; \
-             (2) 'screen' — absolute screen x, y (use with find_text results); \
+            "PREFERRED via background=true + app_name (macOS): NO cursor movement, NO focus steal.\n\
+             Without background=true: moves the real cursor and steals focus — fallback only.\n\
+             Pass exactly one coordinate variant — the runtime rejects mixes. Variants: \
+             (1) 'screen' — absolute screen x, y (use with find_text results); \
+             (2) 'screenshot-pixels' — screenshot_x, screenshot_y, screenshot_origin_x,\
+             screenshot_origin_y, screenshot_scale from take_screenshot metadata; \
              (3) 'window-relative' — window_x, window_y, window_id from list_windows; \
-             (4) 'screenshot-pixels-legacy' (DEPRECATED) — screenshot_x, screenshot_y, \
+             (4) 'screenshot-pixels-legacy' (DEPRECATED) — screenshot_x, screenshot_y,\
              screenshot_window_id. \
-             Works with any app (egui, Electron, etc.). Requires Accessibility permission on macOS. \
-             LAST RESORT on macOS: this moves the real cursor and steals focus. Prefer ax_click \
-             (native apps) or cdp_click (browsers) first; if AXPress is unsupported \
-             (not_dispatchable), prefer background=true + app_name on this tool before omitting it.",
+             Works with any app (egui, Electron, etc.). Requires Accessibility permission on macOS.",
             Arc::new(json_to_object(serde_json::json!({
                 "type": "object",
                 "properties": {
@@ -301,15 +298,15 @@ impl ToolHandler for Click {
                     },
                     "screenshot_origin_x": {
                         "type": "number",
-                        "description": "[screenshot-pixels, PREFERRED] screenshot_origin_x from take_screenshot metadata."
+                        "description": "[screenshot-pixels] screenshot_origin_x from take_screenshot metadata."
                     },
                     "screenshot_origin_y": {
                         "type": "number",
-                        "description": "[screenshot-pixels, PREFERRED] screenshot_origin_y from take_screenshot metadata."
+                        "description": "[screenshot-pixels] screenshot_origin_y from take_screenshot metadata."
                     },
                     "screenshot_scale": {
                         "type": "number",
-                        "description": "[screenshot-pixels, PREFERRED] screenshot_scale from take_screenshot metadata."
+                        "description": "[screenshot-pixels] screenshot_scale from take_screenshot metadata."
                     },
                     "screenshot_window_id": {
                         "type": "integer",
@@ -335,7 +332,7 @@ impl ToolHandler for Click {
                     },
                     "background": {
                         "type": "boolean",
-                        "description": "When true, deliver click via CGEventPostToPid without moving cursor or stealing focus. Requires app_name. macOS only.",
+                        "description": "PREFERRED mode (macOS): deliver click via CGEventPostToPid — NO cursor movement, NO focus steal. Requires app_name. Use this first, fall back to plain click only if it has no visible effect.",
                         "default": false
                     }
                 }
