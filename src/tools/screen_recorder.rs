@@ -322,8 +322,8 @@ impl ToolHandler for StartRecording {
                     },
                     "max_duration_ms": {
                         "type": "integer",
-                        "description": "Auto-stop after this many milliseconds (default: 60000 = 1 min)",
-                        "default": 60000
+                        "description": "Auto-stop after this many milliseconds (default: 1800000 = 30 min; 0 = unlimited)",
+                        "default": 1800000
                     }
                 },
                 "required": ["output_dir"]
@@ -365,8 +365,12 @@ impl ToolHandler for StartRecording {
         let max_duration_ms = args
             .get("max_duration_ms")
             .and_then(|v| v.as_u64())
-            .unwrap_or(60_000)
-            .clamp(1_000, u32::MAX as u64) as u32;
+            .unwrap_or(1_800_000);
+        let max_duration_ms = if max_duration_ms == 0 {
+            u32::MAX
+        } else {
+            max_duration_ms.clamp(1_000, u32::MAX as u64) as u32
+        };
 
         let output_path = std::path::PathBuf::from(&output_dir);
         if let Err(e) = std::fs::create_dir_all(&output_path) {
@@ -400,8 +404,13 @@ impl ToolHandler for StartRecording {
         *ctx.screen_recorder.write().await = Some(recorder);
         let _ = ctx.peer.notify_tool_list_changed().await;
 
+        let duration_label = if max_duration_ms == u32::MAX {
+            "unlimited".to_string()
+        } else {
+            format!("{max_duration_ms}ms")
+        };
         Ok(CallToolResult::success(vec![Content::text(format!(
-            "Recording started ({fps}fps, max: {max_duration_ms}ms, dir: {output_dir}). Use stop_recording to end.",
+            "Recording started ({fps}fps, max: {duration_label}, dir: {output_dir}). Use stop_recording to end.",
         ))]))
     }
 }
