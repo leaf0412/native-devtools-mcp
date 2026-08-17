@@ -1,6 +1,7 @@
 //! Pointer and keyboard tools: move_mouse, drag, scroll, type_text, press_key.
 
-use super::{check_permission, run_input};
+use super::diagnostics::{dispatched_unverified, error as input_error};
+use super::{check_permission, current_permission_status, run_input, InputErrorCode};
 use crate::platform::input;
 use crate::tools::registry::{json_to_object, ToolContext, ToolHandler};
 use rmcp::model::{CallToolResult, Content};
@@ -140,28 +141,35 @@ pub async fn type_text(params: TypeTextParams) -> CallToolResult {
 
     #[cfg(target_os = "macos")]
     if background {
+        let perm = current_permission_status();
         let app = match &params.app_name {
             Some(name) => name.clone(),
             None => {
-                return CallToolResult::error(vec![Content::text(
+                return input_error(
+                    InputErrorCode::InvalidTargetCoordinates,
                     "background type_text requires app_name to resolve the target process",
-                )])
+                    Some(&perm),
+                )
             }
         };
         let windows = match crate::macos::window::find_windows_by_app(&app) {
             Ok(w) => w,
             Err(e) => {
-                return CallToolResult::error(vec![Content::text(format!(
-                    "Failed to find windows for '{}': {}", app, e
-                ))])
+                return input_error(
+                    InputErrorCode::TargetAppNotFound,
+                    format!("Failed to find windows for '{}': {}", app, e),
+                    Some(&perm),
+                )
             }
         };
         let pid = match windows.first() {
             Some(w) => w.owner_pid as i32,
             None => {
-                return CallToolResult::error(vec![Content::text(format!(
-                    "No window found for app '{}'", app
-                ))])
+                return input_error(
+                    InputErrorCode::TargetWindowNotFound,
+                    format!("No window found for app '{}'", app),
+                    Some(&perm),
+                )
             }
         };
 
@@ -173,14 +181,17 @@ pub async fn type_text(params: TypeTextParams) -> CallToolResult {
             std::thread::sleep(std::time::Duration::from_millis(10));
         }
         if !errors.is_empty() {
-            return CallToolResult::error(vec![Content::text(format!(
-                "Background type errors: {}", errors.join(", ")
-            ))]);
+            return input_error(
+                InputErrorCode::BackgroundEventCreationFailed,
+                format!("Background type errors: {}", errors.join(", ")),
+                Some(&perm),
+            );
         }
-        return CallToolResult::success(vec![Content::text(format!(
-            "Background typed {} characters on '{}'",
-            char_count, app
-        ))]);
+        return dispatched_unverified(
+            "type_text",
+            &app,
+            &format!("posted {} characters", char_count),
+        );
     }
 
     run_input(
@@ -225,28 +236,35 @@ pub async fn press_key(params: PressKeyParams) -> CallToolResult {
 
     #[cfg(target_os = "macos")]
     if background {
+        let perm = current_permission_status();
         let app = match &params.app_name {
             Some(name) => name.clone(),
             None => {
-                return CallToolResult::error(vec![Content::text(
+                return input_error(
+                    InputErrorCode::InvalidTargetCoordinates,
                     "background press_key requires app_name to resolve the target process",
-                )])
+                    Some(&perm),
+                )
             }
         };
         let windows = match crate::macos::window::find_windows_by_app(&app) {
             Ok(w) => w,
             Err(e) => {
-                return CallToolResult::error(vec![Content::text(format!(
-                    "Failed to find windows for '{}': {}", app, e
-                ))])
+                return input_error(
+                    InputErrorCode::TargetAppNotFound,
+                    format!("Failed to find windows for '{}': {}", app, e),
+                    Some(&perm),
+                )
             }
         };
         let pid = match windows.first() {
             Some(w) => w.owner_pid as i32,
             None => {
-                return CallToolResult::error(vec![Content::text(format!(
-                    "No window found for app '{}'", app
-                ))])
+                return input_error(
+                    InputErrorCode::TargetWindowNotFound,
+                    format!("No window found for app '{}'", app),
+                    Some(&perm),
+                )
             }
         };
 
@@ -271,14 +289,18 @@ pub async fn press_key(params: PressKeyParams) -> CallToolResult {
 
         match crate::macos::bg_click::post_key_event_bg(pid, keycode, flags) {
             Ok(()) => {
-                return CallToolResult::success(vec![Content::text(format!(
-                    "Background pressed {} on '{}'", key_desc, app
-                ))]);
+                return dispatched_unverified(
+                    "press_key",
+                    &app,
+                    &key_desc,
+                );
             }
             Err(e) => {
-                return CallToolResult::error(vec![Content::text(format!(
-                    "Background key press failed: {}", e
-                ))]);
+                return input_error(
+                    InputErrorCode::BackgroundEventCreationFailed,
+                    format!("Background key press failed: {}", e),
+                    Some(&perm),
+                );
             }
         }
     }

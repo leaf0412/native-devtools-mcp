@@ -1,7 +1,8 @@
 //! `click` tool: resolve one coordinate variant and click at screen coords.
 
 use super::click_variant::{select_click_variant, ClickVariant};
-use super::{check_permission, run_input};
+use super::diagnostics::{dispatched_unverified, error as input_error};
+use super::{check_permission, current_permission_status, run_input, InputErrorCode};
 use crate::platform::{display, input};
 use crate::tools::ax_snapshot::append_ax_snapshot_if_requested;
 use crate::tools::registry::{json_to_object, ToolContext, ToolHandler};
@@ -176,30 +177,43 @@ pub async fn click(params: ClickParams) -> CallToolResult {
     let background = params.background;
 
     // ── Background click (CGEventPostToPid) ─────────────────────────
+    //
+    // Each stage reports its own error code. `check_permission` already ran
+    // above, so reaching here means the host is TCC-trusted; the permission
+    // snapshot attached to these errors therefore reads `true` and points at
+    // the *real* failure (missing window, unsupported symbol, …) instead of
+    // a misleading blanket permission message.
     #[cfg(target_os = "macos")]
     if background {
+        let perm = current_permission_status();
         let app = match &params.app_name {
             Some(name) => name.clone(),
             None => {
-                return CallToolResult::error(vec![Content::text(
+                return input_error(
+                    InputErrorCode::InvalidTargetCoordinates,
                     "background click requires app_name to resolve the target window",
-                )])
+                    Some(&perm),
+                )
             }
         };
         let windows = match crate::macos::window::find_windows_by_app(&app) {
             Ok(w) => w,
             Err(e) => {
-                return CallToolResult::error(vec![Content::text(format!(
-                    "Failed to find windows for '{}': {}", app, e
-                ))])
+                return input_error(
+                    InputErrorCode::TargetAppNotFound,
+                    format!("Failed to find windows for '{}': {}", app, e),
+                    Some(&perm),
+                )
             }
         };
         let win = match windows.first() {
             Some(w) => w,
             None => {
-                return CallToolResult::error(vec![Content::text(format!(
-                    "No window found for app '{}'", app
-                ))])
+                return input_error(
+                    InputErrorCode::TargetWindowNotFound,
+                    format!("No window found for app '{}'", app),
+                    Some(&perm),
+                )
             }
         };
         let local_x = x - win.bounds.x;
@@ -216,22 +230,21 @@ pub async fn click(params: ClickParams) -> CallToolResult {
             local_point,
         );
         return match result {
-            crate::macos::bg_click::BgClickResult::Ok => {
-                CallToolResult::success(vec![Content::text(format!(
-                    "Background click at ({:.0}, {:.0}) on '{}'",
-                    x, y, app
-                ))])
-            }
-            crate::macos::bg_click::BgClickResult::EventCreationFailed => {
-                CallToolResult::error(vec![Content::text(
-                    "Background click: NSEvent factory returned nil",
-                )])
-            }
-            crate::macos::bg_click::BgClickResult::PrivateSymbolMissing => {
-                CallToolResult::error(vec![Content::text(
-                    "Background click: CGEventSetWindowLocation symbol not found (macOS too old?)",
-                )])
-            }
+            crate::macos::bg_click::BgClickResult::Ok => dispatched_unverified(
+                "click",
+                &app,
+                &format!("posted mouse down/up at ({:.0}, {:.0})", x, y),
+            ),
+            crate::macos::bg_click::BgClickResult::EventCreationFailed => input_error(
+                InputErrorCode::BackgroundEventCreationFailed,
+                "Background click: NSEvent factory returned nil",
+                Some(&perm),
+            ),
+            crate::macos::bg_click::BgClickResult::PrivateSymbolMissing => input_error(
+                InputErrorCode::BackgroundDispatchUnsupported,
+                "Background click: CGEventSetWindowLocation symbol not found (macOS too old?)",
+                Some(&perm),
+            ),
         };
     }
 

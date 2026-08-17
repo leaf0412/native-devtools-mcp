@@ -5,37 +5,51 @@
 
 mod click;
 mod click_variant;
+mod diagnostics;
 mod pointer;
 mod query;
 
 pub use click::*;
+pub use diagnostics::*;
 pub use pointer::*;
 pub use query::*;
 
 use crate::platform::input;
 use rmcp::model::{CallToolResult, Content};
 
-/// Check accessibility permission and return a standardized plain-text error
-/// result if not granted. Returns `None` when permission is available.
+/// Snapshot of the host process's Accessibility trust, for inclusion in
+/// structured input errors so callers can tell a permission problem apart
+/// from a target/event/verification problem.
+pub(crate) fn current_permission_status() -> PermissionStatus {
+    PermissionStatus {
+        accessibility_trusted: input::check_accessibility_permission(),
+    }
+}
+
+/// Check accessibility permission and return a structured error result if not
+/// granted. Returns `None` when permission is available.
 ///
 /// Shared between the coord-based input tools (`click`, `type_text`, …) and
-/// the macOS AX dispatch tools (`ax_click`, `ax_set_value`) so all user-facing
-/// permission messages are identical.
+/// the macOS AX dispatch tools (`ax_click`, `ax_set_value`) so the
+/// permission-stage failure is identical across tools.
+///
+/// Note: this only reports the *permission-probe* stage. A `false` here means
+/// the host process is untrusted; it does NOT mean a particular target window
+/// or event path failed. Downstream stages report their own codes.
 pub(crate) fn check_permission() -> Option<CallToolResult> {
     if !input::check_accessibility_permission() {
-        #[cfg(target_os = "macos")]
-        let msg = "Accessibility permission required.\n\n\
-             Grant permission to your MCP client (e.g., Claude Desktop, VS Code, Terminal) in:\n\
-             System Settings → Privacy & Security → Accessibility\n\n\
-             The permission must be granted to the app that runs this MCP server, \
-             not to the server binary itself.";
-
-        #[cfg(target_os = "windows")]
-        let msg = "Input injection permission denied.\n\n\
-             This typically occurs when targeting elevated (admin) windows \
-             from a non-elevated process, or when targeting secure desktops.";
-
-        return Some(CallToolResult::error(vec![Content::text(msg)]));
+        let perm = PermissionStatus {
+            accessibility_trusted: false,
+        };
+        return Some(diagnostics::error(
+            InputErrorCode::AccessibilityUntrusted,
+            "Accessibility permission not granted to the app that runs this MCP server. \
+             Grant it to the host app (e.g. Terminal, VS Code, Claude Desktop, Ghostty) in \
+             System Settings → Privacy & Security → Accessibility, then restart that app. \
+             The permission must be granted to the app that runs this server, not to the \
+             server binary itself.",
+            Some(&perm),
+        ));
     }
     None
 }
