@@ -27,6 +27,10 @@ pub struct CdpClient {
     pub browser: Browser,
     pub selected_page: Option<Page>,
     pub handler_handle: JoinHandle<()>,
+    /// Remote debugging port this client is attached to. Used to decide
+    /// whether an existing connection can be reused (`cdp_connect` to the
+    /// same port, repeated `cdp_auto_connect`) or must be replaced.
+    pub port: u16,
     pub last_dom_snapshot: Option<SnapshotMap>,
     pub last_page_list: Vec<Page>,
     /// Monotonic counter bumped on every page-lifecycle event that could
@@ -75,6 +79,7 @@ impl CdpClient {
             browser,
             selected_page,
             handler_handle,
+            port,
             last_dom_snapshot: None,
             last_page_list: Vec::new(),
             generation: 0,
@@ -83,7 +88,7 @@ impl CdpClient {
         })
     }
 
-    /// Connect to a Chromium instance using an already-resolved WebSocket URL.
+    /// Connect to a Chromium instance using an already-resolved Web
     ///
     /// Skips chromiumoxide's HTTP-discovery step (which would `GET /json/version`
     /// and fail on browsers that reject that endpoint, e.g. Chrome 144+ on the
@@ -93,7 +98,7 @@ impl CdpClient {
     /// The URL is expected to be `ws://127.0.0.1:<port><path>`, exactly as
     /// written in `<userDataDir>/DevToolsActivePort`. Use
     /// [`crate::cdp::auto_connect::connect_default_chrome`] to wire that up.
-    pub async fn connect_ws(ws_url: &str) -> Result<Self, String> {
+    pub async fn connect_ws(ws_url: &str, port: u16) -> Result<Self, String> {
         let (mut browser, mut handler) = Browser::connect(ws_url)
             .await
             .map_err(|e| format!(
@@ -109,6 +114,7 @@ impl CdpClient {
             browser,
             selected_page,
             handler_handle,
+            port,
             last_dom_snapshot: None,
             last_page_list: Vec::new(),
             generation: 0,
@@ -147,6 +153,35 @@ impl CdpClient {
     }
 }
 
+/// Connection strategy when a connect tool is invoked and a client may
+/// already be attached to a browser.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ConnectDecision {
+    /// Already attached to the *same* target port — reuse the live connection,
+    /// create nothing new. This is the fix for the leak where every
+    /// `cdp_connect` / `cdp_launch` / `cdp_auto_connect` call spun up a fresh
+    /// browser WebSocket connection and dropped the previous one without
+    /// stopping its handler task (each conversation accumulated connections).
+    ReuseExisting,
+    /// Already attached, but to a *different* port — the callers must dispose
+    /// the old client before connecting to the new target.
+    ReplaceExisting,
+    /// No active connection — connect fresh.
+    Fresh,
+}
+
+/// Decide how a connect tool should proceed given the currently attached port
+/// (if any) and the requested target port.
+///
+/// Pure and side-effect free so it is unit-testable without a browser.
+pub fn decide_connect(current_port: Option<u16>, target_port: u16) -> ConnectDecision {
+    match current_port {
+        Some(p) if p == target_port => ConnectDecision::ReuseExisting,
+        Some(_) => ConnectDecision::ReplaceExisting,
+        None => ConnectDecision::Fresh,
+    }
+}
+
 /// Check out the selected [`Page`] and the current generation under a brief
 /// read lock, releasing the lock *before returning*.
 ///
@@ -178,6 +213,28 @@ where
 {
     if let Some(c) = client.write().await.as_mut() {
         f(c);
+    }
+}
+
+/// Defensive release: any dropped `CdpClient` — including one silently
+/// displaced by `*write().await = Some(new_client)` — must stop its CDP
+/// handler task and kill a self-spawned Chrome. Without this, dropping a
+/// client leaks a live browser WebSocket plus a forever-spinning tokio
+/// task (`JoinHandle` drop does NOT abort the task), which is exactly the
+/// leak observed when connect tools replaced an existing connection.
+///
+/// `abort()` only schedules cancellation; the handler task's owned
+/// chromiumoxide stream (and its WebSocket) is dropped when the task
+/// unwinds at its next await point, releasing the connection.
+impl Drop for CdpClient {
+    fn drop(&mut self) {
+        // Cancel the handler task. If a JoinHandle was already aborted by
+        // `disconnect`, aborting again is a no-op.
+        self.handler_handle.abort();
+        if let Some(mut child) = self.chrome_child.take() {
+            let _ = child.kill();
+            let _ = child.wait();
+        }
     }
 }
 
@@ -337,6 +394,33 @@ mod tests {
             },
         );
         map
+    }
+
+    /// No active connection — connect tools must build a fresh client.
+    #[test]
+    fn decide_connect_fresh_when_not_connected() {
+        assert_eq!(decide_connect(None, 9222), ConnectDecision::Fresh);
+    }
+
+    /// Same target port -> reuse. This is the leak fix: a repeated
+    /// `cdp_auto_connect` / `cdp_connect(same port)` must NOT open a new
+    /// browser WebSocket.
+    #[test]
+    fn decide_connect_reuses_same_port() {
+        assert_eq!(
+            decide_connect(Some(9222), 9222),
+            ConnectDecision::ReuseExisting
+        );
+    }
+
+    /// Different target port -> displace the old connection first so the
+    /// previous handler task / WebSocket does not leak.
+    #[test]
+    fn decide_connect_replaces_different_port() {
+        assert_eq!(
+            decide_connect(Some(9222), 9333),
+            ConnectDecision::ReplaceExisting
+        );
     }
 
     #[test]

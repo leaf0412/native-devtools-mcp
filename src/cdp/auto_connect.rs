@@ -157,7 +157,7 @@ pub fn build_ws_url(endpoint: &DevToolsEndpoint) -> String {
 pub async fn connect_default_chrome() -> Result<(CdpClient, DevToolsEndpoint), String> {
     let endpoint = read_devtools_active_port()?;
     let url = build_ws_url(&endpoint);
-    let client = CdpClient::connect_ws(&url).await?;
+    let client = CdpClient::connect_ws(&url, endpoint.port).await?;
     Ok((client, endpoint))
 }
 

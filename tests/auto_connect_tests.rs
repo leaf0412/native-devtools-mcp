@@ -163,7 +163,7 @@ fn attach_to_real_default_profile_chrome() {
         eprintln!("[smoke] connecting via {url}");
 
         // Hold the client for the duration of the assertion; disconnect on drop.
-        let mut client = native_devtools_mcp::cdp::CdpClient::connect_ws(&url)
+        let mut client = native_devtools_mcp::cdp::CdpClient::connect_ws(&url, endpoint.port)
             .await
             .expect("CdpClient::connect_ws must succeed against the real Chrome");
 

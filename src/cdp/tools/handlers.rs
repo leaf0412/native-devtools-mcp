@@ -56,26 +56,70 @@ impl ToolHandler for CdpConnect {
             ))]));
         }
         let port = port_num as u16;
-        match crate::cdp::CdpClient::connect(port).await {
-            Ok(client) => {
-                let page_info = if let Some(page) = client.selected_page.as_ref() {
-                    let url = crate::cdp::page_url(page).await;
-                    format!("Selected page: {}", url)
+
+        // Reuse the live connection when already attached to this port — do
+        // NOT open a second browser WebSocket / spawn a second handler task
+        // (the leak: replaced clients were dropped without aborting their
+        // handler, so every connect call accumulated a live connection).
+        let current_port = ctx.cdp_client.read().await.as_ref().map(|c| c.port);
+        match crate::cdp::decide_connect(current_port, port) {
+            crate::cdp::ConnectDecision::ReuseExisting => {
+                // Clone the selected page under a brief read lock, then release
+                // the lock before any async work (project concurrency rule).
+                let selected = ctx
+                    .cdp_client
+                    .read()
+                    .await
+                    .as_ref()
+                    .and_then(|c| c.selected_page.clone());
+                let page_info = if let Some(page) = selected.as_ref() {
+                    format!("Selected page: {}", crate::cdp::page_url(page).await)
                 } else {
                     "No pages found".to_string()
                 };
-                *ctx.cdp_client.write().await = Some(client);
-                // Tool list does not change on CDP connect/disconnect — CDP
-                // tools are always listed so prompt caches remain stable.
                 Ok(CallToolResult::success(vec![Content::text(format!(
-                    "Connected to Chrome/Electron on port {}. CDP tool calls will now succeed.\n{}",
+                    "Already connected to Chrome/Electron on port {}. Reusing the existing \
+                     connection (no new browser connection created).\n{}",
                     port, page_info
                 ))]))
             }
-            Err(e) => Ok(CallToolResult::error(vec![Content::text(e)])),
+            crate::cdp::ConnectDecision::ReplaceExisting => {
+                // Disconnecting the displaced client before installing a new
+                // one closes its WebSocket and aborts its handler task.
+                if let Some(old) = ctx.cdp_client.write().await.take() {
+                    old.disconnect();
+                }
+                connect_and_store(ctx, port).await
+            }
+            crate::cdp::ConnectDecision::Fresh => connect_and_store(ctx, port).await,
         }
     }
 }
+
+/// Build a fresh [`CdpClient`] for `port`, store it on the context, and
+/// return the standard success message. Used by the `Fresh` and displaced
+/// `ReplaceExisting` branches of the connect tools.
+async fn connect_and_store(ctx: &ToolContext, port: u16) -> Result<CallToolResult, McpError> {
+    match crate::cdp::CdpClient::connect(port).await {
+        Ok(client) => {
+            let page_info = if let Some(page) = client.selected_page.as_ref() {
+                let url = crate::cdp::page_url(page).await;
+                format!("Selected page: {}", url)
+            } else {
+                "No pages found".to_string()
+            };
+            *ctx.cdp_client.write().await = Some(client);
+            // Tool list does not change on CDP connect/disconnect — CDP
+            // tools are always listed so prompt caches remain stable.
+            Ok(CallToolResult::success(vec![Content::text(format!(
+                "Connected to Chrome/Electron on port {}. CDP tool calls will now succeed.\n{}",
+                port, page_info
+            ))]))
+        }
+        Err(e) => Ok(CallToolResult::error(vec![Content::text(e)])),
+    }
+}
+
 
 /// `cdp_launch` — start (or reuse) a managed debug Chrome with a stable
 /// profile so logins persist, then connect. See [`crate::cdp::launch`].
@@ -137,8 +181,43 @@ impl ToolHandler for CdpLaunch {
             .unwrap_or("chrome-profile");
         let headless = args.get("headless").and_then(|v| v.as_bool()).unwrap_or(false);
         let ephemeral = args.get("ephemeral").and_then(|v| v.as_bool()).unwrap_or(false);
+        let port = port as u16;
 
-        match crate::cdp::launch::launch_and_connect(port as u16, profile, url, headless, ephemeral)
+        // Reuse the live MCP connection when already attached to this port
+        // (launching again must not open a second browser WebSocket).
+        let current_port = ctx.cdp_client.read().await.as_ref().map(|c| c.port);
+        match crate::cdp::decide_connect(current_port, port) {
+            crate::cdp::ConnectDecision::ReuseExisting => {
+                // Clone the selected page under a brief read lock, then release
+                // the lock before any async I/O (project concurrency rule).
+                let selected = ctx
+                    .cdp_client
+                    .read()
+                    .await
+                    .as_ref()
+                    .and_then(|c| c.selected_page.clone());
+                let page_info = if let Some(page) = selected.as_ref() {
+                    format!("Selected page: {}", crate::cdp::page_url(page).await)
+                } else {
+                    "No pages found".to_string()
+                };
+                return Ok(CallToolResult::success(vec![Content::text(format!(
+                    "Already connected to a debug browser on port {}. Reusing the existing \
+                     connection (no new browser connection created).\n{}",
+                    port, page_info
+                ))]));
+            }
+            crate::cdp::ConnectDecision::ReplaceExisting => {
+                // Dispose the displaced client (abort handler, kill its spawned
+                // Chrome) before launching/attaching the new target.
+                if let Some(old) = ctx.cdp_client.write().await.take() {
+                    old.disconnect();
+                }
+            }
+            crate::cdp::ConnectDecision::Fresh => {}
+        }
+
+        match crate::cdp::launch::launch_and_connect(port, profile, url, headless, ephemeral)
             .await
         {
             Ok((client, reused)) => {
@@ -204,26 +283,76 @@ impl ToolHandler for CdpAutoConnect {
     }
 
     async fn call(&self, _args: Value, ctx: &ToolContext) -> Result<CallToolResult, McpError> {
-        match crate::cdp::auto_connect::connect_default_chrome().await {
-            Ok((client, endpoint)) => {
-                let page_info = if let Some(page) = client.selected_page.as_ref() {
+        // Resolve the default-profile endpoint first (a local file read) and
+        // only then decide reuse vs. fresh connect, so an existing connection
+        // is never torn down unless we actually switch targets.
+        let endpoint = match crate::cdp::auto_connect::read_devtools_active_port() {
+            Ok(ep) => ep,
+            Err(e) => return Ok(CallToolResult::error(vec![Content::text(e)])),
+        };
+
+        let current_port = ctx.cdp_client.read().await.as_ref().map(|c| c.port);
+        match crate::cdp::decide_connect(current_port, endpoint.port) {
+            crate::cdp::ConnectDecision::ReuseExisting => {
+                // Clone the selected page under a brief read lock, then release
+                // the lock before any async I/O (project concurrency rule).
+                let selected = ctx
+                    .cdp_client
+                    .read()
+                    .await
+                    .as_ref()
+                    .and_then(|c| c.selected_page.clone());
+                let page_info = if let Some(page) = selected.as_ref() {
                     format!("Selected page: {}", crate::cdp::page_url(page).await)
                 } else {
                     "No pages found (browser is running but has no open tabs)".to_string()
                 };
-                *ctx.cdp_client.write().await = Some(client);
                 Ok(CallToolResult::success(vec![Content::text(format!(
-                    "Attached to your default-profile Chrome at ws://127.0.0.1:{}{}.\n\
-                     Connected to the user's actual browser — tabs, cookies, extensions, \
-                     and login sessions are now visible to CDP tool calls.\n\
+                    "Already attached to your default-profile Chrome at ws://127.0.0.1:{}{}.\n\
+                     Reusing the existing connection — no new browser connection created.\n\
                      CDP tool calls will now succeed.\n{}",
                     endpoint.port, endpoint.ws_path, page_info
                 ))]))
             }
-            Err(e) => Ok(CallToolResult::error(vec![Content::text(e)])),
+            crate::cdp::ConnectDecision::ReplaceExisting => {
+                // Dispose the displaced client (abort handler, kill its spawned
+                // Chrome) before attaching to the default profile.
+                if let Some(old) = ctx.cdp_client.write().await.take() {
+                    old.disconnect();
+                }
+                auto_attach_and_store(ctx, &endpoint).await
+            }
+            crate::cdp::ConnectDecision::Fresh => auto_attach_and_store(ctx, &endpoint).await,
         }
     }
 }
+
+/// Attach to the default-profile Chrome using an already-resolved endpoint,
+/// store the client on the context, and return the standard success message.
+async fn auto_attach_and_store(
+    ctx: &ToolContext,
+    endpoint: &crate::cdp::auto_connect::DevToolsEndpoint,
+) -> Result<CallToolResult, McpError> {
+    match crate::cdp::auto_connect::connect_default_chrome().await {
+        Ok((client, _)) => {
+            let page_info = if let Some(page) = client.selected_page.as_ref() {
+                format!("Selected page: {}", crate::cdp::page_url(page).await)
+            } else {
+                "No pages found (browser is running but has no open tabs)".to_string()
+            };
+            *ctx.cdp_client.write().await = Some(client);
+            Ok(CallToolResult::success(vec![Content::text(format!(
+                "Attached to your default-profile Chrome at ws://127.0.0.1:{}{}.\n\
+                 Connected to the user's actual browser — tabs, cookies, extensions, \
+                 and login sessions are now visible to CDP tool calls.\n\
+                 CDP tool calls will now succeed.\n{}",
+                endpoint.port, endpoint.ws_path, page_info
+            ))]))
+        }
+        Err(e) => Ok(CallToolResult::error(vec![Content::text(e)])),
+    }
+}
+
 
 /// `cdp_disconnect` — always visible; CDP tools remain listed afterward and
 /// return a "not connected" error until `cdp_connect` succeeds again.
