@@ -24,3 +24,10 @@ npm/darwin-arm64/bin/native-devtools-mcp
 .DS_Store
 # Worktrees
 .worktrees/
+
+# Uncommitted workspace artifacts (generated / downloaded, never tracked)
+_docs/
+*.log
+__pycache__/
+/native-devtools-mcp-v*-macos-arm64/
+/native-devtools-mcp-v*.zip
