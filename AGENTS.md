@@ -21,26 +21,24 @@ Your **first action** for ANY web/browser task MUST be `cdp_auto_connect()`. Thi
 
 ### Rule 2 — NEVER move the real mouse cursor as your first action
 
-Coordinate-based input (`click`/`type_text`/`press_key` **without** `background=true`) is the **ABSOLUTE LAST RESORT**. Always climb the tiers in order:
+Only two paths exist for desktop click/input. Use them in strict order:
 
-1.  **CDP** (browser content) or **AX** (native macOS app) — no cursor, no focus steal
-2.  **Background dispatch** (`background=true` on `click`/`type_text`/`press_key`) — still no cursor movement, still no focus steal
-3.  **Only then** — plain `click(x, y)` / `type_text(text)` with real cursor movement
+1.  **Background dispatch** (`click(x, y, background=true, app_name=...)` / `type_text(text, background=true, app_name=...)` / `press_key(key, background=true, app_name=...)`) — NO cursor movement, NO focus steal. Use `find_text` to locate targets, then dispatch via background. This is the DEFAULT for all desktop apps.
+2.  **Only if background dispatch has no visible effect** — plain `click(x, y)` / `type_text(text)` with real cursor movement.
 
-If you find yourself typing `click(x=` or `type_text(text=` before you've exhausted tiers 1 and 2, STOP. You are skipping steps.
+If you find yourself typing `click(x=` or `type_text(text=` without `background=true`, STOP. You skipped the default path.
 
 ---
 
 ## 🧠 Core Reasoning Loop
 
-**Decision order — climb down this list one tier at a time. A real mouse click/keystroke (`click`/`type_text`/`press_key` without `background=true`) is the LAST resort, not the default ACT step:**
+**Decision order — exactly two tiers. Plain click without `background=true` is the LAST resort:**
 
 1.  **Browser content (macOS/any):** `cdp_auto_connect()` (ALWAYS try this FIRST — see Rule 1) → `cdp_find_elements(query)` → `cdp_click(uid)` / `cdp_fill(uid, value)` / `cdp_press_key(key)`. DOM-level targeting, no cursor movement. Only if `cdp_auto_connect` fails, fall back to `cdp_launch`.
-2.  **Native macOS app:** `take_ax_snapshot(app_name='...')` → read `uid` + capability tags (`[P,SV,SC,F,ADJ]`) + bbox from the emitted tree → `ax_click(uid)` for `[P]` controls, `ax_set_value(uid, text)` for `[SV]` fields, or `ax_select(uid)` for `NSOutlineView` / `NSTableView` rows (sidebars, rule lists). No cursor movement, no focus steal.
-3.  **AX dispatch returned `not_dispatchable`** — OR — **the target is an Electron app / custom-drawn UI where AX doesn't reach:** use `click(x, y, background=true, app_name='...')`, `type_text(text, background=true, app_name='...')`, or `press_key(key, background=true, app_name='...')`. Delivered via `CGEventPostToPid` (Accessibility) — still no cursor movement, still no focus steal. **This is the primary no-cursor path for Electron apps and non-AX-reachable UI.**
-4.  **Last resort** — only when AX is unavailable AND background dispatch failed: `take_screenshot(app_name="TargetApp", include_screenshot="auto")` → locate visually or via OCR → plain `click(x, y)` / `type_text(text)` / `press_key(key)`. This moves the real cursor and steals focus.
+2.  **ALL desktop apps (macOS/Windows):** `find_text(text='...', app_name='App')` → `click(x, y, background=true, app_name='App')` / `type_text(text, background=true, app_name='App')` / `press_key(key, background=true, app_name='App')`. Background dispatch via `CGEventPostToPid` — NO cursor movement, NO focus steal. **This is the DEFAULT for every desktop app.**
+3.  **Last resort** — only when background dispatch has no visible effect (app doesn't respond): plain `click(x, y)` / `type_text(text)` / `press_key(key)`. This moves the real cursor and steals focus.
 
-**VERIFY** every tier the same way you acted: re-`take_ax_snapshot` for tiers 2–3, re-`take_screenshot` for tier 4, and confirm the intended state actually changed before moving on.
+**VERIFY** after every action: re-screenshot or re-scan to confirm the intended state actually changed before moving on. If background dispatch had no effect, fall back to plain click.
 
 ---
 
@@ -48,7 +46,7 @@ If you find yourself typing `click(x=` or `type_text(text=` before you've exhaus
 
 Use this table to choose the right tool sequence for the user's goal. **Rows are ordered by tier: preferred (no-cursor) first, last-resort (real mouse) last.**
 
-### 🥇 Tier 1 — No Cursor Movement (CDP / AX)
+### 🌐 Browser Web Content (CDP)
 
 | User Goal | Tool Sequence | Why? |
 |-----------|---------------|------|
@@ -56,28 +54,27 @@ Use this table to choose the right tool sequence for the user's goal. **Rows are
 | "Click a button in Chrome" | `cdp_auto_connect()` → `cdp_find_elements(query="Submit")` → `cdp_click(uid="d1")` | CDP is more reliable than coordinates for web content. No cursor movement. |
 | "Type in a web input" | `cdp_auto_connect()` → `cdp_find_elements(query="Email")` → `cdp_fill(uid="d1", value="hello")` | Works for `<input>`, `<textarea>`, and `<select>` elements. No cursor movement. |
 | "Navigate to a URL" | `cdp_navigate(url="https://example.com")` | Also supports back, forward, reload. Requires active CDP connection from `cdp_auto_connect`. |
-| "Click a named button in a native app (macOS)" | `take_ax_snapshot(app_name="...")` → `ax_click(uid)` | Focus-preserving. Check `[P]` tag first. **Do NOT use `find_text` + `click(x,y)` — that's Tier 3.** |
-| "Enter text into a text field in a native app (macOS)" | `take_ax_snapshot(app_name="...")` → `ax_set_value(uid, text)` | No key events, no IME. Check `[SV]` tag first. **Do NOT use `click` + `type_text` — that's Tier 3.** |
-| "Select a sidebar row in System Settings / Finder (macOS)" | `take_ax_snapshot(app_name="...")` → `ax_select(uid)` | For `NSOutlineView` / `NSTableView` rows. Rows refuse `AXPress`; `ax_select` works. |
-| "Inspect a native app's UI (macOS)" | `take_screenshot(app_name="TargetApp", include_screenshot="auto")` | AX snapshot first; only attaches pixels when AX coverage is insufficient. |
 
-### 🥈 Tier 2 — Background Dispatch (no cursor movement, works for ANY app)
+### 🥇 Tier 1 — Background Dispatch (NO cursor movement, works for ALL desktop apps)
 
-**The key mechanism for Electron apps and UI that AX doesn't reach.** Uses `CGEventPostToPid` via Accessibility — delivers events directly to the target process without moving the real cursor.
+**The DEFAULT for every desktop app (native, Electron, custom UI).** Uses `CGEventPostToPid` to deliver events directly to the target process without moving the cursor or stealing focus.
 
 | User Goal | Tool Sequence | Why? |
 |-----------|---------------|------|
-| "AX returned `not_dispatchable`" | `click(fallback.x, fallback.y, background=true, app_name="TargetApp")` / `type_text(text, background=true, app_name="TargetApp")` / `press_key(key, background=true, app_name="TargetApp")` | `CGEventPostToPid` — still no cursor movement, still no focus steal. **ALWAYS try this before dropping `background=true`.** |
-| "Interact with an Electron app (no CDP, AX limited)" | `find_text(text="...", app_name="App")` → `click(x, y, background=true, app_name="App")` | Find the target with AX/OCR, then click via background dispatch. No cursor movement. |
-| "Type into an Electron app's input" | `find_text(text="Search", app_name="App")` → `click(x, y, background=true, app_name="App")` → `type_text("hello", background=true, app_name="App")` | Focus then type, all via `CGEventPostToPid`. No cursor movement. |
+| "Click a button in any desktop app" | `find_text(text="Save", app_name="App")` → `click(x, y, background=true, app_name="App")` | Find with AX/OCR, click via background dispatch. NO cursor movement. |
+| "Type into an input field" | `find_text(text="Search", app_name="App")` → `click(x, y, background=true, app_name="App")` → `type_text("hello", background=true, app_name="App")` | Focus then type, all via `CGEventPostToPid`. No cursor movement. |
+| "Press a keyboard shortcut" | `press_key(key="Return", background=true, app_name="App")` | Background key delivery. No cursor movement, no focus steal. |
+| "Find text on screen" | `find_text(text="...", app_name="App")` | Locate UI elements by name via accessibility API + OCR fallback. |
 
-### 🥉 Tier 3 — Last Resort (real cursor movement, steals focus)
+### 🥈 Tier 2 — Plain Input (fallback, moves cursor)
+
+**Only when background dispatch has no visible effect.** Uses standard `CGEventPost` through WindowServer — the real cursor moves and focus shifts.
 
 | User Goal | Tool Sequence | Why? |
 |-----------|---------------|------|
-| "Click a button when CDP/AX/background ALL failed" | `find_text(text="Submit")` → `click(x, y)` | Real cursor movement, steals focus. **Only when tiers 0–2 are exhausted.** |
+| "Click when background dispatch had no effect" | `find_text(text="Submit")` → `click(x, y)` | Real cursor movement, steals focus. **Only after Tier 1 failed.** |
+| "Type when background typing had no effect" | `find_text(text="Search")` → `click(x, y)` → `type_text("hello")` | Real cursor movement. Only as final fallback. |
 | "Click an unlabeled visual feature (canvas/WebGL)" | `take_screenshot()` → (Analyze Image) → `click(screenshot_x=..., screenshot_y=..., ...)` | Visual features require full screenshot analysis. Real cursor movement. |
-| "Type into a field when background typing failed" | `find_text(text="Search")` → `click(x, y)` → `type_text("hello")` | Real cursor movement. Only as final fallback. |
 
 ### 🔧 Utility
 
@@ -272,7 +269,7 @@ Scrolls at a specific screen position.
 
 Track cursor hover transitions across UI elements. Designed for observing user navigation patterns (tooltip triggers, dropdown reveals, panel expansions).
 
-* `start_hover_tracking`: Begin polling session. Inputs: `app_name` (optional), `poll_interval_ms` (default 100), `max_duration_ms` (default 60000), `min_dwell_ms` (default 300 — cursor must stay on element this long before recording).
+* `start_hover_tracking`: Begin polling session. Inputs: `app_name` (optional), `poll_interval_ms` (default 100), `max_duration_ms` (default 0 = unlimited, runs until stop_hover_tracking), `min_dwell_ms` (default 300 — cursor must stay on element this long before recording).
 * `get_hover_events`: Drain buffered events since last call. Returns JSON array of dwell events: `{ timestamp_ms, cursor: {x, y}, element: {role, name, label, bounds, app_name, pid}, dwell_ms }`.
 * `stop_hover_tracking`: End session, return remaining events.
 
@@ -290,7 +287,7 @@ Tools appear dynamically — `get_hover_events` and `stop_hover_tracking` only s
 
 Record the frontmost app's window as timestamped JPEG frames. Automatically follows app switches — when the user moves to a different app, recording captures the new app's window.
 
-* `start_recording`: Begin recording. Inputs: `output_dir` (required — directory for JPEG frames), `fps` (default 5), `max_duration_ms` (default 60000 = 1 min).
+* `start_recording`: Begin recording. Inputs: `output_dir` (required — directory for JPEG frames), `fps` (default 5), `max_duration_ms` (default 1800000 = 30 min; 0 = unlimited, runs until stop_recording).
 * `stop_recording`: End session, return all frame metadata as JSON array.
 
 Each frame includes: `{ timestamp_ms, path, app_name, window_id, origin_x, origin_y, scale, pixel_width, pixel_height }`.
@@ -422,8 +419,8 @@ Android tools use the `android_` prefix. Device management tools are always avai
 ### Method A: Absolute Screen Coordinates (Recommended)
 Use this when you have data from `find_text` OR `take_screenshot` (OCR results).
 *   **Source:** `find_text` returns `{ "x": 500, "y": 300 }`.
-*   **Action:** `click(x=500, y=300)`.
-*   **Why:** These are already global screen coordinates.
+*   **Action:** `click(x=500, y=300, background=true, app_name="App")`.
+*   **Why:** Background dispatch — no cursor movement. These are global screen coordinates.
 
 ### Method B: Relative Screenshot Coordinates
 Use this when you (the model) look at the *image* from `take_screenshot` and estimate positions (e.g., "The icon is at 50% width").
@@ -440,9 +437,9 @@ Use this when you (the model) look at the *image* from `take_screenshot` and est
 
 ## ⚡ Intent Examples (Chain of Thought)
 
-Each example shows the **preferred tier first**, then fallback. The old pattern of `find_text → click(x,y)` for native apps is **wrong** — always try AX/CDP first.
+Each example shows the **preferred tier first**, then fallback. **For ALL desktop apps: background dispatch is the default.**
 
-### 🌐 "Search for something on Google" (web — Tier 1 CDP)
+### 🌐 "Search for something on Google" (web — CDP)
 1.  **Call:** `cdp_auto_connect()` → "Connected to Chrome. Selected page: https://..."
     - ❌ Do NOT use `cdp_launch` for this. The user already has Chrome open.
 2.  **Call:** `cdp_find_elements(query="search")` → `[{uid:"d1", role:"searchbox", ...}]`
@@ -450,28 +447,26 @@ Each example shows the **preferred tier first**, then fallback. The old pattern 
 4.  **Call:** `cdp_press_key(key="Enter")`
 5.  **Call:** `cdp_wait_for(text=["Results"])` → verify page loaded.
 
-### 🖥️ "Click the 'Save' button in TextEdit" (native macOS — Tier 1 AX)
-1.  **Thought:** This is a native macOS app. I should use AX, not `find_text` + `click(x,y)`.
-2.  **Call:** `take_ax_snapshot(app_name="TextEdit")` → scan for `AXButton "Save" [P,F]`.
-3.  **Call:** `ax_click(uid="a12g3")` → no cursor movement, no focus steal.
-4.  **Verify:** `take_ax_snapshot(app_name="TextEdit")` → confirm the save dialog closed or file saved.
-5.  **Fallback (only if `ax_click` returns `not_dispatchable`):** `click(fallback.x, fallback.y, background=true, app_name="TextEdit")` → still no cursor movement.
-6.  **Last resort (only if background click also fails):** `find_text(text="Save", app_name="TextEdit")` → `click(x, y)`.
+### 🖥️ "Click the 'Save' button in TextEdit" (desktop app — bg dispatch)
+1.  **Thought:** Desktop app. Use background dispatch first — no cursor movement.
+2.  **Call:** `find_text(text="Save", app_name="TextEdit")` → `{x: 200, y: 50}`.
+3.  **Call:** `click(x=200, y=50, background=true, app_name="TextEdit")` → no cursor movement.
+4.  **Verify:** `take_screenshot(app_name="TextEdit")` → confirm the save action happened.
+5.  **Fallback (only if background click had no visible effect):** `click(x=200, y=50)` — moves cursor.
 
-### 🖥️ "Fill the search field in Finder" (native macOS — Tier 1 AX)
-1.  **Call:** `take_ax_snapshot(app_name="Finder")` → `AXSearchField` at `uid="a7g2" [SV,F]`.
-2.  **Call:** `ax_set_value(uid="a7g2", text="invoice.pdf")` → `{ "ok": true }`.
-3.  **Fallback on `not_dispatchable`:** `click(fallback.x, fallback.y, background=true, app_name="Finder")` then `type_text("invoice.pdf", background=true, app_name="Finder")` — still no cursor movement.
-4.  **Last resort:** `click(fallback.x, fallback.y)` then `type_text("invoice.pdf")` — real cursor.
+### 🖥️ "Fill the search field in Finder" (desktop app — bg dispatch)
+1.  **Call:** `find_text(text="Search", app_name="Finder")` → `{x: 400, y: 30}`.
+2.  **Call:** `click(x=400, y=30, background=true, app_name="Finder")` → focus the field without cursor movement.
+3.  **Call:** `type_text("invoice.pdf", background=true, app_name="Finder")` → type without cursor movement.
+4.  **Fallback:** `click(x=400, y=30)` then `type_text("invoice.pdf")` — real cursor.
 
-### 🖥️ "Open the Wi-Fi pane in System Settings" (native macOS — Tier 1 AX)
-1.  **Call:** `take_ax_snapshot(app_name="System Settings")` → `AXRow "Wi-Fi"` at `uid="a18g3"`.
-2.  **Thought:** Sidebar rows are backed by `NSOutlineView` — they refuse `AXPress`, so use `ax_select`.
-3.  **Call:** `ax_select(uid="a18g3")` → `{ "ok": true, "dispatched_via": "AXSelectedRows" }`.
-4.  **Call:** `take_ax_snapshot(app_name="System Settings")` → verify the Wi-Fi detail pane is visible.
+### 🖥️ "Open the Wi-Fi pane in System Settings" (desktop app — bg dispatch)
+1.  **Call:** `find_text(text="Wi-Fi", app_name="System Settings")` → `{x: 150, y: 200}`.
+2.  **Call:** `click(x=150, y=200, background=true, app_name="System Settings")` → no cursor movement.
+3.  **Verify:** `take_screenshot(app_name="System Settings")` → confirm the Wi-Fi detail pane is visible.
 
-### 🎨 "Draw a circle in Paint" (canvas app — Tier 3, AX unavailable)
-1.  **Thought:** Canvas apps have no accessibility tree. This genuinely needs screenshots + coordinates.
+### 🎨 "Draw a circle in Paint" (canvas app — visual targeting)
+1.  **Thought:** Canvas apps have no text elements. This needs screenshot visual analysis.
 2.  **Call:** `take_screenshot(app_name="Paint")`
 3.  **Analysis:** I see the canvas center at pixel (500, 500) in the image.
 4.  **Compute:** `start_x = screenshot_origin_x + 500 / screenshot_scale`, `start_y = screenshot_origin_y + 500 / screenshot_scale`
